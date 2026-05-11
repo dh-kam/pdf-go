@@ -1,6 +1,6 @@
 module github.com/dh-kam/pdf-go
 
-go 1.25.7
+go 1.25.10
 
 require (
 	github.com/andybalholm/brotli v1.2.0
