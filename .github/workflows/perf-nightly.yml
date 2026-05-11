@@ -1,0 +1,43 @@
+name: Nightly Performance Snapshot
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  snapshot:
+    name: Profile + Sample Compare
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Poppler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
+
+      - name: Run nightly snapshot pipeline
+        run: make nightly-snapshot-no-cgo
+
+      - name: Upload nightly artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-performance-snapshot
+          path: |
+            tmp/nightly_profile/summary.log
+            tmp/nightly_profile/cpu.out
+            tmp/nightly_profile/mem.out
+            tmp/nightly_sample_compare/report.csv
+            tmp/nightly_sample_compare/tradeoff.md
+            tmp/nightly_sample_compare/html/index.html
+          retention-days: 14

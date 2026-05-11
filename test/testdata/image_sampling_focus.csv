@@ -1,0 +1,5 @@
+pdf,page,goal,notes
+test/testdata/sample-files/007-imagemagick-images/imagemagick-images.pdf,1,decode_or_transform,imagemagick grayscale baseline mismatch
+test/testdata/sample-files/007-imagemagick-images/imagemagick-images.pdf,4,decode_or_transform,imagemagick dct decode mismatch
+test/testdata/sample-files/019-grayscale-image/grayscale-image.pdf,1,resample_or_antialias,grayscale rasterization mismatch
+test/testdata/sample-files/023-cmyk-image/cmyk-image.pdf,1,color_or_colorspace,cmyk color conversion mismatch

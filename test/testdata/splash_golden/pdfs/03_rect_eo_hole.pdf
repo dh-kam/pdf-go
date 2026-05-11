@@ -1,0 +1,42 @@
+%PDF-1.4
+%‚„œ”
+% SP5 fixture #03 - even-odd
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [3 0 R] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 60] /Contents 4 0 R /Resources << /ProcSet [/PDF /Text /ImageB /ImageC /ImageI] >> >>
+endobj
+4 0 obj
+<< /Length 82 >>
+stream
+q
+0 0 0 rg
+10 5 m 90 5 l 90 55 l 10 55 l h
+35 20 m 35 40 l 65 40 l 65 20 l h
+f*
+Q
+
+endstream
+endobj
+5 0 obj
+<< /Producer (splash-golden-gen) /CreationDate (D:20260427000000Z) /ModDate (D:20260427000000Z) >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000044 00000 n 
+0000000093 00000 n 
+0000000150 00000 n 
+0000000299 00000 n 
+0000000431 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R /Info 5 0 R
+   /ID [<A2C66A13FE38ADE9EF0BA4A739060274> <A2C66A13FE38ADE9EF0BA4A739060274>]
+>>
+startxref
+545
+%%EOF

@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  porting-complete:
+    name: Porting Complete Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run porting completion checks
+        run: make porting-complete
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run Java parity check
+        run: make parity-java
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+      - name: Run tests
+        run: go test -v -race -tags='nojpx,nojbig2' -coverprofile=coverage.txt ./...
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.txt
+
+      - name: Build (without CGo dependencies)
+        run: go build -tags='nojpx,nojbig2' ./...
+
+      - name: Build CLI tools
+        run: |
+          go build -tags='nojpx,nojbig2' -o /tmp/pdfinfo ./cmd/pdfinfo
+          go build -tags='nojpx,nojbig2' -o /tmp/pdftext ./cmd/pdftext
+          go build -tags='nojpx,nojbig2' -o /tmp/pdfrender ./cmd/pdfrender
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=10m --verbose
+
+      - name: Run go vet
+        run: go vet ./...
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run go fmt check
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "Go code is not formatted:"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: Run go mod tidy
+        run: |
+          go mod tidy
+          git diff go.mod go.sum
+
+      - name: Run gosec
+        uses: securego/gosec@master
+        with:
+          args: ./...
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [test, lint, porting-complete]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build all packages
+        run: go build -tags='nojpx,nojbig2' ./...
+
+      - name: Build CLI tools
+        run: |
+          go build -tags='nojpx,nojbig2' -o bin/pdfinfo ./cmd/pdfinfo
+          go build -tags='nojpx,nojbig2' -o bin/pdftext ./cmd/pdftext
+          go build -tags='nojpx,nojbig2' -o bin/pdfrender ./cmd/pdfrender
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: bin/

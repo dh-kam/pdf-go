@@ -1,0 +1,293 @@
+Found 94 PDFs to process
+DPI: 150
+Skip render: False
+Threshold: 99.0%
+
+[1/94] Processing: lex_001_minimal.pdf
+  ERROR: Poppler render failed: pdftoppm failed: Syntax Error: Invalid page count 0
+Wrong page range given: the first page (1) can not be after the last page (0).
+[2/94] Processing: lex_002_text.pdf
+  Pages: 1, Avg Similarity: 99.7879%
+  Worst page: 1 (99.7879%)
+[3/94] Processing: lex_003_path.pdf
+  Pages: 1, Avg Similarity: 99.9175%
+  Worst page: 1 (99.9175%)
+[4/94] Processing: lex_004_fill.pdf
+  Pages: 1, Avg Similarity: 100.0000%
+  Worst page: 1 (100.0000%)
+[5/94] Processing: lex_005_stroke.pdf
+  Pages: 1, Avg Similarity: 99.4021%
+  Worst page: 1 (99.4021%)
+[6/94] Processing: lex_006_transform.pdf
+  Pages: 1, Avg Similarity: 99.9602%
+  Worst page: 1 (99.9602%)
+[7/94] Processing: lex_007_clipping.pdf
+  Pages: 1, Avg Similarity: 99.4575%
+  Worst page: 1 (99.4575%)
+[8/94] Processing: lex_008_gradient.pdf
+  Pages: 1, Avg Similarity: 99.9888%
+  Worst page: 1 (99.9888%)
+[9/94] Processing: lex_009_graphics_state.pdf
+  Pages: 1, Avg Similarity: 99.9435%
+  Worst page: 1 (99.9435%)
+[10/94] Processing: lex_010_curveto.pdf
+  Pages: 1, Avg Similarity: 99.8127%
+  Worst page: 1 (99.8127%)
+[11/94] Processing: lex_011_closepath.pdf
+  Pages: 1, Avg Similarity: 99.9877%
+  Worst page: 1 (99.9877%)
+[12/94] Processing: lex_012_lineto.pdf
+  Pages: 1, Avg Similarity: 99.9866%
+  Worst page: 1 (99.9866%)
+[13/94] Processing: lex_013_moveto.pdf
+  Pages: 1, Avg Similarity: 99.9973%
+  Worst page: 1 (99.9973%)
+[14/94] Processing: lex_014_text_matrix.pdf
+  Pages: 1, Avg Similarity: 99.7677%
+  Worst page: 1 (99.7677%)
+[15/94] Processing: lex_015_text_spacing.pdf
+  Pages: 1, Avg Similarity: 99.7276%
+  Worst page: 1 (99.7276%)
+[16/94] Processing: lex_016_linecap.pdf
+  Pages: 1, Avg Similarity: 98.8645%
+  Worst page: 1 (98.8645%)
+[17/94] Processing: lex_017_linejoin.pdf
+  Pages: 1, Avg Similarity: 98.8113%
+  Worst page: 1 (98.8113%)
+[18/94] Processing: lex_018_dash.pdf
+  Pages: 1, Avg Similarity: 99.5400%
+  Worst page: 1 (99.5400%)
+[19/94] Processing: lex_019_simple_image.pdf
+  Pages: 1, Avg Similarity: 99.9173%
+  Worst page: 1 (99.9173%)
+[20/94] Processing: lex_020_rect.pdf
+  Pages: 1, Avg Similarity: 99.8437%
+  Worst page: 1 (99.8437%)
+[21/94] Processing: lex_021_fillstroke.pdf
+  Pages: 1, Avg Similarity: 99.9096%
+  Worst page: 1 (99.9096%)
+[22/94] Processing: lex_022_eofill.pdf
+  Pages: 1, Avg Similarity: 99.9897%
+  Worst page: 1 (99.9897%)
+[23/94] Processing: lex_023_text_modes.pdf
+  Pages: 1, Avg Similarity: 100.0000%
+  Worst page: 1 (100.0000%)
+[24/94] Processing: lex_024_clip.pdf
+  Pages: 1, Avg Similarity: 99.9963%
+  Worst page: 1 (99.9963%)
+[25/94] Processing: lex_025_eoclip.pdf
+  Pages: 1, Avg Similarity: 99.9963%
+  Worst page: 1 (99.9963%)
+[26/94] Processing: lex_026_simple_clip.pdf
+  Pages: 1, Avg Similarity: 99.9953%
+  Worst page: 1 (99.9953%)
+[27/94] Processing: lex_030_clip_rect.pdf
+  Pages: 1, Avg Similarity: 99.9953%
+  Worst page: 1 (99.9953%)
+[28/94] Processing: lex_031_clip_eo.pdf
+  Pages: 1, Avg Similarity: 99.9779%
+  Worst page: 1 (99.9779%)
+[29/94] Processing: lex_032_clip_circle.pdf
+  Pages: 1, Avg Similarity: 99.9838%
+  Worst page: 1 (99.9838%)
+[30/94] Processing: lex_033_clip_stroke.pdf
+  Pages: 1, Avg Similarity: 99.9407%
+  Worst page: 1 (99.9407%)
+[31/94] Processing: lex_034_clip_polygon.pdf
+  Pages: 1, Avg Similarity: 99.9800%
+  Worst page: 1 (99.9800%)
+[32/94] Processing: lex_035_clip_nested.pdf
+  Pages: 1, Avg Similarity: 99.9925%
+  Worst page: 1 (99.9925%)
+[33/94] Processing: lex_036_clip_curve.pdf
+  Pages: 1, Avg Similarity: 99.9907%
+  Worst page: 1 (99.9907%)
+[34/94] Processing: lex_037_clip_eo_overlap.pdf
+  Pages: 1, Avg Similarity: 99.9779%
+  Worst page: 1 (99.9779%)
+[35/94] Processing: lex_040_path_moveto_lineto.pdf
+  Pages: 1, Avg Similarity: 99.9983%
+  Worst page: 1 (99.9983%)
+[36/94] Processing: lex_041_pathto_curveto.pdf
+  Pages: 1, Avg Similarity: 99.9916%
+  Worst page: 1 (99.9916%)
+[37/94] Processing: lex_042_pathto_closepath.pdf
+  Pages: 1, Avg Similarity: 99.9802%
+  Worst page: 1 (99.9802%)
+[38/94] Processing: lex_043_pathto_rectangle.pdf
+  Pages: 1, Avg Similarity: 99.9802%
+  Worst page: 1 (99.9802%)
+[39/94] Processing: lex_044_path_stroke.pdf
+  Pages: 1, Avg Similarity: 99.8335%
+  Worst page: 1 (99.8335%)
+[40/94] Processing: lex_045_path_transform.pdf
+  Pages: 1, Avg Similarity: 99.9885%
+  Worst page: 1 (99.9885%)
+[41/94] Processing: lex_046_path_multiple.pdf
+  Pages: 1, Avg Similarity: 99.9934%
+  Worst page: 1 (99.9934%)
+[42/94] Processing: lex_047_pathto_curve_complex.pdf
+  Pages: 1, Avg Similarity: 99.9945%
+  Worst page: 1 (99.9945%)
+[43/94] Processing: lex_048_triangle.pdf
+  Pages: 1, Avg Similarity: 99.9983%
+  Worst page: 1 (99.9983%)
+[44/94] Processing: lex_049_stroke_simple.pdf
+  Pages: 1, Avg Similarity: 99.7326%
+  Worst page: 1 (99.7326%)
+[45/94] Processing: lex_050_text_leading.pdf
+  Pages: 1, Avg Similarity: 99.9232%
+  Worst page: 1 (99.9232%)
+[46/94] Processing: lex_051_text_hscale.pdf
+  Pages: 1, Avg Similarity: 99.7755%
+  Worst page: 1 (99.7755%)
+[47/94] Processing: lex_052_text_rise.pdf
+  Pages: 1, Avg Similarity: 99.7863%
+  Worst page: 1 (99.7863%)
+[48/94] Processing: lex_053_color_operators.pdf
+  Pages: 1, Avg Similarity: 99.4470%
+  Worst page: 1 (99.4470%)
+[49/94] Processing: lex_054_inline_image_bi.pdf
+  Pages: 1, Avg Similarity: 99.9997%
+  Worst page: 1 (99.9997%)
+[50/94] Processing: lex_055_colorspace_operators.pdf
+  Pages: 1, Avg Similarity: 99.5313%
+  Worst page: 1 (99.5313%)
+[51/94] Processing: lex_056_text_td_td.pdf
+  Pages: 1, Avg Similarity: 99.7897%
+  Worst page: 1 (99.7897%)
+[52/94] Processing: lex_057_curve_shortcuts_vy.pdf
+  Pages: 1, Avg Similarity: 99.9165%
+  Worst page: 1 (99.9165%)
+[53/94] Processing: lex_058_xobject_do_form.pdf
+  Pages: 1, Avg Similarity: 99.9648%
+  Worst page: 1 (99.9648%)
+[54/94] Processing: lex_059_shading_operator.pdf
+  Pages: 1, Avg Similarity: 99.9745%
+  Worst page: 1 (99.9745%)
+[55/94] Processing: lex_060_color_n_operators.pdf
+  Pages: 1, Avg Similarity: 99.8545%
+  Worst page: 1 (99.8545%)
+[56/94] Processing: lex_061_text_array_tj.pdf
+  Pages: 1, Avg Similarity: 99.9711%
+  Worst page: 1 (99.9711%)
+[57/94] Processing: lex_062_close_stroke_s.pdf
+  Pages: 1, Avg Similarity: 99.8907%
+  Worst page: 1 (99.8907%)
+[58/94] Processing: lex_063_fill_stroke_evenodd_bstar.pdf
+  Pages: 1, Avg Similarity: 99.8598%
+  Worst page: 1 (99.8598%)
+[59/94] Processing: lex_064_close_fill_stroke_b.pdf
+  Pages: 1, Avg Similarity: 99.9113%
+  Worst page: 1 (99.9113%)
+[60/94] Processing: lex_065_close_fill_stroke_evenodd_bstar.pdf
+  Pages: 1, Avg Similarity: 99.8761%
+  Worst page: 1 (99.8761%)
+[61/94] Processing: lex_type3_d0_smoke.pdf
+  Pages: 1, Avg Similarity: 98.1511%
+  Worst page: 1 (98.1511%)
+[62/94] Processing: lex_type3_d1_smoke.pdf
+  Pages: 1, Avg Similarity: 98.1438%
+  Worst page: 1 (98.1438%)
+[63/94] Processing: sample_002-trivial-libre-office-writer.pdf
+  Pages: 1, Avg Similarity: 99.1487%
+  Worst page: 1 (99.1487%)
+[64/94] Processing: sample_GeoTopo-komprimiert.pdf
+  Pages: 50, Avg Similarity: 98.4385%
+  Worst page: 1 (95.7950%)
+[65/94] Processing: sample_GeoTopo.pdf
+  Pages: 50, Avg Similarity: 98.2154%
+  Worst page: 1 (95.7219%)
+[66/94] Processing: sample_annotated_pdf.pdf
+  Pages: 1, Avg Similarity: 99.4922%
+  Worst page: 1 (99.4922%)
+[67/94] Processing: sample_base64image.pdf
+  Pages: 1, Avg Similarity: 99.6568%
+  Worst page: 1 (99.6568%)
+[68/94] Processing: sample_cmyk-image.pdf
+  Pages: 1, Avg Similarity: 98.3078%
+  Worst page: 1 (98.3078%)
+[69/94] Processing: sample_crazyones-pdfa.pdf
+  Pages: 1, Avg Similarity: 99.2375%
+  Worst page: 1 (99.2375%)
+[70/94] Processing: sample_google-doc-document.pdf
+  Pages: 1, Avg Similarity: 97.2947%
+  Worst page: 1 (97.2947%)
+[71/94] Processing: sample_grayscale-image.pdf
+  Pages: 1, Avg Similarity: 99.7284%
+  Worst page: 1 (99.7284%)
+[72/94] Processing: sample_habibi-oneline-cmap.pdf
+  Pages: 1, Avg Similarity: 99.9781%
+  Worst page: 1 (99.9781%)
+[73/94] Processing: sample_habibi-rotated.pdf
+  Pages: 4, Avg Similarity: 99.9782%
+  Worst page: 4 (99.9781%)
+[74/94] Processing: sample_habibi.pdf
+  Pages: 1, Avg Similarity: 99.9781%
+  Worst page: 1 (99.9781%)
+[75/94] Processing: sample_imagemagick-ASCII85Decode.pdf
+  Pages: 1, Avg Similarity: 90.3585%
+  Worst page: 1 (90.3585%)
+[76/94] Processing: sample_imagemagick-CCITTFaxDecode.pdf
+  Pages: 1, Avg Similarity: 90.3585%
+  Worst page: 1 (90.3585%)
+[77/94] Processing: sample_imagemagick-images.pdf
+  Pages: 6, Avg Similarity: 90.2956%
+  Worst page: 4 (89.9816%)
+[78/94] Processing: sample_imagemagick-lzw.pdf
+  Pages: 1, Avg Similarity: 90.3585%
+  Worst page: 1 (90.3585%)
+[79/94] Processing: sample_inline-image.pdf
+  Pages: 1, Avg Similarity: 99.9282%
+  Worst page: 1 (99.9282%)
+[80/94] Processing: sample_libre-office-link.pdf
+  Pages: 1, Avg Similarity: 99.9556%
+  Worst page: 1 (99.9556%)
+[81/94] Processing: sample_libreoffice-form.pdf
+  Pages: 1, Avg Similarity: 99.4687%
+  Worst page: 1 (99.4687%)
+[82/94] Processing: sample_libreoffice-writer-password.pdf
+  ERROR: Poppler render failed: pdftoppm failed: Command Line Error: Incorrect password
+[83/94] Processing: sample_minimal-document.pdf
+  Pages: 1, Avg Similarity: 99.3318%
+  Worst page: 1 (99.3318%)
+[84/94] Processing: sample_mistitled_outlines_example.pdf
+  Pages: 4, Avg Similarity: 98.1288%
+  Worst page: 3 (97.0969%)
+[85/94] Processing: sample_multicolumn.pdf
+  Pages: 3, Avg Similarity: 97.7134%
+  Worst page: 1 (96.6542%)
+[86/94] Processing: sample_output_with_metadata_pymupdf.pdf
+  Pages: 1, Avg Similarity: 99.9722%
+  Worst page: 1 (99.9722%)
+[87/94] Processing: sample_pdfkit.pdf
+  Pages: 1, Avg Similarity: 99.8192%
+  Worst page: 1 (99.8192%)
+[88/94] Processing: sample_pdflatex-4-pages.pdf
+  Pages: 4, Avg Similarity: 96.0098%
+  Worst page: 3 (95.6416%)
+[89/94] Processing: sample_pdflatex-forms.pdf
+  Pages: 1, Avg Similarity: 99.9395%
+  Worst page: 1 (99.9395%)
+[90/94] Processing: sample_pdflatex-image.pdf
+  Pages: 1, Avg Similarity: 98.9447%
+  Worst page: 1 (98.9447%)
+[91/94] Processing: sample_pdflatex-outline.pdf
+  Pages: 4, Avg Similarity: 98.1288%
+  Worst page: 3 (97.0969%)
+[92/94] Processing: sample_reportlab-overlay.pdf
+  Pages: 1, Avg Similarity: 99.8888%
+  Worst page: 1 (99.8888%)
+[93/94] Processing: sample_unreadablemetadata.pdf
+  Pages: 1, Avg Similarity: 92.7777%
+  Worst page: 1 (92.7777%)
+[94/94] Processing: sample_with-attachment.pdf
+  Pages: 1, Avg Similarity: 99.3318%
+  Worst page: 1 (99.3318%)
+CSV exported: /workspace/pdf-reader/go-pdf/testdata/compare/report.csv
+
+Report generated: /workspace/pdf-reader/go-pdf/testdata/compare/report/index.html
+
+============================================================
+Summary: 74 passed, 18 failed, 2 errors out of 94 PDFs
+Report: file:///workspace/pdf-reader/go-pdf/testdata/compare/report/index.html

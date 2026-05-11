@@ -1,0 +1,44 @@
+%PDF-1.4
+%‚„œ”
+% SP5 fixture #25 - link-border
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [3 0 R] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 60] /Contents 4 0 R /Resources << /ProcSet [/PDF] >> /Annots [5 0 R] >>
+endobj
+4 0 obj
+<< /Length 36 >>
+stream
+q
+0.8 0.8 0.8 rg
+20 20 60 20 re f
+Q
+
+endstream
+endobj
+5 0 obj
+<< /Type /Annot /Subtype /Link /Rect [20 20 80 40] /Border [0 0 1] /C [0 0 0] /A << /S /URI /URI (https://example.invalid/) >> >>
+endobj
+6 0 obj
+<< /Producer (splash-golden-gen) /CreationDate (D:20260427000000Z) /ModDate (D:20260427000000Z) >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000047 00000 n 
+0000000096 00000 n 
+0000000153 00000 n 
+0000000288 00000 n 
+0000000374 00000 n 
+0000000519 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R /Info 6 0 R
+   /ID [<963A87D68371671B8EF30061159AB270> <963A87D68371671B8EF30061159AB270>]
+>>
+startxref
+633
+%%EOF

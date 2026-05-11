@@ -1,0 +1,22 @@
+# Splash port — Phase 1 watch-set regression floor.
+#
+# Source: /workspace/pdf-reader/go-pdf/test/testdata/output/render_parity/report.csv
+# Captured: 2026-04-27 (Phase 1 entry).
+# Per /workspace/pdf-reader/tmp/splash_port_design/05_test_strategy.md §3 + §4.
+#
+# Format: pdf_basename<TAB>page<TAB>exact_percent_floor<TAB>captured_phase
+# Match policy: pdf_basename is the substring matched against report.csv's
+#   pdf column (column 1). The first row whose pdf contains the basename and
+#   whose page equals the listed page is the watch-set entry.
+#
+# Hard rule (project memory): exact100 must monotonically rise. A drop below
+# the floor below FAILS the test; raising the floor requires editing this file
+# in a follow-up "floor++" commit per 05_test_strategy.md §9.
+GeoTopo	23	98.8528	P1
+GeoTopo	35	98.4674	P1
+GeoTopo	44	99.8137	P1
+GeoTopo	55	95.9503	P1
+GeoTopo	96	98.2180	P1
+GeoTopo	97	99.3913	P1
+google-doc-document	1	99.0113	P1
+libreoffice-form	1	99.7863	P1

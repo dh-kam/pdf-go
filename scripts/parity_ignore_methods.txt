@@ -1,0 +1,1 @@
+# No parity exclusions. Keep this file for future exceptional cases.

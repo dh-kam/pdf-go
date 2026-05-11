@@ -1,0 +1,51 @@
+%PDF-1.4
+%‚„œ”
+% SP5 fixture #17 - glyph-blend
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [3 0 R] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 60] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /ProcSet [/PDF /Text] >> >>
+endobj
+4 0 obj
+<< /Length 74 >>
+stream
+q
+BT
+/F1 28 Tf
+0 0 0 rg
+10 20 Td
+(O) Tj
+0.5 0.5 0.5 rg
+4 0 Td
+(O) Tj
+ET
+Q
+
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Producer (splash-golden-gen) /CreationDate (D:20260427000000Z) /ModDate (D:20260427000000Z) >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000047 00000 n 
+0000000096 00000 n 
+0000000153 00000 n 
+0000000300 00000 n 
+0000000424 00000 n 
+0000000521 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R /Info 6 0 R
+   /ID [<08102D8A6AB593A4F4CF9F908093DA3D> <08102D8A6AB593A4F4CF9F908093DA3D>]
+>>
+startxref
+635
+%%EOF

@@ -1,0 +1,49 @@
+# Splash port — Phase 5 tier-1 PR-time similarity floors.
+#
+# Source: TestSplashCorpusTier1 (initial conservative seeding).
+# Captured: 2026-04-27 (Phase 5 entry).
+# Per /workspace/pdf-reader/tmp/splash_port_design/05_test_strategy.md §3 + §4.
+#
+# Format: pdf_basename<TAB>page<TAB>similarity_floor<TAB>exact_percent_floor<TAB>captured_phase
+# Match policy: pdf_basename matches the PDF file basename (e.g. GeoTopo.pdf).
+#
+# Hard rule (project memory): similarity_percent must monotonically rise. A
+# drop below the floor FAILS the test; raising the floor requires running
+# with SPLASH_TIER1_SNAPSHOT=1 in a follow-up "floor++" commit per
+# 05_test_strategy.md §9.
+#
+# Initial values are conservative: 80.0% across most pages, 90.0% for the
+# 8 watch-set pages (which are already pinned at exact ≥98% in watchset.tsv).
+# Run `SPLASH_TIER1_SNAPSHOT=1 make splash-corpus-tier1` to promote to the
+# real measured values once Phase 5 lands.
+GeoTopo.pdf	23	90.0000	0.0000	P5
+GeoTopo.pdf	35	90.0000	0.0000	P5
+GeoTopo.pdf	44	90.0000	0.0000	P5
+GeoTopo.pdf	55	90.0000	0.0000	P5
+GeoTopo.pdf	96	90.0000	0.0000	P5
+GeoTopo.pdf	97	90.0000	0.0000	P5
+google-doc-document.pdf	1	90.0000	0.0000	P5
+libreoffice-form.pdf	1	90.0000	0.0000	P5
+minimal-document.pdf	1	80.0000	0.0000	P5
+002-trivial-libre-office-writer.pdf	1	80.0000	0.0000	P5
+pdflatex-4-pages.pdf	1	80.0000	0.0000	P5
+pdflatex-4-pages.pdf	3	80.0000	0.0000	P5
+pdflatex-outline.pdf	1	80.0000	0.0000	P5
+pdflatex-image.pdf	1	80.0000	0.0000	P5
+imagemagick-images.pdf	1	80.0000	0.0000	P5
+inline-image.pdf	1	80.0000	0.0000	P5
+base64image.pdf	1	80.0000	0.0000	P5
+grayscale-image.pdf	1	80.0000	0.0000	P5
+cmyk-image.pdf	1	80.0000	0.0000	P5
+GeoTopo.pdf	1	80.0000	0.0000	P5
+GeoTopo.pdf	16	80.0000	0.0000	P5
+pdflatex-forms.pdf	1	80.0000	0.0000	P5
+annotated_pdf.pdf	1	80.0000	0.0000	P5
+libre-office-link.pdf	1	80.0000	0.0000	P5
+libreoffice-writer-password.pdf	1	80.0000	0.0000	P5
+habibi.pdf	1	80.0000	0.0000	P5
+crazyones-pdfa.pdf	1	80.0000	0.0000	P5
+pdfkit.pdf	1	80.0000	0.0000	P5
+multicolumn.pdf	1	80.0000	0.0000	P5
+reportlab-overlay.pdf	1	80.0000	0.0000	P5
+mistitled_outlines_example.pdf	1	80.0000	0.0000	P5

@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sample_002-trivial-libre-office-writer.pdf - Render Comparison</title>
+    
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               background: #0d1117; color: #c9d1d9; padding: 20px; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 { color: #58a6ff; margin-bottom: 20px; font-size: 24px; }
+        h2 { color: #58a6ff; margin: 20px 0 10px; font-size: 18px; }
+        h3 { color: #8b949e; margin: 10px 0; font-size: 14px; }
+
+        .summary-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px; margin-bottom: 24px;
+        }
+        .summary-card {
+            background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+            padding: 16px; text-align: center;
+        }
+        .summary-card .value { font-size: 32px; font-weight: bold; color: #58a6ff; }
+        .summary-card .label { font-size: 12px; color: #8b949e; margin-top: 4px; }
+        .summary-card.pass .value { color: #3fb950; }
+        .summary-card.fail .value { color: #f85149; }
+        .summary-card.warn .value { color: #d29922; }
+
+        table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+        th { background: #161b22; color: #8b949e; padding: 10px 12px; text-align: left;
+             font-size: 12px; text-transform: uppercase; border-bottom: 2px solid #30363d; }
+        td { padding: 10px 12px; border-bottom: 1px solid #21262d; font-size: 13px; }
+        tr:hover { background: #161b22; }
+
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 12px;
+                 font-size: 11px; font-weight: 600; }
+        .badge-pass { background: #1a3a2a; color: #3fb950; }
+        .badge-fail { background: #3a1a1a; color: #f85149; }
+        .badge-error { background: #3a2a1a; color: #d29922; }
+
+        .bar { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; }
+        .bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+        .bar-fill.green { background: linear-gradient(90deg, #238636, #3fb950); }
+        .bar-fill.yellow { background: linear-gradient(90deg, #9e6a03, #d29922); }
+        .bar-fill.red { background: linear-gradient(90deg, #da3633, #f85149); }
+
+        a { color: #58a6ff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+
+        .page-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin: 16px 0; }
+        .page-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }
+        .page-card img { width: 100%; border-radius: 4px; border: 1px solid #30363d; }
+        .page-card .title { text-align: center; color: #8b949e; font-size: 12px; margin-bottom: 8px; }
+
+        .page-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 8px 0; }
+        .page-stat { text-align: center; padding: 8px; background: #0d1117; border-radius: 4px; }
+        .page-stat .val { font-size: 18px; font-weight: bold; }
+        .page-stat .lbl { font-size: 10px; color: #8b949e; }
+
+        .nav { display: flex; gap: 8px; margin: 16px 0; flex-wrap: wrap; }
+        .nav a { padding: 6px 12px; background: #21262d; border-radius: 4px; color: #c9d1d9;
+                 font-size: 13px; border: 1px solid #30363d; }
+        .nav a:hover { background: #30363d; text-decoration: none; }
+        .nav a.active { background: #1f6feb; border-color: #1f6feb; }
+
+        .filter-bar { display: flex; gap: 8px; margin-bottom: 16px; }
+        .filter-btn { padding: 6px 14px; background: #21262d; border: 1px solid #30363d;
+                      border-radius: 20px; color: #c9d1d9; cursor: pointer; font-size: 12px; }
+        .filter-btn:hover { background: #30363d; }
+        .filter-btn.active { background: #1f6feb; border-color: #1f6feb; }
+
+        .footer { text-align: center; color: #484f58; font-size: 11px; margin-top: 40px; padding: 20px; }
+    </style>
+    
+</head>
+<body>
+<div class="container">
+    <div class="nav"><a href="detail_lex_type3_d1_smoke.pdf.html">&larr; lex_type3_d1_smoke.pdf</a><a href="index.html">Index</a><a href="detail_sample_GeoTopo-komprimiert.pdf.html">sample_GeoTopo-komprimiert.pdf &rarr;</a></div>
+
+    <h1>sample_002-trivial-libre-office-writer.pdf</h1>
+    <h3>Avg Similarity: 99.9252% | Avg Exact: 98.6288% | Pages: 1</h3>
+
+    
+            <h2>Page 1 <span class="badge badge-pass">PASS</span></h2>
+
+            <div class="page-stats">
+                <div class="page-stat">
+                    <div class="val" style="color:#3fb950">99.9252%</div>
+                    <div class="lbl">Similarity</div>
+                </div>
+                <div class="page-stat">
+                    <div class="val">98.6288%</div>
+                    <div class="lbl">Exact Match</div>
+                </div>
+                <div class="page-stat">
+                    <div class="val">29,847 / 2,176,714</div>
+                    <div class="lbl">Diff Pixels</div>
+                </div>
+            </div>
+
+            <div class="bar" style="margin-bottom:12px;">
+                <div class="bar-fill green" style="width:99.9%"></div>
+            </div>
+
+            <div class="page-grid">
+                <div class="page-card">
+                    <div class="title">Poppler (Reference)</div>
+                    <img src="../poppler_png/sample_002-trivial-libre-office-writer/sample_002-trivial-libre-office-writer-1.png" alt="Poppler Page 1" loading="lazy">
+                </div>
+                <div class="page-card">
+                    <div class="title">go-pdf (Ours)</div>
+                    <img src="../gopdf_png/sample_002-trivial-libre-office-writer/sample_002-trivial-libre-office-writer_page_0001.png" alt="go-pdf Page 1" loading="lazy">
+                </div>
+                <div class="page-card">
+                    <div class="title">Difference</div>
+                    <img src="../diff_png/sample_002-trivial-libre-office-writer/diff_page_0001.png" alt="Diff Page 1" loading="lazy">
+                </div>
+            </div>
+            <hr style="border:none;border-top:1px solid #30363d;margin:24px 0;">
+
+    <div class="footer">
+        <a href="index.html">&larr; Back to Index</a>
+    </div>
+</div>
+</body>
+</html>

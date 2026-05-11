@@ -1,0 +1,44 @@
+%PDF-1.4
+%‚„œ”
+% SP5 fixture #24 - clip-nested
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [3 0 R] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 60] /Contents 4 0 R /Resources << /ProcSet [/PDF /Text /ImageB /ImageC /ImageI] >> >>
+endobj
+4 0 obj
+<< /Length 80 >>
+stream
+q
+10 10 80 40 re W n
+q
+30 5 m 70 55 l 70 5 l h W n
+0 0 0 rg
+0 0 100 60 re f
+Q
+Q
+
+endstream
+endobj
+5 0 obj
+<< /Producer (splash-golden-gen) /CreationDate (D:20260427000000Z) /ModDate (D:20260427000000Z) >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000047 00000 n 
+0000000096 00000 n 
+0000000153 00000 n 
+0000000302 00000 n 
+0000000432 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R /Info 5 0 R
+   /ID [<A40373F62AE12C09C66F860006C56884> <A40373F62AE12C09C66F860006C56884>]
+>>
+startxref
+546
+%%EOF

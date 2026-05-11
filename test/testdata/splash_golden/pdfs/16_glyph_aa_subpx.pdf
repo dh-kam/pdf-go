@@ -1,0 +1,47 @@
+%PDF-1.4
+%‚„œ”
+% SP5 fixture #16 - glyph-aa-subpx
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [3 0 R] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 60] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /ProcSet [/PDF /Text] >> >>
+endobj
+4 0 obj
+<< /Length 38 >>
+stream
+q
+BT
+/F1 20 Tf
+10.5 20 Td
+(g) Tj
+ET
+Q
+
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Producer (splash-golden-gen) /CreationDate (D:20260427000000Z) /ModDate (D:20260427000000Z) >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000050 00000 n 
+0000000099 00000 n 
+0000000156 00000 n 
+0000000303 00000 n 
+0000000391 00000 n 
+0000000490 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R /Info 6 0 R
+   /ID [<C21ECF79CB937B009D9528EDFC968B93> <C21ECF79CB937B009D9528EDFC968B93>]
+>>
+startxref
+604
+%%EOF

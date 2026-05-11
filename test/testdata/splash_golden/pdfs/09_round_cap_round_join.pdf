@@ -1,0 +1,43 @@
+%PDF-1.4
+%‚„œ”
+% SP5 fixture #09 - round-cap-join
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [3 0 R] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 60] /Contents 4 0 R /Resources << /ProcSet [/PDF /Text /ImageB /ImageC /ImageI] >> >>
+endobj
+4 0 obj
+<< /Length 51 >>
+stream
+q
+0 0 0 RG
+3 w
+1 J
+1 j
+20 20 m 50 40 l 80 20 l S
+Q
+
+endstream
+endobj
+5 0 obj
+<< /Producer (splash-golden-gen) /CreationDate (D:20260427000000Z) /ModDate (D:20260427000000Z) >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000050 00000 n 
+0000000099 00000 n 
+0000000156 00000 n 
+0000000305 00000 n 
+0000000406 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R /Info 5 0 R
+   /ID [<915E6EB7B9176E998BCB3018568B9BF4> <915E6EB7B9176E998BCB3018568B9BF4>]
+>>
+startxref
+520
+%%EOF

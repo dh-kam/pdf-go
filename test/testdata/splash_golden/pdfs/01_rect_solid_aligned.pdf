@@ -1,0 +1,41 @@
+%PDF-1.4
+%‚„œ”
+% SP5 fixture #01 - rect-fill
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [3 0 R] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 60] /Contents 4 0 R /Resources << /ProcSet [/PDF /Text /ImageB /ImageC /ImageI] >> >>
+endobj
+4 0 obj
+<< /Length 30 >>
+stream
+q
+0 0 0 rg
+0 10 100 40 re
+f
+Q
+
+endstream
+endobj
+5 0 obj
+<< /Producer (splash-golden-gen) /CreationDate (D:20260427000000Z) /ModDate (D:20260427000000Z) >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000045 00000 n 
+0000000094 00000 n 
+0000000151 00000 n 
+0000000300 00000 n 
+0000000380 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R /Info 5 0 R
+   /ID [<4581F62DF4FE5DFB0E287AC6C677DE8D> <4581F62DF4FE5DFB0E287AC6C677DE8D>]
+>>
+startxref
+494
+%%EOF

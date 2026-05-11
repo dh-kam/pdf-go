@@ -1,0 +1,20 @@
+# Build artifacts
+/bin/
+/build/
+/dist/
+
+# Test and coverage outputs
+/coverage*.txt
+/coverage*.html
+*.test
+*.prof
+
+# Local/generated working data
+/tmp/
+
+# Python helper cache
+__pycache__/
+*.pyc
+
+# OS/editor noise
+.DS_Store
