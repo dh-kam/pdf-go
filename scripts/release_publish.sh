@@ -32,14 +32,7 @@ echo "[release] module=${REPO_MODULE}"
 run_cmd git tag -a "${VERSION}" -m "release: ${VERSION}"
 run_cmd git push origin "${VERSION}"
 
-if command -v gh >/dev/null 2>&1; then
-  run_cmd gh release create "${VERSION}" \
-    --verify-tag \
-    --title "${VERSION}" \
-    --notes "Automated release for ${VERSION}"
-else
-  echo "[release][warn] gh cli not found; skip GitHub release creation"
-fi
+echo "[release] pushed tag ${VERSION}; GitHub Actions will build artifacts and publish the release"
 
 run_cmd env GOPROXY=https://proxy.golang.org go list -m "${REPO_MODULE}@${VERSION}"
 

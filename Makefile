@@ -1,4 +1,4 @@
-.PHONY: all build build-pdf-go build-cli build-examples build-pdfinfo build-pdftext build-pdfrender build-all build-pure build-all-cgo build-no-cgo test coverage lint mock-gen clean run-tests test-no-cgo test-no-cgo-race coverage-no-cgo coverage-core-no-cgo render-regression-no-cgo check-no-cgo vet-no-cgo cli-smoke-no-cgo vuln-no-cgo goal98-batch-test-no-cgo goal98-batch-no-cgo goal98-html-no-cgo sample-compare-html-no-cgo sample-compare-tradeoff-no-cgo sample-compare-backlog-no-cgo sample-compare-focus-no-cgo sample-compare-faildocs-recheck-no-cgo sample-compare-iccbased-focus-no-cgo nightly-snapshot-no-cgo nightly-compare-diff-no-cgo profile-render-no-cgo profile-render-guard-no-cgo render-leak-check-no-cgo goal98-compare-report goal98-batch-compare-no-cgo goal98-guard-no-cgo pdfjs-select-eq pdfjs-render-parity pdfjs-parity-clean render-parity-report-test lex-render-parity-report-test render-parity-priority porting-complete porting-complete-plus-goal98 release-preflight release-dry-run release-publish
+.PHONY: all build build-pdf-go build-cli build-examples build-pdfinfo build-pdftext build-pdfrender build-all build-pure build-all-cgo build-no-cgo test coverage lint mock-gen clean run-tests test-no-cgo test-no-cgo-race fmt-check-release test-release-no-cgo coverage-no-cgo coverage-core-no-cgo render-regression-no-cgo check-no-cgo vet-no-cgo cli-smoke-no-cgo vuln-no-cgo vuln-release-no-cgo full-render-compare-html goal98-batch-test-no-cgo goal98-batch-no-cgo goal98-html-no-cgo sample-compare-html-no-cgo sample-compare-tradeoff-no-cgo sample-compare-backlog-no-cgo sample-compare-focus-no-cgo sample-compare-faildocs-recheck-no-cgo sample-compare-iccbased-focus-no-cgo nightly-snapshot-no-cgo nightly-compare-diff-no-cgo profile-render-no-cgo profile-render-guard-no-cgo render-leak-check-no-cgo goal98-compare-report goal98-batch-compare-no-cgo goal98-guard-no-cgo pdfjs-select-eq pdfjs-render-parity pdfjs-parity-clean render-parity-report-test lex-render-parity-report-test render-parity-priority porting-complete porting-complete-plus-goal98 release-ci release-build release-package release-preflight release-dry-run release-publish
 
 # Build variables
 BINARY_NAME=pdfrender
@@ -56,9 +56,11 @@ all_for_variant=$(foreach os,$(OS_LIST),$(foreach arch,$(ARCH_LIST),$(call build
 all_for_os_arch=$(foreach var,$(BUILD_VARIANTS),$(call build_stamp,$(1),$(2),$(var)))
 all_for_os_variant=$(foreach arch,$(ARCH_LIST),$(call build_stamp,$(1),$(arch),$(2)))
 all_for_arch_variant=$(foreach os,$(OS_LIST),$(call build_stamp,$(os),$(1),$(2)))
-GO_PACKAGES_NO_TMP=$(shell $(GOCMD) list ./... | grep -v '^github.com/dh-kam/pdf-go/tmp$$' | grep -v '^github.com/dh-kam/pdf-go/tmp/' | sed 's|^github.com/dh-kam/pdf-go|.|')
+GO_PACKAGES_NO_TMP=$(shell $(GOCMD) list ./... | grep -v '^github.com/dh-kam/pdf-go/tmp$$' | grep -v '^github.com/dh-kam/pdf-go/tmp/' | grep -v '^github.com/dh-kam/pdf-go/cmd$$' | grep -v '^github.com/dh-kam/pdf-go/test$$' | sed 's|^github.com/dh-kam/pdf-go|.|')
 GO_PACKAGES_NO_TMP_NO_INTEG=$(shell echo "$(GO_PACKAGES_NO_TMP)" | tr ' ' '\n' | grep -v '^\./test/integration/pdf$$' | tr '\n' ' ')
 GO_PACKAGES_NO_TMP_NO_E2E=$(shell echo "$(GO_PACKAGES_NO_TMP)" | tr ' ' '\n' | grep -v '^\./test/e2e$$' | tr '\n' ' ')
+GO_PACKAGES_RELEASE?=./cmd/pdfcompare ./cmd/pdfinfo ./cmd/pdfrender ./cmd/pdftext ./pkg/pdf
+GO_FORMAT_PATHS_RELEASE?=cmd/pdfcompare cmd/pdfinfo cmd/pdfrender cmd/pdftext pkg/pdf
 GOAL98_OUT?=$(CURDIR)/tmp/goal98_final_after_porting_complete_v2
 GOAL98_PREV_REPORT?=$(CURDIR)/tmp/goal98_prev_report.csv
 GOAL98_BASE_REPORT?=
@@ -90,6 +92,12 @@ SAMPLE_COMPARE_FAILDOCS_LIST?=$(SAMPLE_COMPARE_OUT)/fail_docs.txt
 SAMPLE_COMPARE_FAILDOCS_OUT?=$(CURDIR)/tmp/sample_compare_faildocs_recheck_only
 SAMPLE_COMPARE_FAILDOCS_TIMEOUT_SEC?=3600
 SAMPLE_COMPARE_FAILDOCS_PER_PAGE_TIMEOUT_SEC?=600
+FULL_COMPARE_OUT?=$(CURDIR)/tmp/full_render_compare
+FULL_COMPARE_SCAN_ROOT?=$(CURDIR)/test/testdata/sample-files
+FULL_COMPARE_DPI?=150
+FULL_COMPARE_BACKEND?=splash
+FULL_COMPARE_WORKERS?=4
+FULL_COMPARE_TIMEOUT_SEC?=900
 PROFILE_RENDER_OUT?=$(CURDIR)/tmp/prof_render
 PROFILE_RENDER_DPI?=150
 PROFILE_RENDER_WORKERS?=4
@@ -120,6 +128,9 @@ COVERAGE_CORE_EXCLUDE_REGEX?=github.com/dh-kam/pdf-go/pkg/pdf/|github.com/dh-kam
 RELEASE_VERSION?=v0.9.0-202602.1
 RELEASE_MODULE?=github.com/dh-kam/pdf-go/pkg/pdf
 RELEASE_DRY_RUN?=true
+RELEASE_OS_LIST?=linux darwin windows
+RELEASE_ARCH_LIST?=amd64 arm64
+RELEASE_DIST_DIR?=$(CURDIR)/dist
 PDFJS_SCAN_ROOT?=$(abspath $(CURDIR)/..)
 PDFJS_ROOT?=$(PDFJS_SCAN_ROOT)/pdf.js
 PDFJS_TEST_ROOT?=$(PDFJS_ROOT)/test
@@ -249,6 +260,22 @@ test-no-cgo:
 test-no-cgo-race:
 	@echo "Running race tests (no CGo, excluding long integration package)..."
 	$(GOTEST) -v -race -timeout=30m -tags='nojpx,nojbig2' $(GO_PACKAGES_NO_TMP_NO_INTEG)
+
+# Check formatting only for release-gated packages. The wider repository still
+# contains experimental probes that are tracked separately from release CI.
+fmt-check-release:
+	@echo "Checking release package formatting..."
+	@files="$$(gofmt -l $(GO_FORMAT_PATHS_RELEASE))"; \
+	if [ -n "$$files" ]; then \
+		echo "Go code is not formatted:"; \
+		echo "$$files"; \
+		exit 1; \
+	fi
+
+# Run release-safe smoke tests for CLI entry points and the public API.
+test-release-no-cgo:
+	@echo "Running release-safe tests (no CGo)..."
+	$(GOTEST) -v -race -timeout=30m -tags='nojpx,nojbig2' $(GO_PACKAGES_RELEASE)
 
 # Generate coverage report
 coverage: test
@@ -388,6 +415,25 @@ render-parity-priority:
 vuln-no-cgo:
 	@echo "Running vulnerability scan (no CGo)..."
 	$(GOCMD) run golang.org/x/vuln/cmd/govulncheck@latest -tags='nojpx,nojbig2' $(GO_PACKAGES_NO_TMP)
+
+# Run vulnerability scanning on the same package scope as release CI.
+vuln-release-no-cgo:
+	@echo "Running release vulnerability scan (no CGo)..."
+	$(GOCMD) run golang.org/x/vuln/cmd/govulncheck@latest -tags='nojpx,nojbig2' $(GO_PACKAGES_RELEASE)
+
+# Render every scanned PDF page with Poppler and this renderer, then write a
+# dashboard HTML report with Poppler, ours, and XOR+red-marker images per row.
+full-render-compare-html:
+	@echo "Generating full render compare HTML..."
+	$(GOCMD) run ./cmd/pdfcompare \
+		-repo-root $(CURDIR) \
+		-scan-root $(FULL_COMPARE_SCAN_ROOT) \
+		-out $(FULL_COMPARE_OUT) \
+		-dpi $(FULL_COMPARE_DPI) \
+		-backend $(FULL_COMPARE_BACKEND) \
+		-workers $(FULL_COMPARE_WORKERS) \
+		-timeout-sec $(FULL_COMPARE_TIMEOUT_SEC)
+	@echo "Full render compare HTML: $(FULL_COMPARE_OUT)/index.html"
 
 # Run no-CGo CLI smoke checks
 cli-smoke-no-cgo: build-no-cgo
@@ -702,6 +748,21 @@ porting-complete: lint check-no-cgo vuln-no-cgo cli-smoke-no-cgo
 porting-complete-plus-goal98: porting-complete goal98-guard-no-cgo
 	@echo "Porting completion + goal98 guard checks passed!"
 
+# Run the release validation gate used by GitHub Actions before tagging/publishing.
+release-ci: fmt-check-release vet-no-cgo test-release-no-cgo build-no-cgo vuln-release-no-cgo
+	@echo "Release validation checks passed!"
+
+# Build release binaries for every configured release OS/ARCH pair.
+release-build:
+	@rm -rf "$(BUILD_ROOT)"
+	@$(MAKE) --no-print-directory all OS_LIST="$(RELEASE_OS_LIST)" ARCH_LIST="$(RELEASE_ARCH_LIST)" BUILD_VARIANTS=release
+	@echo "Release build complete: $(BUILD_ROOT)"
+
+# Package release binaries into archives and checksums.
+release-package: release-build
+	@./scripts/package_release_assets.sh "$(RELEASE_VERSION)" "$(RELEASE_DIST_DIR)"
+	@echo "Release package complete: $(RELEASE_DIST_DIR)"
+
 # Run release preflight checks before tagging/publishing.
 release-preflight:
 	@./scripts/release_preflight.sh "$(CURDIR)" "$(RELEASE_VERSION)"
@@ -747,13 +808,18 @@ help:
 	@echo "  install-tools  - Install development tools"
 	@echo "  check          - Run all checks"
 	@echo "  vuln-no-cgo    - Run vulnerability scan without CGo dependencies"
+	@echo "  vuln-release-no-cgo - Run release-scoped vulnerability scan"
 	@echo "  cli-smoke-no-cgo - Run no-CGo CLI smoke checks"
+	@echo "  full-render-compare-html - Render scanned PDFs with Poppler/ours and generate dashboard HTML"
 	@echo "  render-parity-report-test - Compare all scanned PDFs against poppler and write report artifacts"
 	@echo "  lex-render-parity-report-test - Compare lex fixtures against poppler and classify confirmed/unconfirmed"
 	@echo "  render-parity-priority - Print worst render parity pages/documents from report.csv"
 	@echo "  goal98-batch-no-cgo - Run full PNG parity batch against poppler"
 	@echo "  goal98-batch-test-no-cgo - Run goal98 batch unit tests without CGo"
 	@echo "  goal98-html-no-cgo - Generate goal98 HTML compare report (poppler/ours/xor)"
+	@echo "  release-ci     - Run the GitHub Actions release validation gate"
+	@echo "  release-build  - Build release binaries for RELEASE_OS_LIST/RELEASE_ARCH_LIST"
+	@echo "  release-package - Build and package release archives into RELEASE_DIST_DIR"
 	@echo "  pdfjs-select-eq - Select local whole-page eq docs from pdf.js test_manifest"
 	@echo "  pdfjs-render-parity - Run fast pdf.js-manifest-driven poppler parity batch"
 	@echo "  sample-compare-html-no-cgo - Run sample-only compare and generate HTML report (99% PASS)"

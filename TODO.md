@@ -33,6 +33,9 @@
 - [ ] 비교 HTML의 poppler/ours/xor 구조와 `failure_type` 2차 정렬을 유지한다.
 
 ## Release Checklist
+- [x] GitHub Actions CI no-CGo validation/build workflow를 정리한다.
+- [x] GitHub Actions 수동 실행 기반 semver tag bump workflow를 추가한다.
+- [x] Tag push 기반 release artifact 빌드 및 GitHub Release 생성 workflow를 추가한다.
 - [ ] Tag release.
 - [ ] Create GitHub release.
 - [ ] Publish Go module.

@@ -1,0 +1,87 @@
+name: Bump Release Tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semver component to bump when version is empty.
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      version:
+        description: Optional explicit version tag, for example v1.2.3.
+        required: false
+        type: string
+      dry_run:
+        description: Compute and validate the tag without pushing it.
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bump-release-tag
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Bump Release Tag
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Require main branch
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "Release tags must be created from main, got ${GITHUB_REF_NAME}." >&2
+            exit 1
+          fi
+
+      - name: Determine next version
+        id: version
+        run: |
+          version="$(./scripts/next_version.sh "${{ inputs.bump }}" "${{ inputs.version }}")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Next release tag: ${version}"
+
+      - name: Ensure tag does not exist
+        run: |
+          if git rev-parse --verify --quiet "refs/tags/${{ steps.version.outputs.version }}" >/dev/null; then
+            echo "Tag already exists: ${{ steps.version.outputs.version }}" >&2
+            exit 1
+          fi
+
+      - name: Run release validation gate
+        run: make release-ci
+
+      - name: Create local tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.version }}" -m "release: ${{ steps.version.outputs.version }}"
+
+      - name: Push release tag
+        if: ${{ !inputs.dry_run }}
+        run: git push origin "${{ steps.version.outputs.version }}"
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "Dry run complete. Tag was not pushed: ${{ steps.version.outputs.version }}"

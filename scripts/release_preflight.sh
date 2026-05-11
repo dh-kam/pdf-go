@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="${1:-$(pwd)}"
 VERSION="${2:-}"
+RELEASE_GATE="${RELEASE_GATE:-release-ci}"
 
 if [[ -z "${VERSION}" ]]; then
   echo "usage: release_preflight.sh <repo-root> <version>" >&2
@@ -50,17 +51,7 @@ if git rev-parse --verify --quiet "refs/tags/${VERSION}" >/dev/null; then
   exit 16
 fi
 
-echo "[preflight] checking release gate..."
-make porting-complete-plus-goal98
-
-if command -v gh >/dev/null 2>&1; then
-  echo "[preflight] gh cli detected"
-  if ! gh auth status >/dev/null 2>&1; then
-    echo "[preflight][fail] gh auth status failed; run 'gh auth login'" >&2
-    exit 17
-  fi
-else
-  echo "[preflight][warn] gh cli not found; GitHub release step will require manual execution"
-fi
+echo "[preflight] checking release gate: ${RELEASE_GATE}"
+make "${RELEASE_GATE}"
 
 echo "[preflight] ok"
