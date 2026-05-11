@@ -254,12 +254,12 @@ test-fast:
 # Run tests without CGo dependencies
 test-no-cgo:
 	@echo "Running tests (no CGo)..."
-	$(GOTEST) -v -tags='nojpx,nojbig2' $(GO_PACKAGES_NO_TMP)
+	$(GOTEST) -v -tags='$(NO_CGO_TAGS)' $(GO_PACKAGES_NO_TMP)
 
 # Run race tests without CGo dependencies
 test-no-cgo-race:
 	@echo "Running race tests (no CGo, excluding long integration package)..."
-	$(GOTEST) -v -race -timeout=30m -tags='nojpx,nojbig2' $(GO_PACKAGES_NO_TMP_NO_INTEG)
+	$(GOTEST) -v -race -timeout=30m -tags='$(NO_CGO_TAGS)' $(GO_PACKAGES_NO_TMP_NO_INTEG)
 
 # Check formatting only for release-gated packages. The wider repository still
 # contains experimental probes that are tracked separately from release CI.
@@ -275,7 +275,7 @@ fmt-check-release:
 # Run release-safe smoke tests for CLI entry points and the public API.
 test-release-no-cgo:
 	@echo "Running release-safe tests (no CGo)..."
-	$(GOTEST) -v -race -timeout=30m -tags='nojpx,nojbig2' $(GO_PACKAGES_RELEASE)
+	$(GOTEST) -v -race -timeout=30m -tags='$(NO_CGO_TAGS)' $(GO_PACKAGES_RELEASE)
 
 # Generate coverage report
 coverage: test
@@ -291,7 +291,7 @@ coverage-show: test
 # Generate and show coverage report without CGo dependencies
 coverage-no-cgo:
 	@echo "Running coverage (no CGo)..."
-	$(GOTEST) -tags='nojpx,nojbig2' -coverpkg=./internal/...,./pkg/... -coverprofile=coverage_no_cgo.txt $(GO_PACKAGES_NO_TMP_NO_E2E)
+	$(GOTEST) -tags='$(NO_CGO_TAGS)' -coverpkg=./internal/...,./pkg/... -coverprofile=coverage_no_cgo.txt $(GO_PACKAGES_NO_TMP_NO_E2E)
 	@TOTAL="$$( $(GOCMD) tool cover -func=coverage_no_cgo.txt | awk '/^total:/ {print $$3}' )"; \
 	echo "Coverage total (no CGo): $$TOTAL"
 
@@ -308,7 +308,7 @@ coverage-core-no-cgo: coverage-no-cgo
 # Run render regression exact-compare tests without CGo dependencies
 render-regression-no-cgo:
 	@echo "Running render regression tests (no CGo)..."
-	$(GOTEST) -v -count=1 -tags='nojpx,nojbig2' ./test/e2e -run TestCLI_PDFRender_ExactBaseline
+	$(GOTEST) -v -count=1 -tags='$(NO_CGO_TAGS)' ./test/e2e -run TestCLI_PDFRender_ExactBaseline
 
 # Run linter
 lint:
@@ -357,7 +357,7 @@ vet:
 # Run vet without CGo dependencies
 vet-no-cgo:
 	@echo "Running go vet (no CGo)..."
-	$(GOCMD) vet -tags='nojpx,nojbig2' $(GO_PACKAGES_NO_TMP)
+	$(GOCMD) vet -tags='$(NO_CGO_TAGS)' $(GO_PACKAGES_NO_TMP)
 
 # Build without CGo (minimal dependencies)
 build-pure:
@@ -414,12 +414,12 @@ render-parity-priority:
 # Run vulnerability scan without CGo dependencies
 vuln-no-cgo:
 	@echo "Running vulnerability scan (no CGo)..."
-	$(GOCMD) run golang.org/x/vuln/cmd/govulncheck@latest -tags='nojpx,nojbig2' $(GO_PACKAGES_NO_TMP)
+	$(GOCMD) run golang.org/x/vuln/cmd/govulncheck@latest -tags='$(NO_CGO_TAGS)' $(GO_PACKAGES_NO_TMP)
 
 # Run vulnerability scanning on the same package scope as release CI.
 vuln-release-no-cgo:
 	@echo "Running release vulnerability scan (no CGo)..."
-	$(GOCMD) run golang.org/x/vuln/cmd/govulncheck@latest -tags='nojpx,nojbig2' $(GO_PACKAGES_RELEASE)
+	$(GOCMD) run golang.org/x/vuln/cmd/govulncheck@latest -tags='$(NO_CGO_TAGS)' $(GO_PACKAGES_RELEASE)
 
 # Render every scanned PDF page with Poppler and this renderer, then write a
 # dashboard HTML report with Poppler, ours, and XOR+red-marker images per row.
@@ -446,7 +446,7 @@ cli-smoke-no-cgo: build-no-cgo
 # Run full PNG parity batch against poppler (goal98 profile)
 goal98-batch-no-cgo:
 	@echo "Running goal98 batch (no CGo)..."
-	$(GOCMD) run -tags='nojpx,nojbig2' ./tmp/goal98_batch.go \
+	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_batch.go \
 		-repo-root $(CURDIR) \
 		-scan-root $(CURDIR) \
 		-out $(GOAL98_OUT) \
@@ -459,12 +459,12 @@ goal98-batch-no-cgo:
 # Run goal98 batch unit tests without CGo.
 goal98-batch-test-no-cgo:
 	@echo "Running goal98 batch unit tests (no CGo)..."
-	$(GOCMD) test -tags='nojpx,nojbig2' ./tmp/goal98_batch.go ./tmp/goal98_batch_test.go -count=1
+	$(GOCMD) test -tags='$(NO_CGO_TAGS)' ./tmp/goal98_batch.go ./tmp/goal98_batch_test.go -count=1
 
 # Generate goal98 HTML compare report (poppler vs ours vs xor).
 goal98-html-no-cgo:
 	@echo "Generating goal98 HTML compare report (no CGo)..."
-	$(GOCMD) run -tags='nojpx,nojbig2' ./tmp/goal98_compare_html.go \
+	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_compare_html.go \
 		-report $(GOAL98_OUT)/report.csv \
 		-out $(GOAL98_HTML_OUT) \
 		-threshold $(GOAL98_HTML_THRESHOLD) \
@@ -473,7 +473,7 @@ goal98-html-no-cgo:
 # Run sample-only poppler-vs-ours compare and generate HTML report (99% gate).
 sample-compare-html-no-cgo:
 	@echo "Running sample-only compare batch + HTML report (no CGo)..."
-	$(GOCMD) run -tags='nojpx,nojbig2' ./tmp/goal98_batch.go \
+	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_batch.go \
 		-repo-root $(CURDIR) \
 		-scan-root $(CURDIR) \
 		-out $(SAMPLE_COMPARE_OUT) \
@@ -485,7 +485,7 @@ sample-compare-html-no-cgo:
 		-sample-only=true \
 		-sample-root $(SAMPLE_COMPARE_SAMPLE_ROOT) \
 		-skip-compressed-duplicates=$(SAMPLE_COMPARE_SKIP_COMPRESSED_DUPLICATES)
-	$(GOCMD) run -tags='nojpx,nojbig2' ./tmp/goal98_compare_html.go \
+	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_compare_html.go \
 		-report $(SAMPLE_COMPARE_OUT)/report.csv \
 		-out $(SAMPLE_COMPARE_OUT)/html \
 		-threshold $(SAMPLE_COMPARE_THRESHOLD) \
@@ -544,7 +544,7 @@ sample-compare-faildocs-recheck-no-cgo:
 		| sort -u > "$(SAMPLE_COMPARE_FAILDOCS_LIST)"
 	@echo "Failed docs: $$(wc -l < "$(SAMPLE_COMPARE_FAILDOCS_LIST)")"
 	@echo "Running failed-doc recompare batch..."
-	$(GOCMD) run -tags='nojpx,nojbig2' ./tmp/goal98_batch.go \
+	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_batch.go \
 		-repo-root $(CURDIR) \
 		-scan-root $(CURDIR) \
 		-out $(SAMPLE_COMPARE_FAILDOCS_OUT) \
@@ -558,7 +558,7 @@ sample-compare-faildocs-recheck-no-cgo:
 		-sample-root $(SAMPLE_COMPARE_SAMPLE_ROOT) \
 		-skip-compressed-duplicates=$(SAMPLE_COMPARE_SKIP_COMPRESSED_DUPLICATES) \
 		-include-doc-list $(SAMPLE_COMPARE_FAILDOCS_LIST)
-	$(GOCMD) run -tags='nojpx,nojbig2' ./tmp/goal98_compare_html.go \
+	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_compare_html.go \
 		-report $(SAMPLE_COMPARE_FAILDOCS_OUT)/report.csv \
 		-out $(SAMPLE_COMPARE_FAILDOCS_OUT)/html \
 		-threshold $(SAMPLE_COMPARE_THRESHOLD) \
@@ -566,7 +566,7 @@ sample-compare-faildocs-recheck-no-cgo:
 		-sample-root $(SAMPLE_COMPARE_SAMPLE_ROOT)
 	@awk -F, 'NR==1 || $$6 != "true" || $$7 != "true" || $$10 != ""' \
 		"$(SAMPLE_COMPARE_FAILDOCS_OUT)/report.csv" > "$(SAMPLE_COMPARE_FAILDOCS_OUT)/report_fail_only.csv"
-	$(GOCMD) run -tags='nojpx,nojbig2' ./tmp/goal98_compare_html.go \
+	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_compare_html.go \
 		-report $(SAMPLE_COMPARE_FAILDOCS_OUT)/report_fail_only.csv \
 		-out $(SAMPLE_COMPARE_FAILDOCS_OUT)/html_fail_only \
 		-threshold $(SAMPLE_COMPARE_THRESHOLD) \
@@ -663,7 +663,7 @@ nightly-compare-diff-no-cgo:
 profile-render-no-cgo:
 	@echo "Profiling renderer (no CGo)..."
 	@mkdir -p $(PROFILE_RENDER_OUT)
-	$(GOCMD) run -tags='nojpx,nojbig2' ./tmp/render_profile.go \
+	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/render_profile.go \
 		-root $(CURDIR) \
 		-dpi $(PROFILE_RENDER_DPI) \
 		-workers $(PROFILE_RENDER_WORKERS) \
@@ -688,7 +688,7 @@ profile-render-guard-no-cgo: profile-render-no-cgo
 render-leak-check-no-cgo:
 	@echo "Running renderer leak check (no CGo)..."
 	@mkdir -p $(LEAK_CHECK_OUT)
-	$(GOCMD) run -tags='nojpx,nojbig2' ./tmp/render_leak_check.go \
+	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/render_leak_check.go \
 		-root $(CURDIR) \
 		-dpi $(LEAK_CHECK_DPI) \
 		-workers $(LEAK_CHECK_WORKERS) \
