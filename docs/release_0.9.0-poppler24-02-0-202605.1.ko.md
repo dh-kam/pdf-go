@@ -1,4 +1,4 @@
-# 릴리즈 준비 문서 (`v0.9.0-202602.1`)
+# 릴리즈 준비 문서 (`v0.9.0-poppler24-02-0-202605.1`)
 
 ## 목적
 
@@ -26,14 +26,14 @@ make porting-complete-plus-goal98
 자동화 preflight(권장):
 
 ```bash
-make release-preflight RELEASE_VERSION=v0.9.0-202602.1
+make release-preflight RELEASE_VERSION=v0.9.0-poppler24-02-0-202605.1
 ```
 
 ## 1) Tag 생성
 
 ```bash
-git tag -a v0.9.0-202602.1 -m "release: v0.9.0-202602.1"
-git push origin v0.9.0-202602.1
+git tag -a v0.9.0-poppler24-02-0-202605.1 -m "release: v0.9.0-poppler24-02-0-202605.1"
+git push origin v0.9.0-poppler24-02-0-202605.1
 ```
 
 ## 2) GitHub Release 생성
@@ -52,13 +52,13 @@ git push origin v0.9.0-202602.1
 Go proxy 반영 확인:
 
 ```bash
-GONOSUMDB=github.com/dh-kam/pdf-go go list -m github.com/dh-kam/pdf-go/pkg/pdf@v0.9.0-202602.1
+GONOSUMDB=github.com/dh-kam/pdf-go go list -m github.com/dh-kam/pdf-go/pkg/pdf@v0.9.0-poppler24-02-0-202605.1
 ```
 
 필요 시:
 
 ```bash
-GOPROXY=https://proxy.golang.org go list -m github.com/dh-kam/pdf-go/pkg/pdf@v0.9.0-202602.1
+GOPROXY=https://proxy.golang.org go list -m github.com/dh-kam/pdf-go/pkg/pdf@v0.9.0-poppler24-02-0-202605.1
 ```
 
 ## 자동화 릴리즈 실행
@@ -66,13 +66,13 @@ GOPROXY=https://proxy.golang.org go list -m github.com/dh-kam/pdf-go/pkg/pdf@v0.
 사전 검증 + 태그/릴리즈/모듈 확인을 하나의 흐름으로 실행:
 
 ```bash
-make release-publish RELEASE_VERSION=v0.9.0-202602.1 RELEASE_MODULE=github.com/dh-kam/pdf-go/pkg/pdf
+make release-publish RELEASE_VERSION=v0.9.0-poppler24-02-0-202605.1 RELEASE_MODULE=github.com/dh-kam/pdf-go/pkg/pdf
 ```
 
 부작용 없이 명령만 검증하려면:
 
 ```bash
-make release-dry-run RELEASE_VERSION=v0.9.0-202602.1 RELEASE_DRY_RUN=true
+make release-dry-run RELEASE_VERSION=v0.9.0-poppler24-02-0-202605.1 RELEASE_DRY_RUN=true
 ```
 
 ## 릴리즈 후 체크리스트

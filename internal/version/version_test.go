@@ -8,5 +8,5 @@ import (
 
 func TestCurrentVersion(t *testing.T) {
 	assert.NotEmpty(t, Current)
-	assert.Equal(t, "0.9.0-202602.1", Current)
+	assert.Equal(t, "0.9.0-poppler24-02-0-202605.1", Current)
 }

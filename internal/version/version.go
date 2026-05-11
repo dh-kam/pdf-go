@@ -2,4 +2,4 @@
 package version
 
 // Current is the release version for this build.
-const Current = "0.9.0-202602.1"
+const Current = "0.9.0-poppler24-02-0-202605.1"

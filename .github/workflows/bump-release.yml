@@ -4,16 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: Semver component to bump when version is empty.
+        description: Release-train component to bump when version is empty.
         required: true
-        default: patch
+        default: sequence
         type: choice
         options:
-          - patch
-          - minor
-          - major
+          - sequence
+      upstream_version:
+        description: Upstream version slug or raw version. Empty defaults to the Poppler golden version.
+        required: false
+        type: string
+      release_month:
+        description: Release month in YYYYMM. Empty defaults to the current UTC month.
+        required: false
+        type: string
       version:
-        description: Optional explicit version tag, for example v1.2.3.
+        description: Optional explicit version tag, for example v0.9.0-poppler24-02-0-202605.1.
         required: false
         type: string
       dry_run:
@@ -57,7 +63,7 @@ jobs:
       - name: Determine next version
         id: version
         run: |
-          version="$(./scripts/next_version.sh "${{ inputs.bump }}" "${{ inputs.version }}")"
+          version="$(./scripts/next_version.sh "${{ inputs.bump }}" "${{ inputs.version }}" "${{ inputs.upstream_version }}" "${{ inputs.release_month }}")"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "Next release tag: ${version}"
 
