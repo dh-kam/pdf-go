@@ -146,7 +146,10 @@ func TestMeasureSyntheticGlyphCodeOutlineProbeResults_ResolvesGlyphMetadata(t *t
 	require.Equal(t, "slash", results[0].glyphName)
 	require.NotZero(t, results[0].glyph)
 	require.NotNil(t, results[0].path)
-	require.Equal(t, [4]float64{56, -751, 441, 248}, results[0].bounds)
+	require.InDelta(t, 0, results[0].bounds[0], 0.0001)
+	require.InDelta(t, -722.65625, results[0].bounds[1], 0.0001)
+	require.InDelta(t, 277.83203125, results[0].bounds[2], 0.0001)
+	require.InDelta(t, 68.359375, results[0].bounds[3], 0.0001)
 	require.False(t, results[0].hasDecodedRune)
 	require.Equal(t, 65, results[1].code)
 	require.Equal(t, "A", results[1].glyphName)
@@ -165,8 +168,8 @@ func TestMeasureSyntheticGlyphCodeOrderingForProbe_UsesExpectedWorstCodes(t *tes
 
 	require.Equal(t, 47, result.lowestDensity.code)
 	require.Equal(t, "slash", result.lowestDensity.glyphName)
-	require.Equal(t, 84, result.lowestCurve.code)
-	require.Equal(t, "T", result.lowestCurve.glyphName)
+	require.Equal(t, 65, result.lowestCurve.code)
+	require.Equal(t, "A", result.lowestCurve.glyphName)
 }
 
 func TestSyntheticGlyphCodeOutlineProbeResult_BoundsHelpers(t *testing.T) {

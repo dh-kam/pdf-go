@@ -110,17 +110,13 @@ func ExampleDetectFormat() {
 	}
 }
 
-// ExampleBuildTags demonstrates building with different CGo configurations.
+// ExampleBuildTags demonstrates building the pure Go decoder path.
 func ExampleBuildTags() {
-	// To build without CGo (stub implementations):
-	// go build -tags='nojpx,nojbig2'
-	//
-	// To build with CGo (requires OpenJPEG and jbig2dec):
+	// The project uses pure Go decoders by default:
 	// go build
 	//
-	// The decoder automatically uses the best available implementation:
-	// - CGo wrapper when library is available
-	// - Native Go stub when library is not available
+	// The decoder path does not require external native JPEG2000 or JBIG2
+	// libraries.
 
 	_ = "see comments above"
 }

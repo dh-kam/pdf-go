@@ -17,4 +17,3 @@ func measureRealPageNonLowerPriorityAcrossDPIProbeAgainstPoppler(
 		dpi150: measureRealPageNonLowerPriorityAtDPIProbeAgainstPoppler(t, 150),
 	}
 }
-

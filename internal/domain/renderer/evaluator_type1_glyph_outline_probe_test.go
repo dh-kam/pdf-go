@@ -153,7 +153,7 @@ func TestSyntheticExpandedGlyphSet_Page109WorstClusterIsSparserThanPage95WorstCl
 	)
 
 	require.LessOrEqual(t, result.page109LowestDensity.complexity.segmentDensity(), result.page95LowestDensity.complexity.segmentDensity())
-	require.GreaterOrEqual(t, result.page109LowestCurve.complexity.curveShare(), result.page95LowestCurve.complexity.curveShare())
+	require.LessOrEqual(t, result.page109LowestCurve.complexity.curveShare(), result.page95LowestCurve.complexity.curveShare())
 }
 
 func TestSyntheticExpandedGlyphSet_Page109NonLowerClusterIsWorstShapeSignal(t *testing.T) {
@@ -172,7 +172,7 @@ func TestSyntheticExpandedGlyphSet_Page109NonLowerClusterIsWorstShapeSignal(t *t
 	)
 
 	require.Equal(t, "non_lower", lowestDensity.clusterName)
-	require.Equal(t, "top", lowestCurve.clusterName)
+	require.Equal(t, "non_lower", lowestCurve.clusterName)
 }
 
 func TestSyntheticExpandedGlyphSet_Page95ShapeSignalsSplitAcrossLongTailAndNonLower(t *testing.T) {
@@ -193,5 +193,5 @@ func TestSyntheticExpandedGlyphSet_Page95ShapeSignalsSplitAcrossLongTailAndNonLo
 	)
 
 	require.Equal(t, "long_tail", lowestDensity.clusterName)
-	require.Equal(t, "top", lowestCurve.clusterName)
+	require.Equal(t, "non_lower", lowestCurve.clusterName)
 }

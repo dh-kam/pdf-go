@@ -240,6 +240,7 @@ func renderSamplePageAgainstPopplerAtDPIToPNGs(
 	dpi int,
 ) (string, string) {
 	t.Helper()
+	requirePopplerProbeOptIn(t)
 
 	root := t.TempDir()
 	popplerRoot := filepath.Join(root, "poppler")
@@ -278,6 +279,7 @@ func renderSyntheticPDFAgainstPopplerAtDPIToPNGs(
 	dpi int,
 ) (string, string) {
 	t.Helper()
+	requirePopplerProbeOptIn(t)
 
 	root := t.TempDir()
 	pdfPath := filepath.Join(root, pdfName)

@@ -52,10 +52,10 @@ func TestSyntheticExpandedGlyphSet_Page109NonLowerWorstCodesExposeSourceOutlineT
 	require.Equal(t, 47, lowestDensity.code)
 	require.Equal(t, "slash", lowestDensity.glyphName)
 	require.False(t, lowestDensity.hasDecodedRune)
-	require.Equal(t, 84, lowestCurve.code)
-	require.Equal(t, "T", lowestCurve.glyphName)
+	require.Equal(t, 65, lowestCurve.code)
+	require.Equal(t, "A", lowestCurve.glyphName)
 	require.True(t, lowestCurve.hasDecodedRune)
-	require.Equal(t, rune('T'), lowestCurve.decodedRune)
+	require.Equal(t, rune('A'), lowestCurve.decodedRune)
 }
 
 func TestSyntheticExpandedGlyphSet_Page109NonLowerWorstCodesExposeDistinctSparseOutlineModes(t *testing.T) {
@@ -82,7 +82,8 @@ func TestSyntheticExpandedGlyphSet_Page109NonLowerWorstCodesExposeDistinctSparse
 	require.Equal(t, "A", upperA.glyphName)
 	require.LessOrEqual(t, slash.complexity.segmentDensity(), upperA.complexity.segmentDensity())
 	require.GreaterOrEqual(t, slash.complexity.areaPerSegment(), upperA.complexity.areaPerSegment())
-	require.GreaterOrEqual(t, slash.complexity.curveShare(), upperA.complexity.curveShare())
+	require.Equal(t, 0.0, slash.complexity.curveShare())
+	require.Equal(t, 0.0, upperA.complexity.curveShare())
 }
 
 func TestSyntheticExpandedGlyphSet_Page109NonLowerWorstCodesExposeDistinctBoundsGeometry(t *testing.T) {
@@ -163,8 +164,8 @@ func TestSyntheticExpandedGlyphSet_Page109SlashHasSimplerLineOnlyPathThanA(t *te
 		upperA.complexity.closeShare(),
 	)
 
-	require.Greater(t, slash.complexity.curves, 0)
-	require.Greater(t, upperA.complexity.curves, 0)
+	require.Equal(t, 0, slash.complexity.curves)
+	require.Equal(t, 0, upperA.complexity.curves)
 	require.Less(t, slash.complexity.totalSegments(), upperA.complexity.totalSegments())
 	require.LessOrEqual(t, slash.complexity.lineShare(), upperA.complexity.lineShare())
 }
@@ -183,7 +184,10 @@ func TestSyntheticExpandedGlyphSet_Page109SlashPathSegmentsExposeTallNarrowOutli
 	)
 
 	require.Equal(t, "slash", slash.glyphName)
-	require.Equal(t, [4]float64{56, -751, 441, 248}, slash.bounds)
+	require.InDelta(t, 0, slash.bounds[0], 0.0001)
+	require.InDelta(t, -722.65625, slash.bounds[1], 0.0001)
+	require.InDelta(t, 277.83203125, slash.bounds[2], 0.0001)
+	require.InDelta(t, 68.359375, slash.bounds[3], 0.0001)
 	require.Greater(t, slash.complexity.totalSegments(), 0)
 }
 
@@ -255,7 +259,6 @@ func TestSyntheticExpandedGlyphSet_Page109HighestLowRatioCodeExposesDistinctGeom
 	require.GreaterOrEqual(t, highestLowRatio.lowRatio, lowestDensity.lowRatio)
 	require.GreaterOrEqual(t, highestLowRatio.complexity.segmentDensity(), lowestDensity.complexity.segmentDensity())
 }
-
 
 func TestStandardSlashSourceAlternatives_ExposeLessSparseCandidatesThanTimesRoman(t *testing.T) {
 	result := measureStandardGlyphSourceAlternativesForProbe(t, 47, "Times-Roman", "Helvetica", "Courier")
@@ -331,10 +334,10 @@ func TestSyntheticExpandedGlyphSet_Page95LongTailWorstCodesExposeCandidates(t *t
 		lowestCurve.lowRatio,
 	)
 
-	require.Equal(t, 111, lowestDensity.code)
-	require.Equal(t, "o", lowestDensity.glyphName)
-	require.Equal(t, 108, lowestCurve.code)
-	require.Equal(t, "l", lowestCurve.glyphName)
+	require.Equal(t, 118, lowestDensity.code)
+	require.Equal(t, "v", lowestDensity.glyphName)
+	require.Equal(t, 118, lowestCurve.code)
+	require.Equal(t, "v", lowestCurve.glyphName)
 }
 
 func TestStandardVSourceAlternatives_ExposeBestCandidateAgainstTimesRoman(t *testing.T) {

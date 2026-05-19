@@ -3,8 +3,11 @@ package image_test
 
 import (
 	"bytes"
+	stdimage "image"
+	"image/color"
 	"testing"
 
+	jpeg2000 "github.com/ajroetker/go-jpeg2000"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -34,9 +37,15 @@ func TestJPEG2000Decoding(t *testing.T) {
 			errMsg:  "invalid",
 		},
 		{
-			name:    "valid JP2 signature (stub)",
-			data:    createJP2StubData(),
+			name:    "valid JP2 codestream",
+			data:    createJP2Data(t),
 			wantErr: false,
+		},
+		{
+			name:    "JP2 signature without codestream",
+			data:    createJP2StubData(),
+			wantErr: true,
+			errMsg:  "jpx_native_decode",
 		},
 		{
 			name:    "invalid JP2 signature",
@@ -84,7 +93,7 @@ func TestJBIG2Decoding(t *testing.T) {
 			name:    "too short data",
 			data:    []byte{0x97, 0x4A},
 			wantErr: true,
-			errMsg:  "invalid",
+			errMsg:  "truncated",
 		},
 		{
 			name:    "valid JBIG2 signature (stub)",
@@ -252,7 +261,7 @@ func TestJBIG2SupportedFormats(t *testing.T) {
 // TestJPXDecodeConfig tests JPEG2000 configuration decoding.
 func TestJPXDecodeConfig(t *testing.T) {
 	decoder := jpx.NewDecoder()
-	data := createJP2StubData()
+	data := createJP2Data(t)
 
 	cfg, err := decoder.DecodeConfig(data)
 	if err != nil {
@@ -290,25 +299,19 @@ func TestIntegrationDecoderWithJPX(t *testing.T) {
 	decoder := imageinfrastructure.NewDecoder()
 
 	imgData := &image.ImageData{
-		Width:            100,
-		Height:           100,
+		Width:            4,
+		Height:           4,
 		ColorSpace:       image.ColorSpaceDeviceRGB,
 		BitsPerComponent: 8,
 		Filter:           image.FilterJPX,
-		Data:             createJP2StubData(),
+		Data:             createJP2Data(t),
 	}
 
-	// This should not panic
 	result, err := decoder.Decode(imgData)
-	if err != nil {
-		// Expected for stub implementation
-		t.Logf("Decode returned error (expected for stub): %v", err)
-	}
-	if result != nil {
-		if result.Width() <= 0 || result.Height() <= 0 {
-			assert.Failf(t, "assertion failed", "Decode() returned invalid dimensions: %dx%d", result.Width(), result.Height())
-		}
-	}
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, 4, result.Width())
+	assert.Equal(t, 4, result.Height())
 }
 
 // TestIntegrationDecoderWithJBIG2 tests integration with main decoder.
@@ -345,7 +348,7 @@ func TestFallbackBehavior(t *testing.T) {
 
 	// Even without CGo, the decoder should handle the data
 	// (returning placeholder images for stubs)
-	jp2Data := createJP2StubData()
+	jp2Data := createJP2Data(t)
 	jbig2Data := createJBIG2StubData()
 
 	jpxImg, jpxErr := jpxDecoder.Decode(jp2Data)
@@ -353,7 +356,7 @@ func TestFallbackBehavior(t *testing.T) {
 
 	// Should either succeed with a placeholder or fail gracefully
 	if jpxImg != nil {
-		t.Logf("JPX decode succeeded (likely stub implementation)")
+		t.Logf("JPX decode succeeded")
 	} else if jpxErr != nil {
 		t.Logf("JPX decode failed gracefully: %v", jpxErr)
 	}
@@ -397,12 +400,12 @@ func TestMalformedData(t *testing.T) {
 			data: []byte{0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20},
 		},
 		{
-			name: "JPX with valid but minimal data",
+			name: "JPX with signature but no codestream",
 			decoder: decodeFunc(func(data []byte) error {
 				_, err := jpx.NewDecoder().Decode(data)
 				return err
 			}),
-			data: createJP2StubData(), // This should succeed (stub)
+			data: createJP2StubData(),
 		},
 	}
 
@@ -425,6 +428,31 @@ func (f decodeFunc) Decode(data []byte) error {
 }
 
 // Helper functions
+
+func createJP2Data(t *testing.T) []byte {
+	t.Helper()
+
+	img := stdimage.NewRGBA(stdimage.Rect(0, 0, 4, 4))
+	for y := 0; y < 4; y++ {
+		for x := 0; x < 4; x++ {
+			img.SetRGBA(x, y, color.RGBA{
+				R: uint8(10 + x*20),
+				G: uint8(30 + y*20),
+				B: uint8(90 + x*10 + y*5),
+				A: 255,
+			})
+		}
+	}
+
+	var buf bytes.Buffer
+	err := jpeg2000.Encode(&buf, img, &jpeg2000.EncodeOptions{
+		Lossless:       true,
+		NumResolutions: 1,
+		FileFormat:     jpeg2000.FormatJP2,
+	})
+	require.NoError(t, err)
+	return buf.Bytes()
+}
 
 func createJP2StubData() []byte {
 	buf := new(bytes.Buffer)
@@ -473,30 +501,28 @@ func createJBIG2StubData() []byte {
 	buf.Write([]byte{0x97, 0x4A, 0x42, 0x32, 0x0D, 0x0A, 0x1A, 0x0A})
 
 	// File header
-	// Number of pages: 1
+	buf.Write([]byte{0x00})                   // sequential organization, known page count
 	buf.Write([]byte{0x00, 0x00, 0x00, 0x01}) // 1 page
-
-	// Organization flag: sequential
-	buf.Write([]byte{0x00})
 
 	// Page information segment (type 48)
 	// Segment number: 1
 	buf.Write([]byte{0x00, 0x00, 0x00, 0x01})
 
-	// Flags: page info segment, no retained segments
 	buf.Write([]byte{0x30}) // Type: 48
+	buf.Write([]byte{0x00}) // No referred-to segments
+	buf.Write([]byte{0x01}) // Page association
 
-	// Segment data length (24-bit)
-	buf.Write([]byte{0x00, 0x00, 0x05})
+	// Segment data length
+	buf.Write([]byte{0x00, 0x00, 0x00, 0x13})
 
 	// Page info data
 	buf.Write([]byte{
 		0x00, 0x00, 0x00, 0x64, // Width: 100
 		0x00, 0x00, 0x00, 0x64, // Height: 100
-		0x00, // Resolution X
-		0x00, // Resolution Y
-		0x00, // Flags
-		0x00, // Striping info
+		0x00, 0x00, 0x00, 0x00, // Resolution X
+		0x00, 0x00, 0x00, 0x00, // Resolution Y
+		0x00,       // Flags
+		0x00, 0x00, // Striping info
 	})
 
 	return buf.Bytes()

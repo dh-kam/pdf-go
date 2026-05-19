@@ -85,8 +85,8 @@ func TestSplashAACoverageBounds(t *testing.T) {
 		{0, 0, 64, 64},
 		{10, 10, 30, 30},
 		{10.5, 20.25, 12, 7.75},
-		{-5, -5, 12, 12},   // negative origin (off-canvas clip)
-		{60, 60, 10, 10},   // overflow off bottom-right
+		{-5, -5, 12, 12},     // negative origin (off-canvas clip)
+		{60, 60, 10, 10},     // overflow off bottom-right
 		{0.0, 0.0, 0.0, 0.0}, // degenerate: zero-area rect must not panic
 	}
 	for _, tc := range cases {
@@ -125,14 +125,14 @@ func TestSplashAAMassConservationTranslation(t *testing.T) {
 		t.Skip("splash backend produces empty output in this phase — invariant trivially satisfied")
 	}
 
-	// Strict check: the overlap region of A shifted by (dx, dy) must equal
-	// the corresponding region of B byte-for-byte. If the rasterizer is
-	// wired, this is the integer-translation invariant.
+	// Strict check: the overlap region of A shifted by (dx, -dy) must equal the
+	// corresponding region of B byte-for-byte. The public backend API accepts PDF
+	// y-up coordinates, while the bitmap data plane is y-down.
 	mismatches := 0
-	for y := 0; y+dy < H; y++ {
+	for y := dy; y < H; y++ {
 		for x := 0; x+dx < W; x++ {
 			ai := (y*W + x) * 4
-			bi := ((y+dy)*W + (x + dx)) * 4
+			bi := ((y-dy)*W + (x + dx)) * 4
 			for k := 0; k < 4; k++ {
 				if pixA[ai+k] != pixB[bi+k] {
 					mismatches++

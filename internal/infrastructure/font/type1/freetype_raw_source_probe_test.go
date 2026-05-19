@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	ftcgo "github.com/dh-kam/pdf-go/internal/infrastructure/cgo/freetype"
+	ftcgo "github.com/dh-kam/pdf-go/internal/infrastructure/font/freetype"
 )
 
 func TestSFRM1095FreeTypeRawSourceProbe(t *testing.T) {

@@ -16,7 +16,7 @@ func TestNewFont_MinimalData(t *testing.T) {
 	assert.Equal(t, "CFF Font", font.Name())
 	assert.Equal(t, uint16(1000), font.UnitsPerEm())
 	assert.False(t, font.IsCIDFont())
-	assert.True(t, font.IsSymbolic())
+	assert.False(t, font.IsSymbolic())
 	assert.Equal(t, [6]float64{0.001, 0, 0, 0.001, 0, 0}, font.GetFontMatrix())
 	assert.Equal(t, buildMinimalCFFData(), font.FontData())
 }

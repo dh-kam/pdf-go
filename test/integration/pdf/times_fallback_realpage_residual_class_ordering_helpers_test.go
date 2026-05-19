@@ -48,4 +48,3 @@ func measureRealPageResidualClassExpandedOrderingAgainstPoppler(
 		nonLowerExpanded: measureRealPageExpandedLowercaseProbeAgainstPoppler(t, nonLower, nonLowerPopplerPNG, nonLowerTargetOnlyEnv),
 	}
 }
-

@@ -1209,7 +1209,10 @@ func (e *Evaluator) setFont(op Operator) error {
 		if resolveErr != nil {
 			font, _ = e.getDefaultFont(baseFont)
 		}
-		if !e.shouldTrustEmbeddedType1CFont(fontDict) && !e.isRenderableFont(font) {
+		subtypeStr := nameValueForEncoding(fontDict.Get(entity.Name("Subtype")))
+		embeddedFontData, embeddedErr := e.getEmbeddedFontData(fontDict)
+		trustEmbeddedSubset := embeddedErr == nil && shouldSkipRenderabilityProbe(subtypeStr, embeddedFontData)
+		if !trustEmbeddedSubset && !e.isRenderableFont(font) {
 			font, _ = e.getDefaultFont(baseFont)
 		}
 		if font != nil {
@@ -1254,12 +1257,7 @@ func (e *Evaluator) getFontFromDict(dict *entity.Dict, baseFont string) (entity.
 		}
 		candidateFont = font
 	}
-	// For CIDFontType0/CIDFontType2 subsetted descendants, the embedded TrueType
-	// has a minimal cmap (only CIDs actually used by this PDF) — the renderability
-	// test glyphs ('A', 'a', '0', codes 1..10) won't be present, so trust them.
-	skipRenderabilityCheck := subtypeStr == "CIDFontType0" || subtypeStr == "CIDFontType2" ||
-		(subtypeStr == "Type1" && looksLikeCFFEmbeddedFont(embeddedFontData))
-	if !skipRenderabilityCheck && !e.isRenderableFont(candidateFont) {
+	if !shouldSkipRenderabilityProbe(subtypeStr, embeddedFontData) && !e.isRenderableFont(candidateFont) {
 		if font, ok := e.fontFallback.ResolveNonRenderableCandidate(e, dict, subtypeStr, baseFont, candidateFont); ok {
 			candidateFont = font
 		}
@@ -1485,6 +1483,19 @@ func (e *Evaluator) isRenderableFont(font entity.Font) bool {
 	}
 
 	return false
+}
+
+func shouldSkipRenderabilityProbe(subtypeStr string, embeddedFontData []byte) bool {
+	switch subtypeStr {
+	case "CIDFontType0", "CIDFontType2":
+		return true
+	case "Type1":
+		// Embedded Type1 subsets can contain only the glyphs used by the PDF.
+		// Probing ASCII glyphs would incorrectly replace them with fallback fonts.
+		return len(embeddedFontData) > 0
+	default:
+		return false
+	}
 }
 
 // Text Style Operators
@@ -4108,7 +4119,7 @@ func colorFromGraphicsState(cs *ColorSpace, alpha float64) color.Color {
 		return color.Black
 	}
 	alpha = clamp(alpha, 0, 1)
-	a := uint8(math.Round(alpha * 255))
+	a := colorspace.ConvertComponentToByte(alpha)
 	r := uint8(value >> 16)
 	g := uint8((value >> 8) & 0xFF)
 	b := uint8(value & 0xFF)
@@ -4648,6 +4659,7 @@ func (e *Evaluator) renderInlineImage() error {
 			bpc,
 			imageFilter,
 			resolveXObjectImageSourceFilter(filterObj),
+			e.resolveImageDecodeParms(dict.GetTry(entity.Name("DecodeParms"), entity.Name("DP")), 0),
 			decode,
 			mask,
 			colorKeyMask,

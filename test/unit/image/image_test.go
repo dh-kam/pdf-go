@@ -324,10 +324,10 @@ func TestDecoder_DecodeRawCMYK(t *testing.T) {
 
 	// Cyan should give us blueish color
 	r, g, b, _ := img.RGBAAt(0, 0).RGBA()
-	// Cyan (C=255, M=0, Y=0, K=0) with the current CMYK conversion curve.
+	// Cyan (C=255, M=0, Y=0, K=0) with the Poppler-compatible CMYK matrix.
 	assert.Equal(t, uint32(0), r)
-	assert.Equal(t, uint32(0xB8B8), g)
-	assert.Equal(t, uint32(0xF1F1), b)
+	assert.Equal(t, uint32(0xADAD), g)
+	assert.Equal(t, uint32(0xEFEF), b)
 }
 
 func TestDecoder_RegisterCustomDecoder(t *testing.T) {
@@ -419,7 +419,7 @@ func TestDecodeArray(t *testing.T) {
 		BitsPerComponent: 8,
 		Filter:           domainimage.FilterNone,
 		Data:             data,
-		Decode:           []float64{255, 0}, // Invert: 0->255, 255->0
+		Decode:           []float64{1, 0}, // Invert: 0->255, 255->0
 	}
 
 	result, err := decoder.Decode(imgData)

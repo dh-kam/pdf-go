@@ -19,4 +19,3 @@ func realPageSFRMLongTailProbeCaseForLowercase(t *testing.T) realPageLowercasePr
 	require.Len(t, cases, 1)
 	return cases[0]
 }
-

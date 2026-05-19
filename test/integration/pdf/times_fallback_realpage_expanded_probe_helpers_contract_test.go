@@ -24,4 +24,3 @@ func TestRealPageExpandedLowercaseProbeResult_ComputesDeltaFields(t *testing.T) 
 	require.Equal(t, 0.5, result.forcedGap())
 	require.Equal(t, 2.0, result.residualGap())
 }
-

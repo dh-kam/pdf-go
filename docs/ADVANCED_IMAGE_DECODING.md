@@ -7,7 +7,7 @@ This document describes the advanced image decoding support for JPEG2000 and JBI
 The library supports decoding of advanced image formats commonly found in PDF documents:
 
 - **JPEG2000 (JPX)**: ISO/IEC 15444-1 standard
-- **JBIG2**: ISO/IEC 11544 standard
+- **JBIG2**: ITU-T T.88 / ISO/IEC 14492 standard
 
 ## Architecture
 
@@ -24,14 +24,6 @@ internal/infrastructure/image/
 │   ├── decoder.go           # JBIG2 decoder
 │   └── wrapper.go           # Domain interface wrapper
 └── decoder.go               # Main decoder (updated)
-
-internal/infrastructure/cgo/
-├── jpx/
-│   ├── openjpeg.go          # CGo OpenJPEG wrapper
-│   └── stub.go              # Stub implementation
-└── jbig2/
-    ├── jbig2dec.go          # CGo jbig2dec wrapper
-    └── stub.go              # Stub implementation
 ```
 
 ## JPEG2000 (JPX) Support
@@ -46,17 +38,10 @@ internal/infrastructure/cgo/
 - **Color Spaces**: Grayscale, RGB, and CMYK
 - **Multiple Resolution Levels**: Box structure parsing
 
-### Implementation Options
+### Implementation
 
-1. **Native Go Implementation** (default):
-   - Basic JP2 file parsing
-   - Placeholder image generation for stub
-   - No external dependencies
-
-2. **CGo OpenJPEG Wrapper** (optional):
-   - Full JPEG2000 decoding via OpenJPEG library
-   - Requires: `libopenjp2` development files
-   - Build without: `-tags nojpx`
+The JPX decoder uses the pure Go JPEG2000 path by default. It does not link
+against OpenJPEG and does not require feature-disabling build tags.
 
 ### Usage Example
 
@@ -91,17 +76,12 @@ if decoder.CanDecode(data) {
 - **Segment Types**: Page information, text regions, generic regions
 - **Compression**: Arithmetic coding and MMR placeholders
 
-### Implementation Options
+### Implementation
 
-1. **Native Go Implementation** (default):
-   - Basic JBIG2 file parsing
-   - Segment structure detection
-   - Placeholder image generation
-
-2. **CGo jbig2dec Wrapper** (optional):
-   - Full JBIG2 decoding via jbig2dec library
-   - Requires: `jbig2dec` development files
-   - Build without: `-tags nojbig2`
+The JBIG2 decoder uses the clean-room pure Go path by default. It parses PDF
+`DecodeParms`, `JBIG2Globals`, segment dictionaries, text/refinement/halftone
+regions, arithmetic coding, and MMR paths covered by the current corpus without
+linking against `jbig2dec`.
 
 ### Usage Example
 
@@ -149,29 +129,19 @@ imgData := &image.ImageData{
 result, err := decoder.Decode(imgData)
 ```
 
-## Build Tags
-
-The implementation uses Go build tags to control CGo usage:
-
-### Build with CGo Support (requires libraries)
+## Build
 
 ```bash
 go build -o bin/pdfinfo ./cmd/pdfinfo
-```
-
-### Build without CGo (stub implementations)
-
-```bash
-go build -tags='nojpx,nojbig2' -o bin/pdfinfo ./cmd/pdfinfo
+CGO_ENABLED=0 go build -o bin/pdfinfo ./cmd/pdfinfo
+go test ./internal/infrastructure/image/jpx ./internal/infrastructure/image/jbig2
 ```
 
 ### Makefile Targets
 
 ```bash
-# Build with full CGo support
-make build-all-cgo
-
-# Build without CGo
+# Build pure Go tools
+make build-pure
 make build-no-cgo
 
 # Build specific targets
@@ -210,10 +180,10 @@ type AdvancedDecoder interface {
 
 ```go
 type Decoder struct {
-    useCGo bool  // Automatically detected
 }
 
 func NewDecoder() *Decoder
+func NewNativeDecoder() *Decoder
 func (d *Decoder) Decode(data []byte) (image.Image, error)
 func (d *Decoder) DecodeConfig(data []byte) (image.Config, error)
 func (d *Decoder) ColorSpace() image.ColorSpace
@@ -225,7 +195,6 @@ func (d *Decoder) SupportedFormats() []string
 
 ```go
 type Decoder struct {
-    useCGo bool  // Automatically detected
 }
 
 func NewDecoder() *Decoder
@@ -241,8 +210,8 @@ func (d *Decoder) SupportedFormats() []string
 Comprehensive tests are provided for both decoders:
 
 ```bash
-# Run tests without CGo
-go test -tags='nojpx,nojbig2' ./test/unit/image/...
+# Run tests
+go test ./test/unit/image/...
 
 # Run specific tests
 go test -run TestJPX ./test/unit/image/...
@@ -281,7 +250,7 @@ Potential improvements for the native implementations:
 ## Standards References
 
 - [ISO/IEC 15444-1](https://www.iso.org/standard/78314.html) - JPEG 2000 image coding standard
-- [ISO/IEC 11544](https://www.iso.org/standard/19078.html) - JBIG2 standard
+- [ISO/IEC 14492](https://www.iso.org/standard/75396.html) - JBIG2 standard
 - [TIFF 6.0](https://www.adobe.io/open/standards/TIFF.html) - For JBIG2 in TIFF
 - [PDF 1.7 Specification](https://opensource.adobe.com/dc-acrobat/pdf-reference-pdf/) - Section 3.3.6 and 7.4.8
 
@@ -291,9 +260,8 @@ This implementation follows the same license as the go-pdf project.
 
 ## Contributing
 
-Contributions to improve the native implementations or CGo wrappers are welcome. Please ensure:
+Contributions to improve the pure Go implementations are welcome. Please ensure:
 
-1. Tests pass for both CGo and non-CGO builds
+1. Tests pass with `CGO_ENABLED=0`
 2. Documentation is updated
-3. Build tags are properly used
-4. Backward compatibility is maintained
+3. Backward compatibility is maintained

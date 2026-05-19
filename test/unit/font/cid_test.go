@@ -146,7 +146,7 @@ func TestCIDFont_WithBaseFont(t *testing.T) {
 	font := cid.NewCIDFont("Test", baseFont, testCmap)
 
 	// Test that base font methods are delegated
-	assert.Equal(t, uint16(1000), font.UnitsPerEm())
+	assert.Equal(t, baseFont.UnitsPerEm(), font.UnitsPerEm())
 
 	width, err := font.GetGlyphWidth(100)
 	require.NoError(t, err)

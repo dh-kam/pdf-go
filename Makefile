@@ -1,4 +1,4 @@
-.PHONY: all build build-pdf-go build-cli build-examples build-pdfinfo build-pdftext build-pdfrender build-all build-pure build-all-cgo build-no-cgo test coverage lint mock-gen clean run-tests test-no-cgo test-no-cgo-race fmt-check-release test-release-no-cgo coverage-no-cgo coverage-core-no-cgo render-regression-no-cgo check-no-cgo vet-no-cgo cli-smoke-no-cgo vuln-no-cgo vuln-release-no-cgo full-render-compare-html goal98-batch-test-no-cgo goal98-batch-no-cgo goal98-html-no-cgo sample-compare-html-no-cgo sample-compare-tradeoff-no-cgo sample-compare-backlog-no-cgo sample-compare-focus-no-cgo sample-compare-faildocs-recheck-no-cgo sample-compare-iccbased-focus-no-cgo nightly-snapshot-no-cgo nightly-compare-diff-no-cgo profile-render-no-cgo profile-render-guard-no-cgo render-leak-check-no-cgo goal98-compare-report goal98-batch-compare-no-cgo goal98-guard-no-cgo pdfjs-select-eq pdfjs-render-parity pdfjs-parity-clean render-parity-report-test lex-render-parity-report-test render-parity-priority porting-complete porting-complete-plus-goal98 release-ci release-build release-package release-preflight release-dry-run release-publish
+.PHONY: all build build-pdf-go build-cli build-examples build-pdfinfo build-pdftext build-pdfrender build-all build-pure build-all-cgo build-no-cgo test coverage lint mock-gen clean run-tests test-no-cgo test-no-cgo-race fmt-check-release test-release-no-cgo coverage-no-cgo coverage-core-no-cgo render-regression-no-cgo cgo-inventory check-no-cgo vet-no-cgo cli-smoke-no-cgo vuln-no-cgo vuln-release-no-cgo full-render-compare-html goal98-batch-test-no-cgo goal98-batch-no-cgo goal98-html-no-cgo sample-compare-html-no-cgo sample-compare-tradeoff-no-cgo sample-compare-backlog-no-cgo sample-compare-focus-no-cgo sample-compare-faildocs-recheck-no-cgo sample-compare-iccbased-focus-no-cgo nightly-snapshot-no-cgo nightly-compare-diff-no-cgo profile-render-no-cgo profile-render-guard-no-cgo render-leak-check-no-cgo goal98-compare-report goal98-batch-compare-no-cgo goal98-guard-no-cgo pdfjs-select-eq pdfjs-render-parity pdfjs-parity-clean render-parity-report-test lex-render-parity-report-test render-parity-priority porting-complete porting-complete-plus-goal98 release-ci release-build release-package release-preflight release-dry-run release-publish
 
 # Build variables
 BINARY_NAME=pdfrender
@@ -20,14 +20,16 @@ HOST_OS=$(shell $(GOCMD) env GOOS)
 HOST_ARCH=$(shell $(GOCMD) env GOARCH)
 OS_LIST?=linux darwin windows
 ARCH_LIST?=amd64 arm64
-BUILD_VARIANTS?=default nocgo release
+BUILD_VARIANTS?=default release
 TARGET_OS?=$(HOST_OS)
 TARGET_ARCH?=$(HOST_ARCH)
 TARGET_VARIANT?=default
 comma:=,
-NO_CGO_TAGS=nojpx$(comma)nojbig2$(comma)nofreetype$(comma)nocairo
-TARGET_CGO_ENABLED?=$(if $(filter default,$(TARGET_VARIANT)),1,0)
-TARGET_TAGS?=$(if $(filter nocgo release,$(TARGET_VARIANT)),$(NO_CGO_TAGS),)
+NO_CGO_TAGS=
+NO_CGO_TAG_FLAGS=$(if $(NO_CGO_TAGS),-tags='$(NO_CGO_TAGS)',)
+NO_CGO_ENV=CGO_ENABLED=0 PDF_FREETYPE_GO=1
+TARGET_CGO_ENABLED?=0
+TARGET_TAGS?=
 GO_DEFAULT_FLAGS?=-trimpath
 GO_RELEASE_FLAGS?=-trimpath -ldflags="-s -w"
 TARGET_GOFLAGS?=$(if $(filter release,$(TARGET_VARIANT)),$(GO_RELEASE_FLAGS),$(GO_DEFAULT_FLAGS))
@@ -40,7 +42,13 @@ CLI_PACKAGE_DIRS=$(sort $(dir $(wildcard $(CMD_DIR)/*/main.go)))
 CLI_FILE_SOURCES=$(filter-out %_test.go,$(wildcard $(CMD_DIR)/*.go))
 EXAMPLE_SOURCES=$(filter-out %_test.go,$(wildcard $(EXAMPLES_DIR)/*.go))
 rwildcard=$(wildcard $(1)/$(2)) $(foreach d,$(wildcard $(1)/*),$(call rwildcard,$(d),$(2)))
-GO_FILES=$(call rwildcard,.,*.go)
+GO_FILES=$(shell find . \
+	-path './.git' -prune -o \
+	-path './bin' -prune -o \
+	-path './build' -prune -o \
+	-path './dist' -prune -o \
+	-path './tmp' -prune -o \
+	-name '*.go' -type f -print)
 build_stamp=$(BUILD_ROOT)/$(1)-$(2)/$(3)/.complete
 FULL_BUILD_TARGETS=$(foreach os,$(OS_LIST),$(foreach arch,$(ARCH_LIST),$(foreach var,$(BUILD_VARIANTS),$(call build_stamp,$(os),$(arch),$(var)))))
 OS_ARCH_PAIRS=$(foreach os,$(OS_LIST),$(foreach arch,$(ARCH_LIST),$(os)-$(arch)))
@@ -93,11 +101,11 @@ SAMPLE_COMPARE_FAILDOCS_OUT?=$(CURDIR)/tmp/sample_compare_faildocs_recheck_only
 SAMPLE_COMPARE_FAILDOCS_TIMEOUT_SEC?=3600
 SAMPLE_COMPARE_FAILDOCS_PER_PAGE_TIMEOUT_SEC?=600
 FULL_COMPARE_OUT?=$(CURDIR)/tmp/full_render_compare
-FULL_COMPARE_SCAN_ROOT?=$(CURDIR)/test/testdata/sample-files
+FULL_COMPARE_SCAN_ROOT?=$(CURDIR)/test/testdata/compare/pdfs
 FULL_COMPARE_DPI?=150
 FULL_COMPARE_BACKEND?=splash
 FULL_COMPARE_WORKERS?=4
-FULL_COMPARE_TIMEOUT_SEC?=900
+FULL_COMPARE_TIMEOUT_SEC?=0
 PROFILE_RENDER_OUT?=$(CURDIR)/tmp/prof_render
 PROFILE_RENDER_DPI?=150
 PROFILE_RENDER_WORKERS?=4
@@ -254,12 +262,13 @@ test-fast:
 # Run tests without CGo dependencies
 test-no-cgo:
 	@echo "Running tests (no CGo)..."
-	$(GOTEST) -v -tags='$(NO_CGO_TAGS)' $(GO_PACKAGES_NO_TMP)
+	$(NO_CGO_ENV) $(GOTEST) -v $(NO_CGO_TAG_FLAGS) $(GO_PACKAGES_NO_TMP)
 
-# Run race tests without CGo dependencies
+# Run race tests with no-CGo feature tags. The Go race detector requires CGo,
+# so this is intentionally not a CGO_ENABLED=0 gate.
 test-no-cgo-race:
-	@echo "Running race tests (no CGo, excluding long integration package)..."
-	$(GOTEST) -v -race -timeout=30m -tags='$(NO_CGO_TAGS)' $(GO_PACKAGES_NO_TMP_NO_INTEG)
+	@echo "Running race tests with no-CGo tags, excluding long integration package..."
+	$(GOTEST) -v -race -timeout=30m $(NO_CGO_TAG_FLAGS) $(GO_PACKAGES_NO_TMP_NO_INTEG)
 
 # Check formatting only for release-gated packages. The wider repository still
 # contains experimental probes that are tracked separately from release CI.
@@ -275,7 +284,7 @@ fmt-check-release:
 # Run release-safe smoke tests for CLI entry points and the public API.
 test-release-no-cgo:
 	@echo "Running release-safe tests (no CGo)..."
-	$(GOTEST) -v -race -timeout=30m -tags='$(NO_CGO_TAGS)' $(GO_PACKAGES_RELEASE)
+	$(NO_CGO_ENV) $(GOTEST) -v -timeout=30m $(NO_CGO_TAG_FLAGS) $(GO_PACKAGES_RELEASE)
 
 # Generate coverage report
 coverage: test
@@ -291,7 +300,7 @@ coverage-show: test
 # Generate and show coverage report without CGo dependencies
 coverage-no-cgo:
 	@echo "Running coverage (no CGo)..."
-	$(GOTEST) -tags='$(NO_CGO_TAGS)' -coverpkg=./internal/...,./pkg/... -coverprofile=coverage_no_cgo.txt $(GO_PACKAGES_NO_TMP_NO_E2E)
+	$(NO_CGO_ENV) $(GOTEST) $(NO_CGO_TAG_FLAGS) -coverpkg=./internal/...,./pkg/... -coverprofile=coverage_no_cgo.txt $(GO_PACKAGES_NO_TMP_NO_E2E)
 	@TOTAL="$$( $(GOCMD) tool cover -func=coverage_no_cgo.txt | awk '/^total:/ {print $$3}' )"; \
 	echo "Coverage total (no CGo): $$TOTAL"
 
@@ -308,7 +317,7 @@ coverage-core-no-cgo: coverage-no-cgo
 # Run render regression exact-compare tests without CGo dependencies
 render-regression-no-cgo:
 	@echo "Running render regression tests (no CGo)..."
-	$(GOTEST) -v -count=1 -tags='$(NO_CGO_TAGS)' ./test/e2e -run TestCLI_PDFRender_ExactBaseline
+	$(NO_CGO_ENV) $(GOTEST) -v -count=1 $(NO_CGO_TAG_FLAGS) ./test/e2e -run TestCLI_PDFRender_ExactBaseline
 
 # Run linter
 lint:
@@ -357,27 +366,31 @@ vet:
 # Run vet without CGo dependencies
 vet-no-cgo:
 	@echo "Running go vet (no CGo)..."
-	$(GOCMD) vet -tags='$(NO_CGO_TAGS)' $(GO_PACKAGES_NO_TMP)
+	$(NO_CGO_ENV) $(GOCMD) vet $(NO_CGO_TAG_FLAGS) $(GO_PACKAGES_NO_TMP)
+
+# Print and validate CGo dependency gates.
+cgo-inventory:
+	@./scripts/cgo_inventory.sh
 
 # Build without CGo (minimal dependencies)
 build-pure:
 	@echo "Building without CGo..."
-	@$(MAKE) --no-print-directory build-pdf-go TARGET_VARIANT=nocgo TARGET_CGO_ENABLED=0 TARGET_TAGS="$(NO_CGO_TAGS)"
+	@$(MAKE) --no-print-directory build-pdf-go TARGET_CGO_ENABLED=0 TARGET_TAGS=
 
-# Build all CLI tools with full CGo support
+# Compatibility target retained for old automation. CGo support has been removed.
 build-all-cgo:
-	@echo "Building all CLI tools with full CGo support..."
-	@$(MAKE) --no-print-directory build-all TARGET_VARIANT=default TARGET_CGO_ENABLED=1 TARGET_TAGS=
-	@echo "Build complete (with CGo support)"
+	@echo "CGo support has been removed; building pure Go CLI tools..."
+	@$(MAKE) --no-print-directory build-all TARGET_VARIANT=default TARGET_CGO_ENABLED=0 TARGET_TAGS=
+	@echo "Build complete (pure Go)"
 
 # Build all CLI tools without CGo
 build-no-cgo:
 	@echo "Building all CLI tools without CGo..."
-	@$(MAKE) --no-print-directory build-all TARGET_VARIANT=nocgo TARGET_CGO_ENABLED=0 TARGET_TAGS="$(NO_CGO_TAGS)"
+	@$(MAKE) --no-print-directory build-all TARGET_VARIANT=default TARGET_CGO_ENABLED=0 TARGET_TAGS=
 	@mkdir -p $(BUILD_DIR)
 	@for name in $(CORE_CLI_TOOLS); do \
 		echo "  legacy $(BUILD_DIR)/$$name$(HOST_EXE)"; \
-		CGO_ENABLED=0 GOOS=$(HOST_OS) GOARCH=$(HOST_ARCH) $(GOBUILD) $(GO_DEFAULT_FLAGS) -tags='$(NO_CGO_TAGS)' -o "$(BUILD_DIR)/$$name$(HOST_EXE)" "$(CMD_DIR)/$$name"; \
+		CGO_ENABLED=0 GOOS=$(HOST_OS) GOARCH=$(HOST_ARCH) $(GOBUILD) $(GO_DEFAULT_FLAGS) $(NO_CGO_TAG_FLAGS) -o "$(BUILD_DIR)/$$name$(HOST_EXE)" "$(CMD_DIR)/$$name"; \
 	done
 	@echo "Build complete (without CGo support)"
 
@@ -393,7 +406,7 @@ check: fmt vet lint test-coverage
 	@echo "All checks passed!"
 
 # Run no-CGo validation checks
-check-no-cgo: vet-no-cgo test-no-cgo-race coverage-core-no-cgo render-regression-no-cgo
+check-no-cgo: vet-no-cgo test-no-cgo coverage-core-no-cgo render-regression-no-cgo
 	@echo "No-CGo checks passed!"
 
 # Run integration parity report against poppler and write CSV/summary artifacts.
@@ -414,18 +427,18 @@ render-parity-priority:
 # Run vulnerability scan without CGo dependencies
 vuln-no-cgo:
 	@echo "Running vulnerability scan (no CGo)..."
-	$(GOCMD) run golang.org/x/vuln/cmd/govulncheck@latest -tags='$(NO_CGO_TAGS)' $(GO_PACKAGES_NO_TMP)
+	$(NO_CGO_ENV) $(GOCMD) run golang.org/x/vuln/cmd/govulncheck@latest $(NO_CGO_TAG_FLAGS) $(GO_PACKAGES_NO_TMP)
 
 # Run vulnerability scanning on the same package scope as release CI.
 vuln-release-no-cgo:
 	@echo "Running release vulnerability scan (no CGo)..."
-	$(GOCMD) run golang.org/x/vuln/cmd/govulncheck@latest -tags='$(NO_CGO_TAGS)' $(GO_PACKAGES_RELEASE)
+	$(NO_CGO_ENV) $(GOCMD) run golang.org/x/vuln/cmd/govulncheck@latest $(NO_CGO_TAG_FLAGS) $(GO_PACKAGES_RELEASE)
 
 # Render every scanned PDF page with Poppler and this renderer, then write a
 # dashboard HTML report with Poppler, ours, and XOR+red-marker images per row.
 full-render-compare-html:
 	@echo "Generating full render compare HTML..."
-	$(GOCMD) run ./cmd/pdfcompare \
+	$(NO_CGO_ENV) $(GOCMD) run ./cmd/pdfcompare \
 		-repo-root $(CURDIR) \
 		-scan-root $(FULL_COMPARE_SCAN_ROOT) \
 		-out $(FULL_COMPARE_OUT) \
@@ -446,7 +459,7 @@ cli-smoke-no-cgo: build-no-cgo
 # Run full PNG parity batch against poppler (goal98 profile)
 goal98-batch-no-cgo:
 	@echo "Running goal98 batch (no CGo)..."
-	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_batch.go \
+	$(GOCMD) run $(NO_CGO_TAG_FLAGS) ./tmp/goal98_batch.go \
 		-repo-root $(CURDIR) \
 		-scan-root $(CURDIR) \
 		-out $(GOAL98_OUT) \
@@ -459,12 +472,12 @@ goal98-batch-no-cgo:
 # Run goal98 batch unit tests without CGo.
 goal98-batch-test-no-cgo:
 	@echo "Running goal98 batch unit tests (no CGo)..."
-	$(GOCMD) test -tags='$(NO_CGO_TAGS)' ./tmp/goal98_batch.go ./tmp/goal98_batch_test.go -count=1
+	$(GOCMD) test $(NO_CGO_TAG_FLAGS) ./tmp/goal98_batch.go ./tmp/goal98_batch_test.go -count=1
 
 # Generate goal98 HTML compare report (poppler vs ours vs xor).
 goal98-html-no-cgo:
 	@echo "Generating goal98 HTML compare report (no CGo)..."
-	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_compare_html.go \
+	$(GOCMD) run $(NO_CGO_TAG_FLAGS) ./tmp/goal98_compare_html.go \
 		-report $(GOAL98_OUT)/report.csv \
 		-out $(GOAL98_HTML_OUT) \
 		-threshold $(GOAL98_HTML_THRESHOLD) \
@@ -473,7 +486,7 @@ goal98-html-no-cgo:
 # Run sample-only poppler-vs-ours compare and generate HTML report (99% gate).
 sample-compare-html-no-cgo:
 	@echo "Running sample-only compare batch + HTML report (no CGo)..."
-	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_batch.go \
+	$(GOCMD) run $(NO_CGO_TAG_FLAGS) ./tmp/goal98_batch.go \
 		-repo-root $(CURDIR) \
 		-scan-root $(CURDIR) \
 		-out $(SAMPLE_COMPARE_OUT) \
@@ -485,7 +498,7 @@ sample-compare-html-no-cgo:
 		-sample-only=true \
 		-sample-root $(SAMPLE_COMPARE_SAMPLE_ROOT) \
 		-skip-compressed-duplicates=$(SAMPLE_COMPARE_SKIP_COMPRESSED_DUPLICATES)
-	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_compare_html.go \
+	$(GOCMD) run $(NO_CGO_TAG_FLAGS) ./tmp/goal98_compare_html.go \
 		-report $(SAMPLE_COMPARE_OUT)/report.csv \
 		-out $(SAMPLE_COMPARE_OUT)/html \
 		-threshold $(SAMPLE_COMPARE_THRESHOLD) \
@@ -544,7 +557,7 @@ sample-compare-faildocs-recheck-no-cgo:
 		| sort -u > "$(SAMPLE_COMPARE_FAILDOCS_LIST)"
 	@echo "Failed docs: $$(wc -l < "$(SAMPLE_COMPARE_FAILDOCS_LIST)")"
 	@echo "Running failed-doc recompare batch..."
-	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_batch.go \
+	$(GOCMD) run $(NO_CGO_TAG_FLAGS) ./tmp/goal98_batch.go \
 		-repo-root $(CURDIR) \
 		-scan-root $(CURDIR) \
 		-out $(SAMPLE_COMPARE_FAILDOCS_OUT) \
@@ -558,7 +571,7 @@ sample-compare-faildocs-recheck-no-cgo:
 		-sample-root $(SAMPLE_COMPARE_SAMPLE_ROOT) \
 		-skip-compressed-duplicates=$(SAMPLE_COMPARE_SKIP_COMPRESSED_DUPLICATES) \
 		-include-doc-list $(SAMPLE_COMPARE_FAILDOCS_LIST)
-	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_compare_html.go \
+	$(GOCMD) run $(NO_CGO_TAG_FLAGS) ./tmp/goal98_compare_html.go \
 		-report $(SAMPLE_COMPARE_FAILDOCS_OUT)/report.csv \
 		-out $(SAMPLE_COMPARE_FAILDOCS_OUT)/html \
 		-threshold $(SAMPLE_COMPARE_THRESHOLD) \
@@ -566,7 +579,7 @@ sample-compare-faildocs-recheck-no-cgo:
 		-sample-root $(SAMPLE_COMPARE_SAMPLE_ROOT)
 	@awk -F, 'NR==1 || $$6 != "true" || $$7 != "true" || $$10 != ""' \
 		"$(SAMPLE_COMPARE_FAILDOCS_OUT)/report.csv" > "$(SAMPLE_COMPARE_FAILDOCS_OUT)/report_fail_only.csv"
-	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/goal98_compare_html.go \
+	$(GOCMD) run $(NO_CGO_TAG_FLAGS) ./tmp/goal98_compare_html.go \
 		-report $(SAMPLE_COMPARE_FAILDOCS_OUT)/report_fail_only.csv \
 		-out $(SAMPLE_COMPARE_FAILDOCS_OUT)/html_fail_only \
 		-threshold $(SAMPLE_COMPARE_THRESHOLD) \
@@ -663,7 +676,7 @@ nightly-compare-diff-no-cgo:
 profile-render-no-cgo:
 	@echo "Profiling renderer (no CGo)..."
 	@mkdir -p $(PROFILE_RENDER_OUT)
-	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/render_profile.go \
+	$(GOCMD) run $(NO_CGO_TAG_FLAGS) ./tmp/render_profile.go \
 		-root $(CURDIR) \
 		-dpi $(PROFILE_RENDER_DPI) \
 		-workers $(PROFILE_RENDER_WORKERS) \
@@ -688,7 +701,7 @@ profile-render-guard-no-cgo: profile-render-no-cgo
 render-leak-check-no-cgo:
 	@echo "Running renderer leak check (no CGo)..."
 	@mkdir -p $(LEAK_CHECK_OUT)
-	$(GOCMD) run -tags='$(NO_CGO_TAGS)' ./tmp/render_leak_check.go \
+	$(GOCMD) run $(NO_CGO_TAG_FLAGS) ./tmp/render_leak_check.go \
 		-root $(CURDIR) \
 		-dpi $(LEAK_CHECK_DPI) \
 		-workers $(LEAK_CHECK_WORKERS) \
@@ -789,9 +802,9 @@ help:
 	@echo "  build-pdftext  - Build pdftext tool into $(TARGET_BUILD_DIR)"
 	@echo "  build-pdfrender - Build pdfrender tool into $(TARGET_BUILD_DIR)"
 	@echo "  build-all      - Build pdf-go, CLI tools, and examples into $(TARGET_BUILD_DIR)"
-	@echo "  build-pure     - Build pdf-go without CGo using the nocgo variant"
-	@echo "  build-all-cgo  - Build all tools with full CGo support using the default variant"
-	@echo "  build-no-cgo   - Build all tools without CGo using the nocgo variant and sync legacy bin/ tools"
+	@echo "  build-pure     - Build pdf-go as pure Go"
+	@echo "  build-all-cgo  - Compatibility alias for pure Go build-all"
+	@echo "  build-no-cgo   - Build all tools as pure Go and sync legacy bin/ tools"
 	@echo "  test           - Run tests with race detector"
 	@echo "  test-fast      - Run tests without race detector"
 	@echo "  coverage       - Generate HTML coverage report"

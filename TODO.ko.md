@@ -5,6 +5,42 @@
 - [ ] `GeoTopo p55` pattern/fill/stroke 잔차를 image/soft-mask가 아닌 segment stroke 및 tiling pattern 축으로 재분해한다.
 - [ ] `GeoTopo p55`, `p23`, `p44`, `p97`을 함께 보면서 Poppler `strokeNarrow`와 `strokeWide` 분기 조건을 더 좁힌다.
 
+## Pure Go 포팅 계획
+- [x] 과거 `nojpx,nojbig2` exact100은 현재 corpus 범위의 검증으로만 보고 JPX/JBIG2 포팅 완료로 간주하지 않는다.
+- [x] CGo inventory gate를 `import "C"`가 0개인지 확인하는 검사로 전환한다.
+- [x] PDF `DecodeParms` / `JBIG2Globals`를 JBIG2 decode option으로 연결하고 full-corpus exact100을 유지한다.
+- [x] JBIG2 MQ arithmetic decoder와 arithmetic generic bitmap region template 0-3을 포팅한다.
+- [x] Poppler JBIG2 arithmetic generic region typical prediction(`TPGDON`) row 처리를 맞춘다.
+- [x] Poppler와 동일한 JBIG2 external region combination operator를 적용하고 immediate generic region 여러 개를 segment 순서대로 합성한다.
+- [x] JBIG2 Page Information flags의 default pixel 초기화를 Poppler와 맞춘다.
+- [x] JBIG2 pattern dictionary와 halftone skip/multi-plane arithmetic gray-image 합성을 포팅한다.
+- [x] Poppler 기준 JBIG2 generic refinement region 파싱, context, TPGR 처리, shared arithmetic refinement decoding을 포팅한다.
+- [x] Poppler 기준 JBIG2 arithmetic integer/IAID decoding과 symbol dictionary/text region 헤더 파싱 및 저장 scaffolding을 추가한다.
+- [x] Poppler 기준 JBIG2 arithmetic symbol dictionary refinement/aggregate bitmap decoding 및 export 흐름을 포팅한다.
+- [x] JBIG2 multi-plane MMR halftone gray-image decoding과 intermediate halftone region storage를 포팅한다.
+- [x] Poppler 기준 JBIG2 default Huffman text region placement 및 refinement switching을 포팅한다.
+- [x] Poppler 기준 JBIG2 default Huffman symbol dictionary collective bitmap, refinement/aggregate, export 흐름을 포팅한다.
+- [x] JBIG2 custom Huffman code-table segment parsing 및 symbol/text region referenced-table dispatch를 포팅한다.
+- [x] PageInfo가 없는 fallback 경로에서 dictionary/code-table을 수집한 뒤 첫 text, halftone, refinement, generic bitmap segment를 decode한다.
+- [x] global stream과 page stream이 같은 segment 번호를 재사용할 때 Poppler `JBIG2Globals` 우선순위를 맞춘다.
+- [x] generic refinement decode 뒤 참조된 intermediate bitmap을 제거하는 Poppler bitmap 생명주기를 맞춘다.
+- [ ] malformed/interleaved `JBIG2Globals` reference 관련 남은 JBIG2 native decoder edge case를 완료한다.
+- [x] JP2 box와 raw codestream을 처리하는 실제 pure Go JPEG2000 decoder 경로를 추가한다.
+- [x] JP2 container와 raw J2K codestream decode 경로의 JPX 단위 테스트 coverage를 추가한다.
+- [ ] JPX exact parity를 Poppler/OpenJPEG coverage 기준으로 검증하고 미지원 JPEG2000 feature gap을 닫는다.
+- [x] FreeType glyph lookup, glyph name, outline, bounding box, transform, approximate bitmap rasterization을 처리하는 pure Go SFNT fallback을 추가한다.
+- [x] Type1이 아닌 pure-Go SFNT bitmap glyph에 Poppler 방식 ppem/matrix 정규화를 적용한다.
+- [x] Type1 no-CGo glyph rasterization을 별도 gate로 유지해 격리 측정 시 끌 수 있게 하되, Type1-heavy parity가 더 좋아지므로 `PDF_FREETYPE_GO=1`에서는 기본 활성화한다.
+- [x] `freetype-go`가 Type1/CFF cubic outline과 raster cubic tag를 보존하도록 갱신하고, local replace 없이 git dependency를 올린다.
+- [x] Type1/CFF `freetype-go` raster 경로에 FreeType fill-rule coverage를 gate하고 full-corpus parity 검증 후 git dependency를 갱신한다.
+- [x] FreeType 의존 glyph API를 pure Go glyph lookup, bbox, outline, transform, bitmap, phase, matrix raster 경로로 대체한다.
+- [x] Cairo glyph mask rasterization을 pure Go raster strategy로 대체하거나 Splash exact parity가 유지되면 Cairo 경로를 제거한다.
+- [x] FreeType, JPX, JBIG2, Cairo CGo wrapper를 source tree에서 제거한다.
+- [x] e2e 하위 `go run` / `go build` 명령에서 feature-disabling build tag 전달을 제거한다.
+- [x] `CGO_ENABLED=0`으로 build/test하는 no-CGo release gate를 추가한다.
+- [x] Makefile no-CGo 검증 target이 실제로 `CGO_ENABLED=0`으로 실행되게 하고 race 검증은 CGo가 필요한 별도 gate로 분리한다.
+- [x] 장시간 검증이 필요한 full-corpus Poppler exact100 HTML 생성은 `-timeout-sec 0`으로 실행 가능하게 유지한다.
+
 ## 렌더링 정확도 개선
 - [ ] `pdf.js` fixture와 기존 sample fixture를 합쳐 render mismatch 상위 문서부터 98%+까지 반복 개선한다.
 - [ ] 실패 문서 재비교 결과에서 `decode_or_transform`, `resample_or_antialias` 병목 근본 원인을 차단한다.

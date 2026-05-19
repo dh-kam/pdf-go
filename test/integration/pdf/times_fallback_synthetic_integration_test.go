@@ -14,6 +14,7 @@ import (
 )
 
 func TestSyntheticTimesRomanTextProbe_CurrentBeatsHelveticaButCourierCanOutscoreCurrent(t *testing.T) {
+	requirePopplerProbeOptIn(t)
 	if _, err := exec.LookPath("pdftoppm"); err != nil {
 		t.Skip("pdftoppm not installed")
 	}

@@ -191,10 +191,8 @@ func newRootCmd() (*cobra.Command, error) {
 	flags.Bool("fail-on-page-error", false, "Exit with an error when any page fails to render")
 	flags.String(
 		"backend",
-		canvas.BackendImageCanvas,
-		"Rendering backend: image-canvas (default) or splash. "+
-			"splash is experimental (Phase 1+, fills/clips not yet implemented; "+
-			"expect blank/incomplete output for non-stroke primitives).",
+		canvas.BackendSplash,
+		"Rendering backend: splash (default) or image-canvas.",
 	)
 
 	if err := cfg.BindPFlags(flags); err != nil {
@@ -408,10 +406,10 @@ func normalizeImageFormat(format string) (string, error) {
 
 func normalizeBackend(backend string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(backend)) {
-	case "", canvas.BackendImageCanvas:
-		return canvas.BackendImageCanvas, nil
-	case canvas.BackendSplash:
+	case "", canvas.BackendSplash:
 		return canvas.BackendSplash, nil
+	case canvas.BackendImageCanvas:
+		return canvas.BackendImageCanvas, nil
 	default:
 		return "", fmt.Errorf(
 			"unsupported backend %q (valid: %s, %s)",

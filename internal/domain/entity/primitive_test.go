@@ -422,7 +422,9 @@ func TestStream(t *testing.T) {
 
 		assert.Equal(t, original.String(), cloned.String())
 		assert.True(t, original != cloned)
-		assert.NotSame(t, original.RawBytes(), cloned.RawBytes())
+		cloned.RawBytes()[0] = 'b'
+		assert.Equal(t, []byte("test"), original.RawBytes())
+		assert.Equal(t, []byte("best"), cloned.RawBytes())
 	})
 
 	t.Run("SetDict and SetData work correctly", func(t *testing.T) {

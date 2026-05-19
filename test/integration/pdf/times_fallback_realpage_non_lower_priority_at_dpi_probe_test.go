@@ -23,4 +23,3 @@ func TestRealPageNonLowerGlyphSourceOverrideGainRemainsSmallerThanCodeSpecAndRes
 	require.Greater(t, result.expandedResidualGap, result.coreGlyphSwapGain)
 	require.Greater(t, result.expandedResidualGap, result.expandedGlyphSwapGain)
 }
-

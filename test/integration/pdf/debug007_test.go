@@ -41,19 +41,19 @@ func TestDebug007Render(t *testing.T) {
 		}
 		fmt.Println()
 	}
-	
+
 	// Poppler reference
 	poppler := [][]int{
-		{0,0,0,0,0,0,0,0},
-		{0,0,0,0,0,0,0,0},
-		{0,0,63,0,0,0,0,63},
-		{0,0,0,0,255,0,0,0},
-		{0,0,0,0,255,0,0,0},
-		{0,0,0,0,127,0,0,0},
-		{0,0,127,0,0,0,191,0},
-		{0,0,63,127,127,127,63,0},
+		{0, 0, 0, 0, 0, 0, 0, 0},
+		{0, 0, 0, 0, 0, 0, 0, 0},
+		{0, 0, 63, 0, 0, 0, 0, 63},
+		{0, 0, 0, 0, 255, 0, 0, 0},
+		{0, 0, 0, 0, 255, 0, 0, 0},
+		{0, 0, 0, 0, 127, 0, 0, 0},
+		{0, 0, 127, 0, 0, 0, 191, 0},
+		{0, 0, 63, 127, 127, 127, 63, 0},
 	}
-	
+
 	fmt.Println("\nDiff (ours - poppler) R channel:")
 	var totalDiff int
 	for y := 0; y < 8; y++ {
@@ -61,9 +61,11 @@ func TestDebug007Render(t *testing.T) {
 			ours := int(rgba.RGBAAt(x, y).R)
 			pop := poppler[y][x]
 			diff := ours - pop
-			if diff < 0 { diff = -diff }
+			if diff < 0 {
+				diff = -diff
+			}
 			totalDiff += diff * 3
-			fmt.Printf("%4d ", ours - poppler[y][x])
+			fmt.Printf("%4d ", ours-poppler[y][x])
 		}
 		fmt.Println()
 	}

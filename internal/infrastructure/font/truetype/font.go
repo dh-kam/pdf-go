@@ -109,7 +109,6 @@ func (f *Font) GetGlyphBoundingBox(glyph uint32) (float64, float64, float64, flo
 	return float64(xMin), float64(yMin), float64(xMax), float64(yMax), nil
 }
 
-
 // renderGlyphGoParser renders a glyph using the pure-Go TrueType outline parser.
 func (f *Font) renderGlyphGoParser(glyph uint32, size float64) (*entity.GlyphPath, error) {
 	glyphData, err := f.file.GetGlyphData(uint16(glyph))

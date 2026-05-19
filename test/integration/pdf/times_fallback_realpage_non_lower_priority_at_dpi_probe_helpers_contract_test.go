@@ -8,11 +8,11 @@ import (
 
 func TestRealPageNonLowerPriorityAtDPIProbeResult_PrefersCodeSpecAndResidualOverGlyphSwap(t *testing.T) {
 	result := realPageNonLowerPriorityAtDPIProbeResult{
-		codeSpecGap:             3.0,
-		expandedResidualGap:     2.0,
-		coreGlyphSwapGain:       0.1,
-		expandedGlyphSwapGain:   0.2,
-		dpi:                     150,
+		codeSpecGap:           3.0,
+		expandedResidualGap:   2.0,
+		coreGlyphSwapGain:     0.1,
+		expandedGlyphSwapGain: 0.2,
+		dpi:                   150,
 	}
 
 	require.Greater(t, result.codeSpecGap, result.coreGlyphSwapGain)
@@ -20,4 +20,3 @@ func TestRealPageNonLowerPriorityAtDPIProbeResult_PrefersCodeSpecAndResidualOver
 	require.Greater(t, result.expandedResidualGap, result.coreGlyphSwapGain)
 	require.Greater(t, result.expandedResidualGap, result.expandedGlyphSwapGain)
 }
-

@@ -39,6 +39,8 @@ type config struct {
 	skipCompressedCopies bool
 }
 
+const defaultPDFRenderBuildTags = ""
+
 type pdfJob struct {
 	index int
 	path  string
@@ -85,13 +87,13 @@ func main() {
 
 func parseFlags() config {
 	var cfg config
-	timeoutSec := flag.Int("timeout-sec", 900, "per-document render timeout in seconds")
+	timeoutSec := flag.Int("timeout-sec", 0, "per-document render timeout in seconds; <=0 disables timeout")
 	flag.StringVar(&cfg.repoRoot, "repo-root", ".", "repository root")
-	flag.StringVar(&cfg.scanRoot, "scan-root", "test/testdata/sample-files", "comma-separated PDF scan roots")
+	flag.StringVar(&cfg.scanRoot, "scan-root", "test/testdata/compare/pdfs", "comma-separated PDF scan roots")
 	flag.StringVar(&cfg.outDir, "out", "tmp/full_render_compare", "output directory")
 	flag.StringVar(&cfg.pdftoppm, "pdftoppm", "pdftoppm", "pdftoppm executable")
 	flag.StringVar(&cfg.pdfrender, "pdfrender", "", "pdfrender executable; built into output tools directory when empty")
-	flag.StringVar(&cfg.pdfrenderBuildTags, "pdfrender-build-tags", "", "optional Go build tags for auto-built pdfrender")
+	flag.StringVar(&cfg.pdfrenderBuildTags, "pdfrender-build-tags", defaultPDFRenderBuildTags, "optional Go build tags for auto-built pdfrender")
 	flag.StringVar(&cfg.backend, "backend", "splash", "pdfrender backend: splash or image-canvas")
 	flag.StringVar(&cfg.imageSamplingMode, "image-sampling-mode", "legacy", "pdfrender image sampling mode")
 	flag.IntVar(&cfg.dpi, "dpi", 150, "render DPI")
@@ -179,6 +181,10 @@ func buildPDFRender(cfg config) error {
 	var stderr bytes.Buffer
 	cmd := exec.Command("go", args...)
 	cmd.Dir = cfg.repoRoot
+	cmd.Env = append(os.Environ(),
+		"CGO_ENABLED=0",
+		"PDF_FREETYPE_GO=1",
+	)
 	cmd.Stderr = &stderr
 	cmd.Stdout = os.Stdout
 	if err := cmd.Run(); err != nil {
@@ -354,10 +360,17 @@ func renderOurs(cfg config, pdfPath, outDir, logDir, password string) string {
 }
 
 func runLogged(cfg config, logDir, name, command string, args ...string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
+	ctx := context.Background()
+	cancel := func() {}
+	if cfg.timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, cfg.timeout)
+	}
 	defer cancel()
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = cfg.repoRoot
+	if name == "ours" {
+		cmd.Env = append(os.Environ(), "PDF_FREETYPE_GO=1")
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

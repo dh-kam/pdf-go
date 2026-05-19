@@ -19,4 +19,3 @@ func TestRealPageBroadLowercaseProbeResult_ComputesDeltaFields(t *testing.T) {
 	require.Equal(t, 8.0, result.fullGap())
 	require.Equal(t, 0.75, result.broadCoverage())
 }
-

@@ -1,6 +1,8 @@
 package renderer
 
 import (
+	"encoding/binary"
+
 	"github.com/dh-kam/pdf-go/internal/domain/entity"
 	"github.com/dh-kam/pdf-go/internal/infrastructure/font/cff"
 	"github.com/dh-kam/pdf-go/internal/infrastructure/font/type1"
@@ -123,29 +125,319 @@ func (e *Evaluator) resolveEmbeddedType1Encoding(dict *entity.Dict) map[byte]str
 }
 
 func embeddedCFFEncodingNames(fontData []byte) map[byte]string {
+	rawEncoding := parseEmbeddedCFFEncodingNames(fontData)
 	font, err := cff.NewFont(fontData)
 	if err != nil {
-		return nil
-	}
-	encoded, ok := any(font).(encodingNameFont)
-	if !ok {
 		return nil
 	}
 
 	// Poppler uses FoFiType1C's built-in encoding and fills empty slots from
 	// StandardEncoding for simple embedded Type1C fonts.
 	out := simpleASCIIEncodingNames()
-	for code := 0; code <= 255; code++ {
-		name := encoded.EncodingName(byte(code))
-		if name == "" || name == ".notdef" {
-			continue
+	for code, name := range rawEncoding {
+		out[code] = name
+	}
+	if encoded, ok := any(font).(encodingNameFont); ok {
+		for code := 0; code <= 255; code++ {
+			name := encoded.EncodingName(byte(code))
+			if name == "" || name == ".notdef" {
+				continue
+			}
+			out[byte(code)] = name
 		}
-		out[byte(code)] = name
+	}
+	if len(rawEncoding) == 0 {
+		if _, ok := any(font).(encodingNameFont); !ok {
+			return nil
+		}
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+type cffIndexData struct {
+	objects [][]byte
+	end     int
+}
+
+func parseEmbeddedCFFEncodingNames(data []byte) map[byte]string {
+	if len(data) < 4 || !looksLikeCFFEmbeddedFont(data) {
+		return nil
+	}
+
+	pos := int(data[2])
+	if pos > len(data) {
+		return nil
+	}
+	nameIndex, ok := readCFFIndexData(data, pos)
+	if !ok {
+		return nil
+	}
+	topDictIndex, ok := readCFFIndexData(data, nameIndex.end)
+	if !ok || len(topDictIndex.objects) == 0 {
+		return nil
+	}
+	stringIndex, ok := readCFFIndexData(data, topDictIndex.end)
+	if !ok {
+		return nil
+	}
+
+	topDict := parseCFFTopDictOffsets(topDictIndex.objects[0])
+	encodingOffset, hasEncoding := topDict[16]
+	charsetOffset, hasCharset := topDict[15]
+	charStringsOffset, hasCharStrings := topDict[17]
+	if !hasEncoding || !hasCharset || !hasCharStrings {
+		return nil
+	}
+
+	charStrings, ok := readCFFIndexData(data, charStringsOffset)
+	if !ok || len(charStrings.objects) == 0 {
+		return nil
+	}
+	charset := parseCFFCharsetNames(data, charsetOffset, len(charStrings.objects), stringIndex.objects)
+	if len(charset) == 0 {
+		return nil
+	}
+	return parseCFFEncodingNames(data, encodingOffset, charset)
+}
+
+func readCFFIndexData(data []byte, pos int) (cffIndexData, bool) {
+	if pos < 0 || pos+2 > len(data) {
+		return cffIndexData{}, false
+	}
+	count := int(binary.BigEndian.Uint16(data[pos : pos+2]))
+	pos += 2
+	if count == 0 {
+		return cffIndexData{end: pos}, true
+	}
+	if pos >= len(data) {
+		return cffIndexData{}, false
+	}
+	offSize := int(data[pos])
+	pos++
+	if offSize < 1 || offSize > 4 || pos+(count+1)*offSize > len(data) {
+		return cffIndexData{}, false
+	}
+
+	offsets := make([]int, count+1)
+	for i := range offsets {
+		offsets[i] = readCFFOffset(data[pos:pos+offSize], offSize)
+		pos += offSize
+	}
+	if offsets[0] != 1 || offsets[count] < offsets[0] {
+		return cffIndexData{}, false
+	}
+
+	dataStart := pos
+	dataEnd := dataStart + offsets[count] - 1
+	if dataEnd > len(data) {
+		return cffIndexData{}, false
+	}
+
+	objects := make([][]byte, 0, count)
+	for i := 0; i < count; i++ {
+		start := dataStart + offsets[i] - 1
+		end := dataStart + offsets[i+1] - 1
+		if start < dataStart || end < start || end > dataEnd {
+			return cffIndexData{}, false
+		}
+		objects = append(objects, data[start:end])
+	}
+	return cffIndexData{objects: objects, end: dataEnd}, true
+}
+
+func readCFFOffset(data []byte, offSize int) int {
+	out := 0
+	for i := 0; i < offSize; i++ {
+		out = (out << 8) | int(data[i])
+	}
+	return out
+}
+
+func parseCFFTopDictOffsets(data []byte) map[int]int {
+	out := map[int]int{}
+	stack := []int{}
+	for i := 0; i < len(data); {
+		b := data[i]
+		if b <= 21 {
+			op := int(b)
+			i++
+			if b == 12 {
+				if i >= len(data) {
+					return out
+				}
+				op = 1200 + int(data[i])
+				i++
+			}
+			if len(stack) > 0 {
+				out[op] = stack[len(stack)-1]
+			}
+			stack = stack[:0]
+			continue
+		}
+
+		value, ok, next := readCFFDictInteger(data, i)
+		if next <= i {
+			return out
+		}
+		i = next
+		if ok {
+			stack = append(stack, value)
+		}
+	}
+	return out
+}
+
+func readCFFDictInteger(data []byte, pos int) (int, bool, int) {
+	if pos >= len(data) {
+		return 0, false, pos
+	}
+	b := data[pos]
+	switch {
+	case b >= 32 && b <= 246:
+		return int(b) - 139, true, pos + 1
+	case b >= 247 && b <= 250:
+		if pos+1 >= len(data) {
+			return 0, false, len(data)
+		}
+		return (int(b)-247)*256 + int(data[pos+1]) + 108, true, pos + 2
+	case b >= 251 && b <= 254:
+		if pos+1 >= len(data) {
+			return 0, false, len(data)
+		}
+		return -(int(b)-251)*256 - int(data[pos+1]) - 108, true, pos + 2
+	case b == 28:
+		if pos+2 >= len(data) {
+			return 0, false, len(data)
+		}
+		return int(int16(binary.BigEndian.Uint16(data[pos+1 : pos+3]))), true, pos + 3
+	case b == 29:
+		if pos+4 >= len(data) {
+			return 0, false, len(data)
+		}
+		return int(int32(binary.BigEndian.Uint32(data[pos+1 : pos+5]))), true, pos + 5
+	case b == 30:
+		next := pos + 1
+		for next < len(data) {
+			current := data[next]
+			next++
+			if current>>4 == 0x0f || current&0x0f == 0x0f {
+				break
+			}
+		}
+		return 0, false, next
+	default:
+		return 0, false, pos + 1
+	}
+}
+
+func parseCFFCharsetNames(data []byte, offset int, glyphCount int, strings [][]byte) []string {
+	if glyphCount <= 0 {
+		return nil
+	}
+	names := make([]string, glyphCount)
+	names[0] = ".notdef"
+	if offset <= 2 || offset >= len(data) {
+		return names
+	}
+
+	format := data[offset]
+	pos := offset + 1
+	gid := 1
+	switch format {
+	case 0:
+		for gid < glyphCount && pos+2 <= len(data) {
+			sid := int(binary.BigEndian.Uint16(data[pos : pos+2]))
+			pos += 2
+			names[gid] = cffSIDName(sid, strings)
+			gid++
+		}
+	case 1, 2:
+		for gid < glyphCount && pos+3 <= len(data) {
+			firstSID := int(binary.BigEndian.Uint16(data[pos : pos+2]))
+			pos += 2
+			nLeft := int(data[pos])
+			pos++
+			if format == 2 {
+				if pos+2 > len(data) {
+					break
+				}
+				nLeft = int(binary.BigEndian.Uint16(data[pos : pos+2]))
+				pos += 2
+			}
+			for sid := firstSID; sid <= firstSID+nLeft && gid < glyphCount; sid++ {
+				names[gid] = cffSIDName(sid, strings)
+				gid++
+			}
+		}
+	}
+	return names
+}
+
+func parseCFFEncodingNames(data []byte, offset int, charset []string) map[byte]string {
+	if offset < 0 || offset >= len(data) || len(charset) == 0 {
+		return nil
+	}
+	format := data[offset] & 0x7f
+	pos := offset + 1
+	gid := 1
+	out := map[byte]string{}
+	switch format {
+	case 0:
+		if pos >= len(data) {
+			return nil
+		}
+		nCodes := int(data[pos])
+		pos++
+		for i := 0; i < nCodes && gid < len(charset) && pos < len(data); i++ {
+			if name := charset[gid]; name != "" && name != ".notdef" {
+				out[data[pos]] = name
+			}
+			pos++
+			gid++
+		}
+	case 1:
+		if pos >= len(data) {
+			return nil
+		}
+		nRanges := int(data[pos])
+		pos++
+		for i := 0; i < nRanges && gid < len(charset) && pos+2 <= len(data); i++ {
+			first := data[pos]
+			nLeft := int(data[pos+1])
+			pos += 2
+			for code := int(first); code <= int(first)+nLeft && gid < len(charset); code++ {
+				if name := charset[gid]; name != "" && name != ".notdef" {
+					out[byte(code)] = name
+				}
+				gid++
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func cffSIDName(sid int, strings [][]byte) string {
+	if sid == 0 {
+		return ".notdef"
+	}
+	if name, ok := cffStandardStringBySID[sid]; ok {
+		return name
+	}
+	custom := sid - 391
+	if custom >= 0 && custom < len(strings) {
+		return string(strings[custom])
+	}
+	return ""
+}
+
+var cffStandardStringBySID = map[int]string{
+	166: "intersection",
 }
 
 func nameValueForEncoding(obj entity.Object) string {

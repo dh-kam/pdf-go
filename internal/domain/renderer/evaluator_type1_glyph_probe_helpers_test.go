@@ -147,20 +147,23 @@ type syntheticExpandedGlyphSetOutlineProbePair struct {
 func unwrapStandardFallbackChainForProbe(t *testing.T, font entity.Font) (*widthMappedFont, *encodedFont, entity.Font) {
 	t.Helper()
 
-	// Optionally unwrap glyphSourceOverrideFont if present.
-	if gso, ok := font.(*glyphSourceOverrideFont); ok {
-		font = gso.base
+	for depth := 0; depth < 16; depth++ {
+		if widthMapped, ok := font.(*widthMappedFont); ok {
+			require.NotNil(t, widthMapped.base)
+
+			encoded, ok := widthMapped.base.(*encodedFont)
+			require.True(t, ok)
+			require.NotNil(t, encoded.base)
+
+			return widthMapped, encoded, encoded.base
+		}
+		unwrapper, ok := font.(fontBaseUnwrapper)
+		require.Truef(t, ok, "font chain does not contain widthMappedFont: %s", describeFontForProbe(font))
+		font = unwrapper.BaseFont()
 	}
 
-	widthMapped, ok := font.(*widthMappedFont)
-	require.True(t, ok)
-	require.NotNil(t, widthMapped.base)
-
-	encoded, ok := widthMapped.base.(*encodedFont)
-	require.True(t, ok)
-	require.NotNil(t, encoded.base)
-
-	return widthMapped, encoded, encoded.base
+	t.Fatalf("font chain exceeded unwrap depth: %s", describeFontForProbe(font))
+	return nil, nil, nil
 }
 
 func collectGlyphSetSignature(t *testing.T, font entity.Font, codes []int) glyphSetSignature {
@@ -665,6 +668,7 @@ func loadResolvedType1ProbeFont(
 	t.Setenv("PDF_DEBUG_TYPE1_MODE", "fallback-first")
 
 	doc, fixture := loadType1GlyphProbeFixture(t, pdfPath, pageNum, fontResource)
+	t.Setenv("PDF_DEBUG_TYPE1_FALLBACK_FOR_BASE", fixture.baseFont)
 
 	e := NewEvaluator(doc.XRef())
 	font, err := e.getFontFromDict(fixture.fontDict, fixture.baseFont)

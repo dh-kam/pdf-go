@@ -12,7 +12,7 @@ import (
 	"golang.org/x/image/math/fixed"
 
 	"github.com/dh-kam/pdf-go/internal/domain/entity"
-	ftcgo "github.com/dh-kam/pdf-go/internal/infrastructure/cgo/freetype"
+	ftcgo "github.com/dh-kam/pdf-go/internal/infrastructure/font/freetype"
 	standardfont "github.com/dh-kam/pdf-go/internal/infrastructure/font/standard"
 )
 
@@ -627,7 +627,7 @@ func (f *Font) buildFreeTypeNameIndex() {
 		}
 		for sourceIdx, fontData := range sources {
 			ftIdx, ok := ftcgo.GetGlyphIndexByName(fontData, name)
-			if !ok || ftIdx == 0 {
+			if !ok {
 				continue
 			}
 			indexByCode[code] = freeTypeGlyphIndex{
@@ -672,7 +672,7 @@ func (f *Font) RenderGlyphBitmap(glyph uint32, sizePt float64, dpi int) ([]byte,
 	if glyph >= ftNamedGlyphBase {
 		ftIdx := glyph - ftNamedGlyphBase
 		for _, fontData := range f.freeTypeSourceData() {
-			buf, bw, bh, bleft, btop, err := ftcgo.RenderGlyphBitmapByIndex(fontData, ftIdx, sizePt, dpi)
+			buf, bw, bh, bleft, btop, err := renderType1FTBitmapByIndex(fontData, ftIdx, sizePt, dpi)
 			if err == nil {
 				return buf, bw, bh, bleft, btop, nil
 			}
@@ -680,7 +680,7 @@ func (f *Font) RenderGlyphBitmap(glyph uint32, sizePt float64, dpi int) ([]byte,
 		return nil, 0, 0, 0, 0, fmt.Errorf("FreeType bitmap rendering failed for index %d", ftIdx)
 	}
 	for _, fontData := range f.freeTypeSourceData() {
-		buf, bw, bh, bleft, btop, err := ftcgo.RenderGlyphBitmap(fontData, glyph, sizePt, dpi)
+		buf, bw, bh, bleft, btop, err := renderType1FTBitmap(fontData, glyph, sizePt, dpi)
 		if err == nil {
 			return buf, bw, bh, bleft, btop, nil
 		}
@@ -697,7 +697,7 @@ func (f *Font) RenderGlyphBitmapPhased(glyph uint32, sizePt float64, dpi int, ph
 	if glyph >= ftNamedGlyphBase {
 		ftIdx := glyph - ftNamedGlyphBase
 		for _, fontData := range f.freeTypeSourceData() {
-			buf, bw, bh, bleft, btop, err := ftcgo.RenderGlyphBitmapByIndexPhased(fontData, ftIdx, sizePt, dpi, phaseX, phaseY)
+			buf, bw, bh, bleft, btop, err := renderType1FTBitmapByIndexPhased(fontData, ftIdx, sizePt, dpi, phaseX, phaseY)
 			if err == nil {
 				return buf, bw, bh, bleft, btop, nil
 			}
@@ -705,13 +705,13 @@ func (f *Font) RenderGlyphBitmapPhased(glyph uint32, sizePt float64, dpi int, ph
 		return nil, 0, 0, 0, 0, fmt.Errorf("FreeType phased bitmap rendering failed for index %d", ftIdx)
 	}
 	if fontData, ftIdx, ok := f.freeTypeNameIndexForGlyph(glyph); ok {
-		buf, bw, bh, bleft, btop, err := ftcgo.RenderGlyphBitmapByIndexPhased(fontData, ftIdx, sizePt, dpi, phaseX, phaseY)
+		buf, bw, bh, bleft, btop, err := renderType1FTBitmapByIndexPhased(fontData, ftIdx, sizePt, dpi, phaseX, phaseY)
 		if err == nil {
 			return buf, bw, bh, bleft, btop, nil
 		}
 	}
 	for _, fontData := range f.freeTypeSourceData() {
-		buf, bw, bh, bleft, btop, err := ftcgo.RenderGlyphBitmapPhased(fontData, glyph, sizePt, dpi, phaseX, phaseY)
+		buf, bw, bh, bleft, btop, err := renderType1FTBitmapPhased(fontData, glyph, sizePt, dpi, phaseX, phaseY)
 		if err == nil {
 			return buf, bw, bh, bleft, btop, nil
 		}
@@ -728,7 +728,7 @@ func (f *Font) RenderGlyphBitmapTransformedPhased(glyph uint32, sizePt, scaleX, 
 	if glyph >= ftNamedGlyphBase {
 		ftIdx := glyph - ftNamedGlyphBase
 		for _, fontData := range f.freeTypeSourceData() {
-			buf, bw, bh, bleft, btop, err := ftcgo.RenderGlyphBitmapByIndexTransformedPhased(fontData, ftIdx, sizePt, scaleX, scaleY, phaseX, phaseY)
+			buf, bw, bh, bleft, btop, err := renderType1FTBitmapByIndexTransformedPhased(fontData, ftIdx, sizePt, scaleX, scaleY, phaseX, phaseY)
 			if err == nil {
 				return buf, bw, bh, bleft, btop, nil
 			}
@@ -736,13 +736,13 @@ func (f *Font) RenderGlyphBitmapTransformedPhased(glyph uint32, sizePt, scaleX, 
 		return nil, 0, 0, 0, 0, fmt.Errorf("FreeType transformed bitmap rendering failed for index %d", ftIdx)
 	}
 	if fontData, ftIdx, ok := f.freeTypeNameIndexForGlyph(glyph); ok {
-		buf, bw, bh, bleft, btop, err := ftcgo.RenderGlyphBitmapByIndexTransformedPhased(fontData, ftIdx, sizePt, scaleX, scaleY, phaseX, phaseY)
+		buf, bw, bh, bleft, btop, err := renderType1FTBitmapByIndexTransformedPhased(fontData, ftIdx, sizePt, scaleX, scaleY, phaseX, phaseY)
 		if err == nil {
 			return buf, bw, bh, bleft, btop, nil
 		}
 	}
 	for _, fontData := range f.freeTypeSourceData() {
-		buf, bw, bh, bleft, btop, err := ftcgo.RenderGlyphBitmapTransformedPhased(fontData, glyph, sizePt, scaleX, scaleY, phaseX, phaseY)
+		buf, bw, bh, bleft, btop, err := renderType1FTBitmapTransformedPhased(fontData, glyph, sizePt, scaleX, scaleY, phaseX, phaseY)
 		if err == nil {
 			return buf, bw, bh, bleft, btop, nil
 		}
@@ -759,7 +759,7 @@ func (f *Font) RenderGlyphBitmapMatrixPhased(glyph uint32, sizePt float64, matri
 	if glyph >= ftNamedGlyphBase {
 		ftIdx := glyph - ftNamedGlyphBase
 		for _, fontData := range f.freeTypeSourceData() {
-			buf, bw, bh, bleft, btop, err := ftcgo.RenderGlyphBitmapByIndexMatrixPhased(fontData, ftIdx, sizePt, matrix, phaseX, phaseY)
+			buf, bw, bh, bleft, btop, err := renderType1FTBitmapByIndexMatrixPhased(fontData, ftIdx, sizePt, matrix, phaseX, phaseY)
 			if err == nil {
 				return buf, bw, bh, bleft, btop, nil
 			}
@@ -767,18 +767,82 @@ func (f *Font) RenderGlyphBitmapMatrixPhased(glyph uint32, sizePt float64, matri
 		return nil, 0, 0, 0, 0, fmt.Errorf("FreeType matrix bitmap rendering failed for index %d", ftIdx)
 	}
 	if fontData, ftIdx, ok := f.freeTypeNameIndexForGlyph(glyph); ok {
-		buf, bw, bh, bleft, btop, err := ftcgo.RenderGlyphBitmapByIndexMatrixPhased(fontData, ftIdx, sizePt, matrix, phaseX, phaseY)
+		buf, bw, bh, bleft, btop, err := renderType1FTBitmapByIndexMatrixPhased(fontData, ftIdx, sizePt, matrix, phaseX, phaseY)
 		if err == nil {
 			return buf, bw, bh, bleft, btop, nil
 		}
 	}
 	for _, fontData := range f.freeTypeSourceData() {
-		buf, bw, bh, bleft, btop, err := ftcgo.RenderGlyphBitmapMatrixPhased(fontData, glyph, sizePt, matrix, phaseX, phaseY)
+		buf, bw, bh, bleft, btop, err := renderType1FTBitmapMatrixPhased(fontData, glyph, sizePt, matrix, phaseX, phaseY)
 		if err == nil {
 			return buf, bw, bh, bleft, btop, nil
 		}
 	}
 	return nil, 0, 0, 0, 0, fmt.Errorf("FreeType matrix bitmap rendering failed")
+}
+
+func renderType1FTBitmap(fontData []byte, glyph uint32, sizePt float64, dpi int) ([]byte, int, int, int, int, error) {
+	if ftcgo.UsesPureGoFallback() {
+		if glyphIndex, ok := ftcgo.GetGlyphIndexByCharCode(fontData, glyph); ok {
+			return ftcgo.RenderGlyphBitmapByIndex(fontData, glyphIndex, sizePt, dpi)
+		}
+	}
+	return ftcgo.RenderGlyphBitmap(fontData, glyph, sizePt, dpi)
+}
+
+func renderType1FTBitmapByIndex(fontData []byte, glyphIndex uint32, sizePt float64, dpi int) ([]byte, int, int, int, int, error) {
+	if ftcgo.UsesPureGoFallback() {
+		return ftcgo.RenderGlyphBitmapByIndex(fontData, glyphIndex, sizePt, dpi)
+	}
+	return ftcgo.RenderGlyphBitmapByIndex(fontData, glyphIndex, sizePt, dpi)
+}
+
+func renderType1FTBitmapPhased(fontData []byte, glyph uint32, sizePt float64, dpi int, phaseX, phaseY float64) ([]byte, int, int, int, int, error) {
+	if ftcgo.UsesPureGoFallback() {
+		if glyphIndex, ok := ftcgo.GetGlyphIndexByCharCode(fontData, glyph); ok {
+			return ftcgo.RenderGlyphBitmapByIndexPhased(fontData, glyphIndex, sizePt, dpi, phaseX, phaseY)
+		}
+	}
+	return ftcgo.RenderGlyphBitmapPhased(fontData, glyph, sizePt, dpi, phaseX, phaseY)
+}
+
+func renderType1FTBitmapByIndexPhased(fontData []byte, glyphIndex uint32, sizePt float64, dpi int, phaseX, phaseY float64) ([]byte, int, int, int, int, error) {
+	if ftcgo.UsesPureGoFallback() {
+		return ftcgo.RenderGlyphBitmapByIndexPhased(fontData, glyphIndex, sizePt, dpi, phaseX, phaseY)
+	}
+	return ftcgo.RenderGlyphBitmapByIndexPhased(fontData, glyphIndex, sizePt, dpi, phaseX, phaseY)
+}
+
+func renderType1FTBitmapTransformedPhased(fontData []byte, glyph uint32, sizePt, scaleX, scaleY, phaseX, phaseY float64) ([]byte, int, int, int, int, error) {
+	if ftcgo.UsesPureGoFallback() {
+		if glyphIndex, ok := ftcgo.GetGlyphIndexByCharCode(fontData, glyph); ok {
+			return ftcgo.RenderGlyphBitmapByIndexTransformedPhased(fontData, glyphIndex, sizePt, scaleX, scaleY, phaseX, phaseY)
+		}
+	}
+	return ftcgo.RenderGlyphBitmapTransformedPhased(fontData, glyph, sizePt, scaleX, scaleY, phaseX, phaseY)
+}
+
+func renderType1FTBitmapByIndexTransformedPhased(fontData []byte, glyphIndex uint32, sizePt, scaleX, scaleY, phaseX, phaseY float64) ([]byte, int, int, int, int, error) {
+	if ftcgo.UsesPureGoFallback() {
+		return ftcgo.RenderGlyphBitmapByIndexTransformedPhased(fontData, glyphIndex, sizePt, scaleX, scaleY, phaseX, phaseY)
+	}
+	return ftcgo.RenderGlyphBitmapByIndexTransformedPhased(fontData, glyphIndex, sizePt, scaleX, scaleY, phaseX, phaseY)
+}
+
+func renderType1FTBitmapMatrixPhased(fontData []byte, glyph uint32, sizePt float64, matrix [4]float64, phaseX, phaseY float64) ([]byte, int, int, int, int, error) {
+	if ftcgo.UsesPureGoFallback() {
+		if glyphIndex, ok := ftcgo.GetGlyphIndexByCharCode(fontData, glyph); ok {
+			return ftcgo.RenderGlyphBitmapByIndexMatrixPhased(fontData, glyphIndex, sizePt, matrix, phaseX, phaseY)
+		}
+	}
+	return ftcgo.RenderGlyphBitmapMatrixPhased(fontData, glyph, sizePt, matrix, phaseX, phaseY)
+}
+
+func renderType1FTBitmapByIndexMatrixPhased(fontData []byte, glyphIndex uint32, sizePt float64, matrix [4]float64, phaseX, phaseY float64) ([]byte, int, int, int, int, error) {
+	if ftcgo.UsesPureGoFallback() {
+		return ftcgo.RenderGlyphBitmapByIndexMatrixPhased(fontData, glyphIndex, sizePt, matrix, phaseX, phaseY)
+	}
+	return ftcgo.RenderGlyphBitmapByIndexMatrixPhased(fontData, glyphIndex, sizePt, matrix, phaseX, phaseY)
 }
 
 func (f *Font) freeTypeSourceData() [][]byte {

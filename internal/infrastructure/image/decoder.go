@@ -114,7 +114,13 @@ func (d *Decoder) Decode(data *image.ImageData) (image.Image, error) {
 		if !ok {
 			return nil, errors.NotFoundf("image_decoder", "no decoder for filter: %s", data.Filter)
 		}
-		img, err = decoder.Decode(rawData)
+		if optionsDecoder, ok := decoder.(interface {
+			DecodeWithOptions([]byte, jbig2.DecodeOptions) (stdimage.Image, error)
+		}); ok {
+			img, err = optionsDecoder.DecodeWithOptions(rawData, jbig2DecodeOptions(data))
+		} else {
+			img, err = decoder.Decode(rawData)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -164,6 +170,36 @@ func (d *Decoder) Decode(data *image.ImageData) (image.Image, error) {
 	}
 
 	return result, nil
+}
+
+func jbig2DecodeOptions(data *image.ImageData) jbig2.DecodeOptions {
+	opts := jbig2.DecodeOptions{
+		Width:  data.Width,
+		Height: data.Height,
+	}
+	if data == nil || data.DecodeParms == nil {
+		return opts
+	}
+	if globals, ok := decodeParmsBytes(data.DecodeParms, "JBIG2Globals"); ok {
+		opts.Globals = globals
+	}
+	return opts
+}
+
+func decodeParmsBytes(params map[string]interface{}, key string) ([]byte, bool) {
+	for _, candidate := range []string{key, "/" + key} {
+		value, ok := params[candidate]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case []byte:
+			return typed, true
+		case string:
+			return []byte(typed), true
+		}
+	}
+	return nil, false
 }
 
 // decompress decompresses image data based on the filter.

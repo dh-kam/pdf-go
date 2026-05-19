@@ -148,6 +148,26 @@ func TestColorSpaceType_String(t *testing.T) {
 	}
 }
 
+func TestConvertComponentToByte_PopplerFixedPointQuantization(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    float64
+		expected uint8
+	}{
+		{"ClampsLow", -0.1, 0},
+		{"ClampsHigh", 1.2, 255},
+		{"PointThree", 0.3, 76},
+		{"Half", 0.5, 128},
+		{"PointSeven", 0.7, 178},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, ConvertComponentToByte(tt.input))
+		})
+	}
+}
+
 func TestParseFunctionFromObject_PostScriptType4Stream(t *testing.T) {
 	dict := entity.NewDict()
 	dict.Set(entity.NewName("FunctionType"), entity.NewInteger(4))

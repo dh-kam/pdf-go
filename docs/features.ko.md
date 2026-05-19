@@ -104,15 +104,11 @@ Visible signature field는 세션 범위에서 추가하거나 제거할 수 있
 
 `pixeldiff`, `splash_pixel_diff`, `compare_pixels` 계열 도구는 Poppler와의 렌더링 차이를 분석하기 위한 개발용 CLI이다. 일반 사용 경로보다는 회귀 분석과 exact parity 작업에 사용한다.
 
-## 빌드 태그와 선택 기능
+## 빌드
 
-`nojpx` 태그를 사용하면 JPEG2000 CGo 연동 없이 빌드한다. 이 경우 `JPXDecode`는 지원 불가 에러를 반환한다.
-
-`nojbig2` 태그를 사용하면 JBIG2 CGo 연동 없이 빌드한다. 이 경우 `JBIG2Decode`는 지원 불가 에러를 반환한다.
-
-두 태그를 함께 사용하면 순수 Go 중심의 빌드와 테스트가 가능하다.
+JPX/JBIG2/FreeType/Splash 렌더링 경로는 기본적으로 순수 Go 구현을 사용한다. 외부 OpenJPEG, jbig2dec, FreeType, Cairo 라이브러리 링크가 필요하지 않다.
 
 ```bash
-go build -tags='nojpx,nojbig2' ./cmd/pdfrender
-go test -tags='nojpx,nojbig2' ./...
+CGO_ENABLED=0 go build ./cmd/pdfrender
+CGO_ENABLED=0 go test ./...
 ```

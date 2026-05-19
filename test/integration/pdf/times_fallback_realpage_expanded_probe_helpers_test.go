@@ -57,4 +57,3 @@ func measureRealPageExpandedLowercaseProbeAgainstPoppler(
 		forcedOnly:   renderPageSimilarityAgainstPopplerForProbe(t, tc.target, popplerPNG, mergeProbeEnv(targetOnlyEnv, tc.forcedEnv)),
 	}
 }
-

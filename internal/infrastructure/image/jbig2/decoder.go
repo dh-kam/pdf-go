@@ -5,8 +5,6 @@
 package jbig2
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
 	stdimage "image"
 	"image/color"
@@ -14,192 +12,322 @@ import (
 
 	"github.com/dh-kam/pdf-go/internal/domain/errors"
 	"github.com/dh-kam/pdf-go/internal/domain/image"
-	"github.com/dh-kam/pdf-go/internal/infrastructure/cgo/jbig2"
 )
 
 // Decoder implements JBIG2 image decoding.
-type Decoder struct {
-	useCGo bool
+type Decoder struct{}
+
+// DecodeOptions carries PDF-level JBIG2 decode parameters.
+type DecodeOptions struct {
+	Globals []byte
+	Width   int
+	Height  int
 }
 
 // NewDecoder creates a new JBIG2 decoder.
 func NewDecoder() *Decoder {
-	return &Decoder{
-		useCGo: jbig2.IsAvailable(),
-	}
+	return &Decoder{}
+}
+
+// NewNativeDecoder creates a decoder that uses only the clean-room Go path.
+func NewNativeDecoder() *Decoder {
+	return &Decoder{}
 }
 
 // Decode decodes JBIG2 image data.
 func (d *Decoder) Decode(data []byte) (stdimage.Image, error) {
+	return d.DecodeWithOptions(data, DecodeOptions{})
+}
+
+// DecodeWithOptions decodes JBIG2 image data with PDF DecodeParms.
+func (d *Decoder) DecodeWithOptions(data []byte, opts DecodeOptions) (stdimage.Image, error) {
 	if len(data) == 0 {
 		return nil, errors.Invalid("jbig2_data", nil)
 	}
 
-	// Try CGo decoder first if available
-	if d.useCGo {
-		img, err := d.decodeWithCGo(data)
-		if err == nil {
-			return img, nil
-		}
-		// Fall through to native implementation on error
-	}
-
-	// Use native Go implementation
-	return d.decodeNative(data)
-}
-
-// decodeWithCGo uses the CGo jbig2dec wrapper.
-func (d *Decoder) decodeWithCGo(data []byte) (stdimage.Image, error) {
-	img, err := jbig2.Decode(data)
-	if err != nil {
-		return nil, errors.Invalid("jbig2_cgo_decode", err)
-	}
-	return img, nil
+	return d.decodeNative(data, opts)
 }
 
 // decodeNative provides a native Go JBIG2 decoder implementation.
-func (d *Decoder) decodeNative(data []byte) (stdimage.Image, error) {
-	// Check for JBIG2 signature
-	if len(data) < 8 {
+func (d *Decoder) decodeNative(data []byte, opts DecodeOptions) (stdimage.Image, error) {
+	if len(data) == 0 {
 		return nil, errors.Invalid("jbig2_header", fmt.Errorf("invalid JBIG2 header: too short"))
 	}
 
-	// JBIG2 signature: 0x97 0x4A 0x42 0x32 0x0D 0x0A 0x1A 0x0A
-	jbig2Sig := []byte{0x97, 0x4A, 0x42, 0x32, 0x0D, 0x0A, 0x1A, 0x0A}
-	if !bytes.Equal(data[:8], jbig2Sig) {
-		// Might be embedded JBIG2 data without header
-		return d.decodeEmbedded(data)
-	}
-
-	// Parse JBIG2 file header
-	hdr, err := d.parseFileHeader(data[8:])
+	doc, err := parseNativeDocument(data)
 	if err != nil {
 		return nil, errors.Invalid("jbig2_header", err)
 	}
+	if len(opts.Globals) > 0 {
+		if err := doc.prependGlobals(opts.Globals); err != nil {
+			return nil, errors.Invalid("jbig2_globals", err)
+		}
+	}
+	doc.applyFallbackDimensions(opts.Width, opts.Height)
+	if doc.hasPageInfo {
+		img, decoded, err := d.decodePageAssociatedBitmap(doc)
+		if err != nil {
+			return nil, err
+		}
+		if decoded {
+			return img, nil
+		}
+	}
+	if img, decoded, err := d.decodeFirstBitmapFallback(doc); err != nil {
+		return nil, err
+	} else if decoded {
+		return img, nil
+	}
 
-	// For the stub implementation, return a placeholder image
-	// In a full implementation, this would decode the actual segments
-	return d.createPlaceholderImage(hdr), nil
+	return d.createPlaceholderImage(doc.pageInfo), nil
+}
+
+func putSegmentValue[V any](values map[uint32]V, number uint32, value V) {
+	if _, exists := values[number]; exists {
+		return
+	}
+	values[number] = value
+}
+
+func (d *Decoder) decodeFirstBitmapFallback(doc *nativeDocument) (*stdimage.Gray, bool, error) {
+	page := d.createPlaceholderImage(doc.pageInfo).(*stdimage.Gray)
+	patternDicts := map[uint32]patternDictionary{}
+	symbolDicts := map[uint32]symbolDictionary{}
+	codeTables := map[uint32][]huffmanTableEntry{}
+	bitmaps := map[uint32]*stdimage.Gray{}
+
+	for _, segment := range doc.segments {
+		if segment.typ == SegmentTables {
+			table, err := decodeCodeTableSegment(segment)
+			if err != nil {
+				return nil, false, err
+			}
+			putSegmentValue(codeTables, segment.number, table)
+			continue
+		}
+		if segment.isSymbolDictionary() {
+			dict, err := decodeSymbolDictionarySegmentWithCodeTables(segment, symbolDicts, codeTables)
+			if err != nil {
+				return nil, false, err
+			}
+			putSegmentValue(symbolDicts, segment.number, dict)
+			continue
+		}
+		if segment.isPatternDictionary() {
+			dict, err := decodePatternDictionarySegment(segment)
+			if err != nil {
+				return nil, false, err
+			}
+			putSegmentValue(patternDicts, segment.number, dict)
+			continue
+		}
+		if segment.pageAssociation == 0 || !segment.requiresBitmapDecoding() {
+			continue
+		}
+		if segment.isTextRegion() {
+			_, img, err := decodeTextRegionSegmentWithCodeTables(segment, symbolDicts, codeTables)
+			if err != nil {
+				return nil, false, err
+			}
+			return img, true, nil
+		}
+		if segment.isHalftoneRegion() {
+			_, img, err := decodeHalftoneRegionSegment(segment, patternDicts)
+			if err != nil {
+				return nil, false, err
+			}
+			return img, true, nil
+		}
+		if segment.isGenericRefinementRegion() {
+			_, img, err := decodeGenericRefinementRegionSegment(segment, page, bitmaps)
+			if err != nil {
+				return nil, false, err
+			}
+			return img, true, nil
+		}
+		if segment.isGenericRegion() {
+			_, img, err := d.decodeGenericBitmapSegment(segment)
+			if err != nil {
+				return nil, false, err
+			}
+			return img, true, nil
+		}
+		return nil, false, errors.NotImplemented(
+			"jbig2_segment_decode",
+			fmt.Errorf("native JBIG2 segment type %d not implemented", segment.typ),
+		)
+	}
+
+	return nil, false, nil
+}
+
+func (d *Decoder) decodePageAssociatedBitmap(doc *nativeDocument) (*stdimage.Gray, bool, error) {
+	page := d.createPlaceholderImage(doc.pageInfo).(*stdimage.Gray)
+	patternDicts := map[uint32]patternDictionary{}
+	symbolDicts := map[uint32]symbolDictionary{}
+	codeTables := map[uint32][]huffmanTableEntry{}
+	bitmaps := map[uint32]*stdimage.Gray{}
+	decoded := false
+
+	for _, segment := range doc.segments {
+		if segment.typ == SegmentTables {
+			table, err := decodeCodeTableSegment(segment)
+			if err != nil {
+				return nil, false, err
+			}
+			putSegmentValue(codeTables, segment.number, table)
+			continue
+		}
+		if segment.isSymbolDictionary() {
+			dict, err := decodeSymbolDictionarySegmentWithCodeTables(segment, symbolDicts, codeTables)
+			if err != nil {
+				return nil, false, err
+			}
+			putSegmentValue(symbolDicts, segment.number, dict)
+			continue
+		}
+		if segment.isPatternDictionary() {
+			dict, err := decodePatternDictionarySegment(segment)
+			if err != nil {
+				return nil, false, err
+			}
+			putSegmentValue(patternDicts, segment.number, dict)
+			continue
+		}
+		if segment.pageAssociation == 0 || !segment.requiresBitmapDecoding() {
+			continue
+		}
+		if segment.isHalftoneRegion() {
+			regionInfo, img, err := decodeHalftoneRegionSegment(segment, patternDicts)
+			if err != nil {
+				return nil, false, err
+			}
+			if segment.isImmediateHalftoneRegion() {
+				composeRegionIntoPage(page, regionInfo, img)
+				decoded = true
+			} else {
+				putSegmentValue(bitmaps, segment.number, img)
+			}
+			continue
+		}
+		if segment.isGenericRefinementRegion() {
+			regionInfo, img, err := decodeGenericRefinementRegionSegment(segment, page, bitmaps)
+			if err != nil {
+				return nil, false, err
+			}
+			discardReferencedBitmap(segment, bitmaps)
+			if segment.isImmediateGenericRefinementRegion() {
+				composeRegionIntoPage(page, regionInfo, img)
+				decoded = true
+			} else {
+				putSegmentValue(bitmaps, segment.number, img)
+			}
+			continue
+		}
+		if segment.isTextRegion() {
+			regionInfo, img, err := decodeTextRegionSegmentWithCodeTables(segment, symbolDicts, codeTables)
+			if err != nil {
+				return nil, false, err
+			}
+			if segment.isImmediateTextRegion() {
+				composeRegionIntoPage(page, regionInfo, img)
+				decoded = true
+			} else {
+				putSegmentValue(bitmaps, segment.number, img)
+			}
+			continue
+		}
+		if !segment.isGenericRegion() {
+			return nil, false, errors.NotImplemented(
+				"jbig2_segment_decode",
+				fmt.Errorf("native JBIG2 segment type %d not implemented", segment.typ),
+			)
+		}
+
+		region, img, err := d.decodeGenericBitmapSegment(segment)
+		if err != nil {
+			return nil, false, err
+		}
+		if segment.isImmediateGenericRegion() {
+			composeRegionIntoPage(page, region.info, img)
+			decoded = true
+		} else {
+			putSegmentValue(bitmaps, segment.number, img)
+		}
+	}
+
+	return page, decoded, nil
+}
+
+func discardReferencedBitmap(segment segmentHeader, bitmaps map[uint32]*stdimage.Gray) {
+	if len(segment.referredToSegmentNumbers) != 1 {
+		return
+	}
+	delete(bitmaps, segment.referredToSegmentNumbers[0])
+}
+
+func (d *Decoder) decodeGenericBitmapSegment(segment segmentHeader) (genericRegion, *stdimage.Gray, error) {
+	if err := validateBitmapSegmentBody(segment); err != nil {
+		return genericRegion{}, nil, errors.Invalid("jbig2_segment_body", err)
+	}
+	if !segment.isGenericRegion() {
+		return genericRegion{}, nil, errors.NotImplemented(
+			"jbig2_segment_decode",
+			fmt.Errorf("native JBIG2 segment type %d not implemented", segment.typ),
+		)
+	}
+
+	region, err := parseGenericRegionSegment(segment.data)
+	if err != nil {
+		return genericRegion{}, nil, errors.Invalid("jbig2_segment_body", err)
+	}
+	img, err := decodeGenericRegion(region)
+	if err != nil {
+		return genericRegion{}, nil, errors.Invalid("jbig2_segment_decode", err)
+	}
+	return region, img, nil
 }
 
 // JBIG2Header represents parsed JBIG2 file header information.
 type JBIG2Header struct {
 	Width         int
 	Height        int
+	DefaultPixel  bool
 	IsStriped     bool
 	MaxStripeSize int
 }
 
 // parseFileHeader parses the JBIG2 file header.
 func (d *Decoder) parseFileHeader(data []byte) (*JBIG2Header, error) {
-	hdr := &JBIG2Header{
-		Width:     100,
-		Height:    100,
-		IsStriped: false,
+	file, err := parseStandaloneFileHeader(data)
+	if err != nil {
+		return nil, err
 	}
 
-	if len(data) < 8 {
-		return hdr, nil
+	hdr := defaultJBIG2Header()
+	if file.headerLength < len(data) {
+		d.parseSegmentHeader(data[file.headerLength:], hdr)
 	}
-
-	// Parse file header (first 8 bytes after signature)
-	// Number of pages (4 bytes)
-	numPages := binary.BigEndian.Uint32(data[0:4])
-
-	// Organization flag (1 byte)
-	orgFlag := data[4]
-	if orgFlag&0x01 != 0 {
-		hdr.IsStriped = true
-		// Max stripe size (optional, 4 bytes)
-		if len(data) >= 12 {
-			hdr.MaxStripeSize = int(binary.BigEndian.Uint32(data[8:12]))
-		}
-	}
-
-	// If single page, try to extract dimensions from segments
-	if numPages == 1 {
-		d.parseSegmentHeader(data[8:], hdr)
-	}
-
 	return hdr, nil
 }
 
 // parseSegmentHeader parses JBIG2 segment headers.
 func (d *Decoder) parseSegmentHeader(data []byte, hdr *JBIG2Header) {
-	offset := 0
-
-	for offset < len(data) {
-		if offset+6 > len(data) {
-			break
-		}
-
-		// Segment number (4 bytes)
-		// segNumber := binary.BigEndian.Uint32(data[offset : offset+4])
-		offset += 4
-
-		// Segment flags (1 byte)
-		flags := data[offset]
-		offset++
-
-		// Segment type (1 byte)
-		segType := data[offset]
-		offset++
-
-		// Check if this is a page information segment (type 48)
-		if segType == 48 {
-			// Page information segment
-			if offset+5 <= len(data) {
-				hdr.Width = int(binary.BigEndian.Uint32(data[offset : offset+4]))
-				hdr.Height = int(binary.BigEndian.Uint32(data[offset+4 : offset+8]))
-				return
-			}
-		}
-
-		// Get segment data length (variable)
-		refCount := int(flags&0xE0) >> 5
-		if flags&0x10 != 0 {
-			// 32-bit segment count
-			if offset+4 > len(data) {
-				break
-			}
-			// segDataLength := binary.BigEndian.Uint32(data[offset : offset+4])
-			offset += 4
-		} else {
-			// 24-bit segment count
-			if offset+3 > len(data) {
-				break
-			}
-			// segDataLength := uint32(data[offset])<<16 | uint32(data[offset+1])<<8 | uint32(data[offset+2])
-			offset += 3
-		}
-
-		// Skip retained segments
-		for i := 0; i < refCount; i++ {
-			if offset+4 > len(data) {
-				break
-			}
-			offset += 4
-		}
-
-		// Skip segment data (we'd need the length to do this properly)
-		// For now, just break
-		break
+	segments, err := parseNativeSegments(data)
+	if err != nil {
+		return
 	}
+	doc := &nativeDocument{segments: segments, pageInfo: hdr}
+	doc.applyPageInfo()
 }
 
 // decodeEmbedded handles embedded JBIG2 data (without file header).
 func (d *Decoder) decodeEmbedded(data []byte) (stdimage.Image, error) {
-	// Embedded JBIG2 data starts directly with segments
-	// This is a stub implementation
-	hdr := &JBIG2Header{
-		Width:  100,
-		Height: 100,
+	doc, err := parseEmbeddedDocument(data)
+	if err != nil {
+		return nil, errors.Invalid("jbig2_embedded", err)
 	}
-
-	// Try to find page information segment
-	d.parseSegmentHeader(data, hdr)
-
-	return d.createPlaceholderImage(hdr), nil
+	return d.createPlaceholderImage(doc.pageInfo), nil
 }
 
 // createPlaceholderImage creates a placeholder image for the stub implementation.
@@ -215,37 +343,31 @@ func (d *Decoder) createPlaceholderImage(hdr *JBIG2Header) stdimage.Image {
 	}
 
 	// JBIG2 is typically bi-level (1 bit per pixel)
-	return stdimage.NewGray(stdimage.Rect(0, 0, width, height))
+	img := stdimage.NewGray(stdimage.Rect(0, 0, width, height))
+	pixel := uint8(0xff)
+	if hdr.DefaultPixel {
+		pixel = 0x00
+	}
+	for i := range img.Pix {
+		img.Pix[i] = pixel
+	}
+	return img
 }
 
 // DecodeConfig returns the JBIG2 image configuration.
 func (d *Decoder) DecodeConfig(data []byte) (stdimage.Config, error) {
-	if len(data) < 8 {
+	if len(data) == 0 {
 		return stdimage.Config{}, errors.Invalid("jbig2_config", fmt.Errorf("data too short"))
 	}
 
-	// Check for JBIG2 signature
-	jbig2Sig := []byte{0x97, 0x4A, 0x42, 0x32, 0x0D, 0x0A, 0x1A, 0x0A}
-	var hdr *JBIG2Header
-	var err error
-
-	if bytes.Equal(data[:8], jbig2Sig) {
-		hdr, err = d.parseFileHeader(data[8:])
-	} else {
-		hdr = &JBIG2Header{
-			Width:  100,
-			Height: 100,
-		}
-		d.parseSegmentHeader(data, hdr)
-	}
-
+	doc, err := parseNativeDocument(data)
 	if err != nil {
 		return stdimage.Config{}, err
 	}
 
 	return stdimage.Config{
-		Width:      hdr.Width,
-		Height:     hdr.Height,
+		Width:      doc.pageInfo.Width,
+		Height:     doc.pageInfo.Height,
 		ColorModel: color.GrayModel,
 	}, nil
 }
@@ -257,32 +379,16 @@ func (d *Decoder) ColorSpace() image.ColorSpace {
 
 // CanDecode checks if the data appears to be a JBIG2 image.
 func (d *Decoder) CanDecode(data []byte) bool {
-	if len(data) < 8 {
+	if len(data) == 0 {
 		return false
 	}
 
-	// Check JBIG2 signature
-	jbig2Sig := []byte{0x97, 0x4A, 0x42, 0x32, 0x0D, 0x0A, 0x1A, 0x0A}
-	if bytes.Equal(data[:8], jbig2Sig) {
+	if hasStandaloneSignature(data) {
 		return true
 	}
 
-	// Check for embedded JBIG2 (starts with segment header)
-	// Segment number is 4 bytes, typically 0 or small value
-	if len(data) >= 6 {
-		// Check if it looks like a segment header
-		segNumber := binary.BigEndian.Uint32(data[0:4])
-		if segNumber < 256 { // Reasonable segment number
-			// Check segment flags
-			flags := data[4]
-			refCount := (flags & 0xE0) >> 5
-			if refCount <= 4 { // Reasonable reference count
-				return true
-			}
-		}
-	}
-
-	return false
+	_, err := parseNativeSegmentHeader(data)
+	return err == nil
 }
 
 // SupportedFormats returns the supported JBIG2 format identifiers.
@@ -292,27 +398,34 @@ func (d *Decoder) SupportedFormats() []string {
 
 // DecodeSegment decodes a single JBIG2 segment (for embedded data).
 func (d *Decoder) DecodeSegment(data []byte) (stdimage.Image, error) {
-	return d.decodeNative(data)
+	return d.decodeNative(data, DecodeOptions{})
 }
 
 // SegmentType represents JBIG2 segment types.
 type SegmentType int
 
 const (
-	SegmentSymbolDictionary      SegmentType = 0
-	SegmentIntermediateText      RegionType  = 4
-	SegmentImmediateText         RegionType  = 6
-	SegmentImmediateLosslessText RegionType  = 7
-	SegmentPatternDictionary     SegmentType = 16
-	SegmentIntermediateHalftone  RegionType  = 20
-	SegmentImmediateHalftone     RegionType  = 22
-	SegmentPageInformation       SegmentType = 48
-	SegmentEndOfPage             SegmentType = 49
-	SegmentEndOfStripe           SegmentType = 50
-	SegmentEndOfFile             SegmentType = 51
-	SegmentProfiles              SegmentType = 52
-	SegmentTables                SegmentType = 53
-	SegmentExtension             SegmentType = 62
+	SegmentSymbolDictionary                         SegmentType = 0
+	SegmentIntermediateText                         SegmentType = 4
+	SegmentImmediateText                            SegmentType = 6
+	SegmentImmediateLosslessText                    SegmentType = 7
+	SegmentPatternDictionary                        SegmentType = 16
+	SegmentIntermediateHalftone                     SegmentType = 20
+	SegmentImmediateHalftone                        SegmentType = 22
+	SegmentImmediateLosslessHalftone                SegmentType = 23
+	SegmentIntermediateGenericRegion                SegmentType = 36
+	SegmentImmediateGenericRegion                   SegmentType = 38
+	SegmentImmediateLosslessGenericRegion           SegmentType = 39
+	SegmentIntermediateGenericRefinementRegion      SegmentType = 40
+	SegmentImmediateGenericRefinementRegion         SegmentType = 42
+	SegmentImmediateLosslessGenericRefinementRegion SegmentType = 43
+	SegmentPageInformation                          SegmentType = 48
+	SegmentEndOfPage                                SegmentType = 49
+	SegmentEndOfStripe                              SegmentType = 50
+	SegmentEndOfFile                                SegmentType = 51
+	SegmentProfiles                                 SegmentType = 52
+	SegmentTables                                   SegmentType = 53
+	SegmentExtension                                SegmentType = 62
 )
 
 // RegionType represents JBIG2 region types.
@@ -325,58 +438,22 @@ const (
 	RegionTypeGenericRefinement RegionType = 3
 )
 
-// ArithmeticDecoder implements JBIG2 arithmetic coding (MQ-coder).
-type ArithmeticDecoder struct {
-	bps        []byte
-	byteOffset int
-	bitOffset  uint8
-	c          byte
-	a          byte
-	ct         byte
-}
-
-// NewArithmeticDecoder creates a new arithmetic decoder.
-func NewArithmeticDecoder(data []byte) *ArithmeticDecoder {
-	return &ArithmeticDecoder{
-		bps:        data,
-		byteOffset: 0,
-		bitOffset:  0,
-	}
-}
-
-// DecodeBit decodes a single bit using arithmetic coding.
-func (ad *ArithmeticDecoder) DecodeBit(context uint8) (uint8, error) {
-	_ = context
-	if ad.byteOffset >= len(ad.bps) {
-		return 0, io.EOF
-	}
-
-	bit := (ad.bps[ad.byteOffset] >> (7 - ad.bitOffset)) & 0x01
-	ad.bitOffset++
-	if ad.bitOffset >= 8 {
-		ad.bitOffset = 0
-		ad.byteOffset++
-	}
-
-	return bit, nil
-}
-
 // MMRDecoder implements Modified Modified READ (MMR) compression.
 type MMRDecoder struct {
-	offset  int
-	data    []byte
-	lineBuf []byte
-	width   int
-	height  int
+	bitOffset    int
+	decodedLines int
+	data         []byte
+	reference    []byte
+	width        int
+	height       int
 }
 
 // NewMMRDecoder creates a new MMR decoder.
 func NewMMRDecoder(data []byte, width, height int) *MMRDecoder {
 	return &MMRDecoder{
-		data:    data,
-		width:   width,
-		height:  height,
-		lineBuf: make([]byte, (width+7)/8),
+		data:   data,
+		width:  width,
+		height: height,
 	}
 }
 
@@ -386,37 +463,233 @@ func (md *MMRDecoder) DecodeLine() ([]byte, error) {
 	if lineBytes <= 0 {
 		return nil, fmt.Errorf("invalid MMR width: %d", md.width)
 	}
-
-	if md.offset >= len(md.data) {
+	if md.decodedLines >= md.height {
 		return nil, io.EOF
 	}
 
-	if len(md.lineBuf) != lineBytes {
-		md.lineBuf = make([]byte, lineBytes)
-	} else {
-		for i := range md.lineBuf {
-			md.lineBuf[i] = 0
+	line := make([]byte, lineBytes)
+	x := 0
+	black := false
+	for x < md.width {
+		modeBit, err := md.readBit()
+		if err != nil {
+			return nil, err
 		}
+		if modeBit == 1 {
+			next := md.nextReferenceChangingElement(x, black)
+			if err := setVerticalRun(line, &x, next, black, md.width); err != nil {
+				return nil, err
+			}
+			black = !black
+			continue
+		}
+
+		modeOffset := md.bitOffset - 1
+		second, err := md.readBit()
+		if err != nil {
+			return nil, err
+		}
+		third, err := md.readBit()
+		if err != nil {
+			return nil, err
+		}
+		if second == 1 && third == 1 {
+			next := md.nextReferenceChangingElement(x, black) + 1
+			if err := setVerticalRun(line, &x, next, black, md.width); err != nil {
+				return nil, err
+			}
+			black = !black
+			continue
+		}
+		if second == 1 && third == 0 {
+			next := md.nextReferenceChangingElement(x, black) - 1
+			if err := setVerticalRun(line, &x, next, black, md.width); err != nil {
+				return nil, err
+			}
+			black = !black
+			continue
+		}
+		if second == 0 && third == 0 {
+			fourth, err := md.readBit()
+			if err != nil {
+				return nil, err
+			}
+			if fourth == 1 {
+				next := md.secondReferenceChangingElement(x, black)
+				if err := setVerticalRun(line, &x, next, black, md.width); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			return nil, fmt.Errorf("unsupported MMR code at bit offset %d", modeOffset)
+		}
+		if second != 0 || third != 1 {
+			return nil, fmt.Errorf("unsupported MMR code at bit offset %d", modeOffset)
+		}
+
+		whiteRun, err := md.readWhiteTerminatingRun()
+		if err != nil {
+			return nil, err
+		}
+		blackRun, err := md.readBlackTerminatingRun()
+		if err != nil {
+			return nil, err
+		}
+		x += whiteRun
+		if x+blackRun > md.width {
+			return nil, fmt.Errorf("MMR run exceeds line width: %d > %d", x+blackRun, md.width)
+		}
+		setBilevelRun(line, x, blackRun, 1)
+		x += blackRun
 	}
 
-	n := copy(md.lineBuf, md.data[md.offset:])
-	md.offset += n
-
-	line := make([]byte, lineBytes)
-	copy(line, md.lineBuf)
+	md.reference = append(md.reference[:0], line...)
+	md.decodedLines++
 	return line, nil
+}
+
+func setVerticalRun(line []byte, x *int, next int, black bool, width int) error {
+	if next < *x || next > width {
+		return fmt.Errorf("invalid vertical MMR transition: %d -> %d", *x, next)
+	}
+	if black {
+		setBilevelRun(line, *x, next-*x, 1)
+	}
+	*x = next
+	return nil
+}
+
+func (md *MMRDecoder) nextReferenceChangingElement(start int, black bool) int {
+	for x := start + 1; x < md.width; x++ {
+		if md.referencePixelBlack(x) == md.referencePixelBlack(x-1) {
+			continue
+		}
+		if md.referencePixelBlack(x) != black {
+			return x
+		}
+	}
+	return md.width
+}
+
+func (md *MMRDecoder) secondReferenceChangingElement(start int, black bool) int {
+	first := md.nextReferenceChangingElement(start, black)
+	if first >= md.width {
+		return md.width
+	}
+	return md.nextReferenceChangingElement(first, !black)
+}
+
+func (md *MMRDecoder) referencePixelBlack(x int) bool {
+	if len(md.reference) == 0 {
+		return false
+	}
+	byteOffset := x / 8
+	if byteOffset >= len(md.reference) {
+		return false
+	}
+	bitOffset := 7 - (x % 8)
+	return ((md.reference[byteOffset] >> bitOffset) & 0x01) == 1
+}
+
+func (md *MMRDecoder) readBit() (uint8, error) {
+	if md.bitOffset >= len(md.data)*8 {
+		return 0, io.EOF
+	}
+	byteOffset := md.bitOffset / 8
+	shift := 7 - (md.bitOffset % 8)
+	md.bitOffset++
+	return (md.data[byteOffset] >> shift) & 0x01, nil
+}
+
+func (md *MMRDecoder) readBits(count int) (uint32, error) {
+	var value uint32
+	for i := 0; i < count; i++ {
+		bit, err := md.readBit()
+		if err != nil {
+			return 0, err
+		}
+		value = (value << 1) | uint32(bit)
+	}
+	return value, nil
+}
+
+func (md *MMRDecoder) readWhiteTerminatingRun() (int, error) {
+	return md.readTerminatingRun(whiteTerminatingRunCodes, "white")
+}
+
+func (md *MMRDecoder) readBlackTerminatingRun() (int, error) {
+	return md.readTerminatingRun(blackTerminatingRunCodes, "black")
+}
+
+func (md *MMRDecoder) readTerminatingRun(codes []mmrRunCode, color string) (int, error) {
+	var value uint16
+	start := md.bitOffset
+	for width := uint8(1); width <= maxMMRTerminatingCodeLength(codes); width++ {
+		bit, err := md.readBit()
+		if err != nil {
+			return 0, err
+		}
+		value = (value << 1) | uint16(bit)
+		for _, code := range codes {
+			if code.width == width && code.bits == value {
+				return code.run, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("unsupported %s MMR terminating code at bit offset %d", color, start)
+}
+
+func maxMMRTerminatingCodeLength(codes []mmrRunCode) uint8 {
+	var max uint8
+	for _, code := range codes {
+		if code.width > max {
+			max = code.width
+		}
+	}
+	return max
+}
+
+func setBilevelRun(row []byte, start, length int, bit uint8) {
+	if bit == 0 {
+		return
+	}
+	for x := start; x < start+length; x++ {
+		byteOffset := x / 8
+		bitOffset := 7 - (x % 8)
+		if byteOffset >= len(row) {
+			return
+		}
+		row[byteOffset] |= 1 << bitOffset
+	}
 }
 
 // DecodeGenericRegion decodes a generic region segment.
 func (d *Decoder) DecodeGenericRegion(data []byte, width, height int) (stdimage.Image, error) {
-	// This is a stub implementation
-	// A full implementation would decode generic region data
-	return stdimage.NewGray(stdimage.Rect(0, 0, width, height)), nil
+	return decodeGenericRegion(genericRegion{
+		info: regionInfo{
+			width:  width,
+			height: height,
+		},
+		payload: data,
+	})
 }
 
 // DecodeTextRegion decodes a text region segment.
 func (d *Decoder) DecodeTextRegion(data []byte, width, height int, symbols []stdimage.Image) (stdimage.Image, error) {
-	// This is a stub implementation
-	// A full implementation would decode text region data using symbol dictionary
-	return stdimage.NewGray(stdimage.Rect(0, 0, width, height)), nil
+	converted := make([]*stdimage.Gray, 0, len(symbols))
+	for _, symbol := range symbols {
+		gray, ok := symbol.(*stdimage.Gray)
+		if !ok {
+			return nil, errors.Invalid("jbig2_text_region", fmt.Errorf("symbol is not a bilevel gray bitmap"))
+		}
+		converted = append(converted, gray)
+	}
+	return decodeArithmeticTextRegion(textRegion{
+		info: regionInfo{
+			width:  width,
+			height: height,
+		},
+		payload:      data,
+		numInstances: 0,
+	}, converted)
 }

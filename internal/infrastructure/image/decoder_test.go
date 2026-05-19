@@ -33,6 +33,16 @@ func (s *stubDecoder) ColorSpace() domainimage.ColorSpace {
 	return domainimage.ColorSpaceDeviceRGB
 }
 
+func testJBIG2EndOfFileSegment() []byte {
+	return []byte{
+		0x00, 0x00, 0x00, 0x01, // segment number
+		0x33,                   // end-of-file segment
+		0x00,                   // no referred-to segments
+		0x00,                   // global page association
+		0x00, 0x00, 0x00, 0x00, // segment data length
+	}
+}
+
 func TestDecoder_NewDecoder_RegistersDefaultCodecs(t *testing.T) {
 	d := NewDecoder()
 	require.NotNil(t, d)
@@ -47,6 +57,22 @@ func TestDecoder_NewDecoder_RegistersDefaultCodecs(t *testing.T) {
 		ColorSpace:       domainimage.ColorSpaceDeviceRGB,
 	})
 	require.NoError(t, err)
+}
+
+func TestDecoder_DecodeJBIG2UsesPDFDimensionsForNativeFallback(t *testing.T) {
+	d := NewDecoder()
+	img, err := d.Decode(&domainimage.ImageData{
+		Filter:           domainimage.FilterJBIG2,
+		Data:             testJBIG2EndOfFileSegment(),
+		Width:            13,
+		Height:           7,
+		BitsPerComponent: 1,
+		ColorSpace:       domainimage.ColorSpaceDeviceGray,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, img)
+	assert.Equal(t, 13, img.Width())
+	assert.Equal(t, 7, img.Height())
 }
 
 func TestDecoder_DecodeNilData(t *testing.T) {

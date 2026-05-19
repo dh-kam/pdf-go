@@ -274,19 +274,18 @@ func TestRadialIsotropy(t *testing.T) {
 	icx, icy := int(cx), int(cy)
 	radii := []int{8, 16, 24}
 	for _, d := range radii {
-		// Horizontal pair around (icy-1) — the actual sample-y center.
-		rL, _, _, okL := p3PixelRGB(bm, icx-d, icy-1)
-		rR, _, _, okR := p3PixelRGB(bm, icx+d, icy-1)
+		// Horizontal pair around the integer sample center used by RadialShader.
+		rL, _, _, okL := p3PixelRGB(bm, icx-d, icy)
+		rR, _, _, okR := p3PixelRGB(bm, icx+d, icy)
 		if okL && okR {
 			if abs8(rL, rR) > 1 {
 				t.Fatalf("radial isotropy violated (horizontal d=%d): R(%d)=%d R(%d)=%d",
 					d, icx-d, rL, icx+d, rR)
 			}
 		}
-		// Vertical pair, mirrored about cy-1 to stay symmetric under the
-		// (x, y+1) sample-shift convention.
-		rT, _, _, okT := p3PixelRGB(bm, icx, icy-1-d)
-		rB, _, _, okB := p3PixelRGB(bm, icx, icy-1+d)
+		// Vertical pair around the same integer sample center.
+		rT, _, _, okT := p3PixelRGB(bm, icx, icy-d)
+		rB, _, _, okB := p3PixelRGB(bm, icx, icy+d)
 		if okT && okB {
 			if abs8(rT, rB) > 1 {
 				t.Fatalf("radial isotropy violated (vertical d=%d): R(top)=%d R(bot)=%d",

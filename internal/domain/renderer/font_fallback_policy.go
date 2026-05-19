@@ -39,10 +39,19 @@ func (e *Evaluator) preferredFallbackFont(baseFont string) (entity.Font, bool) {
 	if normalized == subsetFree {
 		return nil, false
 	}
+	if shouldDeferSubsetFallbackToResolver(subsetFree) {
+		return nil, false
+	}
 
 	font, err := e.getDefaultFont(baseFont)
 	if err != nil || font == nil {
 		return nil, false
 	}
 	return font, true
+}
+
+func shouldDeferSubsetFallbackToResolver(subsetFree string) bool {
+	// cm-super SFRM fonts need late fallback resolution so experiments and
+	// Poppler-parity probes can distinguish them from Computer Modern CMR.
+	return strings.HasPrefix(strings.TrimSpace(subsetFree), "SFRM")
 }

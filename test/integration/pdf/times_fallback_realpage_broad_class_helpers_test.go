@@ -19,6 +19,7 @@ func runRealPageBroadLowercaseProbeCases(
 	assertFn realPageBroadLowercaseProbeAssertFunc,
 ) {
 	t.Helper()
+	requirePopplerProbeOptIn(t)
 
 	if _, err := execLookPathPdftoppmForProbe(); err != nil {
 		t.Skip("pdftoppm not installed")

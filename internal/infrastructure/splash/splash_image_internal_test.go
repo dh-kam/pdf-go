@@ -179,36 +179,52 @@ func TestArbitraryTransformVerticalFlip(t *testing.T) {
 func TestDownscaleVFlipTopDownUsesTopRows(t *testing.T) {
 	const srcW, srcH = 6, 6
 	src := func(row int, color, alpha []byte) error {
-		_ = alpha
 		sourceY := srcH - 1 - row
 		gray := byte(sourceY * 40)
 		for x := 0; x < srcW; x++ {
 			color[3*x] = gray
 			color[3*x+1] = gray
 			color[3*x+2] = gray
+			if alpha != nil {
+				alpha[x] = 0xFF
+			}
 		}
 		return nil
 	}
 	mat := [6]float64{4, 0, 0, -4, 1, 5}
 
-	defaultSplash := newRGBSplash(8, 8)
-	if err := defaultSplash.DrawImage(src, srcW, srcH, mat, false); err != nil {
-		t.Fatalf("DrawImage default: %v", err)
+	renderTopByte := func(withAlpha, forceTopDown bool) byte {
+		t.Helper()
+		bm := NewBitmap(8, 8, ModeRGB8, withAlpha)
+		bm.Clear(Color{0xFF, 0xFF, 0xFF})
+		s, err := New(bm, false)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		s.SetFillPattern(NewSolidColor(Color{}))
+		s.downscaleVFlipTopDown = forceTopDown
+		if err := s.DrawImage(src, srcW, srcH, mat, false); err != nil {
+			t.Fatalf("DrawImage alpha=%v topDown=%v: %v", withAlpha, forceTopDown, err)
+		}
+		return s.bitmap.data[1*s.bitmap.rowSize+1*3]
 	}
-	defaultTop := defaultSplash.bitmap.data[1*defaultSplash.bitmap.rowSize+1*3]
 
-	topDownSplash := newRGBSplash(8, 8)
-	topDownSplash.downscaleVFlipTopDown = true
-	if err := topDownSplash.DrawImage(src, srcW, srcH, mat, false); err != nil {
-		t.Fatalf("DrawImage top-down: %v", err)
-	}
-	topDownTop := topDownSplash.bitmap.data[1*topDownSplash.bitmap.rowSize+1*3]
-
-	if topDownTop >= defaultTop {
-		t.Fatalf("top-down vflip downscale used wrong rows: topDown=%d default=%d", topDownTop, defaultTop)
+	defaultTop := renderTopByte(false, false)
+	topDownTop := renderTopByte(false, true)
+	if topDownTop != defaultTop {
+		t.Fatalf("regular image downscale should use top-down rows by default: topDown=%d default=%d", topDownTop, defaultTop)
 	}
 	if topDownTop > 80 {
 		t.Fatalf("top-down vflip downscale top row = %d, want source top rows", topDownTop)
+	}
+
+	alphaDefaultTop := renderTopByte(true, false)
+	alphaTopDownTop := renderTopByte(true, true)
+	if alphaTopDownTop >= alphaDefaultTop {
+		t.Fatalf("alpha top-down gate did not select earlier rows: topDown=%d default=%d", alphaTopDownTop, alphaDefaultTop)
+	}
+	if alphaTopDownTop != topDownTop {
+		t.Fatalf("alpha top-down gate should match regular top-down rows: alpha=%d regular=%d", alphaTopDownTop, topDownTop)
 	}
 }
 

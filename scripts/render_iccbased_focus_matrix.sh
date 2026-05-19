@@ -95,7 +95,7 @@ for mode in "${MODES[@]}"; do
   echo "[focus-matrix] running mode=$mode"
   (
     cd "$ROOT_DIR"
-    go run -tags='nojpx,nojbig2' ./tmp/goal98_batch.go \
+	go run ./tmp/goal98_batch.go \
       -root "$ROOT_DIR" \
       -out "$mode_out" \
       -dpi 150 \
@@ -109,7 +109,7 @@ for mode in "${MODES[@]}"; do
       -skip-compressed-duplicates=false \
       -include-doc-list "$INCLUDE_DOC_LIST"
 
-    go run -tags='nojpx,nojbig2' ./tmp/goal98_compare_html.go \
+	go run ./tmp/goal98_compare_html.go \
       -report "$mode_out/report.csv" \
       -out "$mode_out/html" \
       -threshold 99 \

@@ -1993,8 +1993,8 @@ func TestEvaluator_FilterShadingAndScaleHelpers(t *testing.T) {
 	assert.Equal(t, "auto_downscale_bilinear", sampler)
 	assert.Equal(t, "auto_interpolate=false_downscale", reason)
 	sampler, reason = resolveSelectiveIndexedGrayOriginDownscaleSampler(ImageSamplingModeExperimentalIndexedOriginDownscalePhaseV1, "candidate_large_indexed_gray_origin_downscale", "auto_downscale_bilinear", "auto_interpolate=false_downscale")
-	assert.Equal(t, "auto_downscale_bilinear", sampler)
-	assert.Equal(t, "auto_interpolate=false_downscale", reason)
+	assert.Equal(t, "experimental_indexed_origin_downscale_bilinear", sampler)
+	assert.Equal(t, "legacy_selective_indexed_origin_downscale_phase", reason)
 	sampler, reason = resolveSelectiveIndexedGrayOriginDownscaleSampler(ImageSamplingModeExperimentalDCTGrayIgnoreICCV1, "candidate_large_indexed_gray_origin_downscale", "auto_downscale_bilinear", "auto_interpolate=false_downscale")
 	assert.Equal(t, "experimental_indexed_origin_downscale_bilinear", sampler)
 	assert.Equal(t, "legacy_selective_indexed_origin_downscale_phase", reason)
@@ -2899,14 +2899,14 @@ func TestIsPatternColorSpaceResource(t *testing.T) {
 		assert.False(t, e.isPatternColorSpaceResource(entity.Name("P1")))
 	})
 
-	t.Run("resource not an array", func(t *testing.T) {
+	t.Run("pattern name resource", func(t *testing.T) {
 		e := NewEvaluator(nil)
 		resources := entity.NewDict()
 		csCategory := entity.NewDict()
 		csCategory.Set(entity.Name("P1"), entity.Name("Pattern"))
 		resources.Set(entity.Name("ColorSpace"), csCategory)
 		e.SetResources(resources)
-		assert.False(t, e.isPatternColorSpaceResource(entity.Name("P1")))
+		assert.True(t, e.isPatternColorSpaceResource(entity.Name("P1")))
 	})
 
 	t.Run("empty array", func(t *testing.T) {

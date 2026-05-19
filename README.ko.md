@@ -199,27 +199,21 @@ go-pdf/
 ### JPEG2000 지원
 
 ```bash
-# OpenJPEG가 설치된 경우
-go build
-
-# OpenJPEG 없이 빌드
-go build -tags=nojpx
+# JPEG2000은 기본 순수 Go 경로로 빌드된다.
+CGO_ENABLED=0 go build
 ```
 
 ### JBIG2 지원
 
 ```bash
-# jbig2dec가 설치된 경우
-go build
-
-# jbig2dec 없이 빌드
-go build -tags=nojbig2
+# JBIG2는 기본 순수 Go 경로로 빌드된다.
+CGO_ENABLED=0 go build
 ```
 
 ### 모두 비활성화
 
 ```bash
-go build -tags='nojpx,nojbig2'
+CGO_ENABLED=0 go build
 ```
 
 ## 성능

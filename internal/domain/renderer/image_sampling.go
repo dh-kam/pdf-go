@@ -326,11 +326,6 @@ func resolveSelectiveIndexedGrayOriginDownscaleSampler(
 	if candidate != "candidate_large_indexed_gray_origin_downscale" {
 		return sampler, reason
 	}
-	switch normalizeImageSamplingMode(mode) {
-	case ImageSamplingModeLegacy, ImageSamplingModeExperimentalDCTGrayIgnoreICCV1:
-	default:
-		return sampler, reason
-	}
 	if sampler != "auto_downscale_bilinear" {
 		return sampler, reason
 	}

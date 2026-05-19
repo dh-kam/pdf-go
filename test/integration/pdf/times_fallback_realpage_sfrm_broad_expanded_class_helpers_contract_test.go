@@ -25,4 +25,3 @@ func TestRunRealPageSFRMBroadAndExpandedLowercaseProbeHelpers_InvokeOnlyActiveSF
 		realPageResidualClassNonLower,
 	}, expandedSeen)
 }
-

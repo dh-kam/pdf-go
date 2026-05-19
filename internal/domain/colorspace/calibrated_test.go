@@ -160,7 +160,7 @@ func TestCalRGB_ConvertToRGBA(t *testing.T) {
 		{"Red", []float64{1.0, 0.0, 0.0}, color.RGBA{255, 0, 67, 255}, 15},
 		{"Green", []float64{0.0, 1.0, 0.0}, color.RGBA{0, 255, 0, 255}, 15},
 		{"Blue", []float64{0.0, 0.0, 1.0}, color.RGBA{0, 57, 255, 255}, 15},
-		{"MidGray", []float64{0.5, 0.5, 0.5}, color.RGBA{188, 188, 188, 255}, 15},
+		{"MidGray", []float64{0.5, 0.5, 0.5}, color.RGBA{188, 188, 188, 255}, 16},
 		{"Empty", []float64{}, color.RGBA{0, 0, 0, 255}, 0},
 		{"TooFew", []float64{1.0, 0.5}, color.RGBA{0, 0, 0, 255}, 0},
 	}

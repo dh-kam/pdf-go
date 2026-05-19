@@ -162,6 +162,7 @@ func (e *Evaluator) evaluateImageXObject(xobj *entity.Stream, name entity.Name) 
 			bpc,
 			imageFilter,
 			resolveXObjectImageSourceFilter(dict.Get(entity.Name("Filter"))),
+			e.resolveImageDecodeParms(dict.Get(entity.Name("DecodeParms")), encodedPrefixLen),
 			decode,
 			mask,
 			colorKeyMask,
@@ -225,6 +226,81 @@ func resolveImageMaskPaintBit(decode []float64) bool {
 	return decode[0] < decode[1]
 }
 
+func (e *Evaluator) resolveImageDecodeParms(obj entity.Object, filterIndex int) map[string]interface{} {
+	selected := selectDecodeParmsObject(obj, filterIndex)
+	dict, ok := e.resolveDecodeParmsDict(selected, 0)
+	if !ok {
+		return nil
+	}
+
+	params := make(map[string]interface{})
+	if globals, ok := e.resolveDecodeParmsBytes(dict.Get(entity.Name("JBIG2Globals")), 0); ok {
+		params["JBIG2Globals"] = globals
+	}
+	if len(params) == 0 {
+		return nil
+	}
+	return params
+}
+
+func selectDecodeParmsObject(obj entity.Object, filterIndex int) entity.Object {
+	if arr, ok := obj.(*entity.Array); ok {
+		if filterIndex < 0 || filterIndex >= arr.Len() {
+			return nil
+		}
+		return arr.Get(filterIndex)
+	}
+	return obj
+}
+
+func (e *Evaluator) resolveDecodeParmsDict(obj entity.Object, depth int) (*entity.Dict, bool) {
+	if obj == nil || depth > 8 {
+		return nil, false
+	}
+	switch typed := obj.(type) {
+	case *entity.Dict:
+		return typed, true
+	case entity.Ref:
+		if e.xref == nil {
+			return nil, false
+		}
+		resolved, err := e.xref.Fetch(typed)
+		if err != nil {
+			return nil, false
+		}
+		return e.resolveDecodeParmsDict(resolved, depth+1)
+	default:
+		return nil, false
+	}
+}
+
+func (e *Evaluator) resolveDecodeParmsBytes(obj entity.Object, depth int) ([]byte, bool) {
+	if obj == nil || depth > 8 {
+		return nil, false
+	}
+	switch typed := obj.(type) {
+	case *entity.Stream:
+		decoded, err := stream.NewFromEntity(typed).Decode()
+		if err == nil {
+			return decoded, true
+		}
+		return typed.RawBytes(), true
+	case *entity.String:
+		return []byte(typed.Value()), true
+	case entity.Ref:
+		if e.xref == nil {
+			return nil, false
+		}
+		resolved, err := e.xref.Fetch(typed)
+		if err != nil {
+			return nil, false
+		}
+		return e.resolveDecodeParmsBytes(resolved, depth+1)
+	default:
+		return nil, false
+	}
+}
+
 // renderImageToCanvas renders an image to the canvas.
 func (e *Evaluator) renderImageToCanvas(
 	data []byte,
@@ -238,6 +314,7 @@ func (e *Evaluator) renderImageToCanvas(
 	bpc int32,
 	filter domainimage.ImageFilter,
 	sourceFilter domainimage.ImageFilter,
+	decodeParms map[string]interface{},
 	decode []float64,
 	mask domainimage.ImageMask,
 	colorKeyMask *image.ColorKeyMask,
@@ -303,6 +380,7 @@ func (e *Evaluator) renderImageToCanvas(
 		IndexedBase:   domainimage.ColorSpace(indexedBase),
 		IndexedLookup: indexedLookup,
 		Filter:        filter,
+		DecodeParms:   decodeParms,
 		Decode:        decode,
 		Mask:          mask,
 	}

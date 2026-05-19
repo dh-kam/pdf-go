@@ -1,10 +1,14 @@
-github.com/andybalholm/brotli v1.2.0 h1:ukwgCxwYrmACq68yiUqwIWnGY0cTPox/M94sVwToPjQ=
-github.com/andybalholm/brotli v1.2.0/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
+github.com/ajroetker/go-jpeg2000 v0.0.1 h1:j3KLhHSFWuKtGVksOQtHLjP/aBoVq9GKZAJ6/mETTPM=
+github.com/ajroetker/go-jpeg2000 v0.0.1/go.mod h1:tsI/+x1PQDxCFqtqXLzeWpScFpAo8izeSnwZMsA4Cls=
+github.com/andybalholm/brotli v1.2.1 h1:R+f5xP285VArJDRgowrfb9DqL18yVK0gKAW/F+eTWro=
+github.com/andybalholm/brotli v1.2.1/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6NIQQ7OS05n1F4g=
 github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc h1:U9qPSI2PIWSS1VwoXQT9A3Wy9MM3WgvqSxFWenqJduM=
 github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dh-kam/djpeg-go v0.0.0-20260510140137-bc12c348d8cb h1:c8uFwZKdoQ5rwPJLdYGXKk+pgDlhM2mVUsS3IRJEcYE=
 github.com/dh-kam/djpeg-go v0.0.0-20260510140137-bc12c348d8cb/go.mod h1:B7LI34s7PR5wHYSwpsLsJ/QVmO0YvGUHJIAh59WVz78=
+github.com/dh-kam/freetype-go v0.0.0-20260519170628-79d7316ba3e1 h1:XJQQsRDgk3OGJ/vtLOZHJ0T8tBfgg3IQqGZx1XRDqVA=
+github.com/dh-kam/freetype-go v0.0.0-20260519170628-79d7316ba3e1/go.mod h1:n0SFaq4cFFE3t65qAKYMKlmhX+MfwKmY5AxgyNanpSE=
 github.com/frankban/quicktest v1.14.6 h1:7Xjx+VpznH+oBnejlPUj8oUpdxnVs4f8XU8WnHkI4W8=
 github.com/frankban/quicktest v1.14.6/go.mod h1:4ptaffx2x8+WTWXmUCuVU6aPUX1/Mz7zb5vbUoiM6w0=
 github.com/fsnotify/fsnotify v1.9.0 h1:2Ml+OJNzbYCTzsxtv8vKSFD9PbJjmhYF14k/jKC7S9k=

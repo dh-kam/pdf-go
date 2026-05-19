@@ -28,4 +28,3 @@ func TestRunRealPageExpandedLowercaseProbeHelpers_InvokeOnlyExpectedResidualClas
 	})
 	require.Equal(t, 1, nonLowerCalls)
 }
-

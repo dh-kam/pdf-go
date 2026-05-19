@@ -26,6 +26,9 @@ func TestSplashExact100GeoTopoRegressions(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Poppler bitmap integration test in short mode")
 	}
+	if !splashHasFreeType {
+		t.Skip("GeoTopo exact100 glyph regressions require the FreeType-backed glyph path")
+	}
 
 	root := parityRepoRoot(t)
 	bin := filepath.Join(root, "bin", "pdfrender")

@@ -112,52 +112,58 @@ func TestScannerHorizontalEdgeCount0(t *testing.T) {
 	}
 }
 
-// TestAddIntersectionWindingGate verifies Poppler's lower-endpoint rule:
-// count is recorded only when segYMin < y. Adjacent segments sharing y=5
-// therefore contribute from the segment that started below y=5, not the one
-// starting exactly at y=5. (SplashXPathScanner.cc:305.)
+// TestAddIntersectionWindingGate verifies Poppler's half-open segment rule:
+// count is recorded for segYMin <= y < segYMax. Adjacent segments sharing y=5
+// therefore append two entries, but only the segment starting at y=5 carries
+// count on that row. (SplashXPathScanner.cc:339.)
 func TestAddIntersectionWindingGate(t *testing.T) {
 	// Build two abutting vertical-ish segments: (0,0)→(0,5) and (0,5)→(0,10).
 	// At y=5 (segYMax of seg1 and segYMin of seg2), Poppler appends both
-	// intersections; only the first segment contributes count because Poppler
-	// tests only segYMin < y.
+	// intersections.
 	x := &XPath{}
 	x.addSegment(2, 0, 4, 5)  // first seg, segYMax = 5
 	x.addSegment(4, 5, 6, 10) // second seg, segYMin = 5
 	s := NewScanner(x, false /*eo=false → nonzero*/, 0, 0, 100, 100)
 	row := s.allIntersections[5-s.yMin]
-	if len(row) != 1 {
-		t.Fatalf("expected Poppler-style merged entry on row 5, got %d", len(row))
+	if len(row) != 2 {
+		t.Fatalf("expected two raw Poppler intersections on row 5, got %d", len(row))
 	}
-	if row[0].Count == 0 {
-		t.Errorf("row 5 count = %d, want first segment count preserved after merge", row[0].Count)
+	zeroCount, nonZeroCount := 0, 0
+	for _, ent := range row {
+		if ent.Count == 0 {
+			zeroCount++
+		} else {
+			nonZeroCount++
+		}
+	}
+	if zeroCount != 1 || nonZeroCount != 1 {
+		t.Errorf("row 5 counts = %+v, want one zero and one non-zero entry", row)
 	}
 }
 
-// TestAddIntersectionLowerEndpointGate verifies the lower-endpoint gate
+// TestAddIntersectionLowerEndpointGate verifies the half-open segment gate
 // used by Poppler's SplashXPathScanner::addIntersection.
 func TestAddIntersectionLowerEndpointGate(t *testing.T) {
 	x := &XPath{}
 	// seed scanner with bbox 0..10
 	x.addSegment(0, 0, 0, 10)
 	s := NewScanner(x, false, 0, 0, 100, 100)
-	// y == segYMin does not carry winding count.
+	// y == segYMin carries winding count.
 	s.allIntersections[5-s.yMin] = nil // clear test row
 	s.addIntersection(5.0, 8.0, 5, 3, 4, 1)
 	row := s.allIntersections[5-s.yMin]
 	if len(row) != 1 {
 		t.Fatalf("want 1 entry, got %d", len(row))
 	}
-	if row[0].Count != 0 {
-		t.Errorf("y == segYMin must yield count=0, got %d", row[0].Count)
+	if row[0].Count != 1 {
+		t.Errorf("y == segYMin must yield count=1, got %d", row[0].Count)
 	}
-	// y == segYMax still carries winding count because Poppler does not gate on
-	// segYMax in addIntersection.
+	// y == segYMax is outside the segment.
 	s.allIntersections[8-s.yMin] = nil
 	s.addIntersection(5.0, 8.0, 8, 3, 4, 1)
 	row = s.allIntersections[8-s.yMin]
-	if row[0].Count != 1 {
-		t.Errorf("y == segYMax must yield count=1, got %d", row[0].Count)
+	if row[0].Count != 0 {
+		t.Errorf("y == segYMax must yield count=0, got %d", row[0].Count)
 	}
 	// segYMin < y records count.
 	s.allIntersections[6-s.yMin] = nil
@@ -168,9 +174,9 @@ func TestAddIntersectionLowerEndpointGate(t *testing.T) {
 	}
 }
 
-// TestAddIntersectionMergesTouchingLastEntry verifies Poppler's addIntersection
-// immediate last-entry merge before final row sort/span coalescing.
-func TestAddIntersectionMergesTouchingLastEntry(t *testing.T) {
+// TestAddIntersectionAppendsTouchingEntries verifies Poppler's addIntersection
+// appends raw entries and defers overlap handling to span iteration.
+func TestAddIntersectionAppendsTouchingEntries(t *testing.T) {
 	x := &XPath{}
 	x.addSegment(0, 0, 0, 10)
 	s := NewScanner(x, false, 0, 0, 100, 100)
@@ -180,17 +186,14 @@ func TestAddIntersectionMergesTouchingLastEntry(t *testing.T) {
 	s.addIntersection(0, 10, 5, 3, 4, 1)
 	s.addIntersection(0, 10, 5, 5, 6, 2)
 	row := s.allIntersections[rowIdx]
-	if len(row) != 1 {
-		t.Fatalf("touching entries should merge, got %d entries", len(row))
-	}
-	if row[0].X0 != 3 || row[0].X1 != 6 || row[0].Count != 3 {
-		t.Fatalf("entry = %+v, want merged [3,6] count=3", row[0])
+	if len(row) != 2 {
+		t.Fatalf("touching entries should remain raw, got %d entries", len(row))
 	}
 
 	s.addIntersection(0, 10, 5, 8, 9, 4)
 	row = s.allIntersections[rowIdx]
-	if len(row) != 2 {
-		t.Fatalf("non-touching entry should append, got %d entries", len(row))
+	if len(row) != 3 {
+		t.Fatalf("third entry should append, got %d entries", len(row))
 	}
 }
 

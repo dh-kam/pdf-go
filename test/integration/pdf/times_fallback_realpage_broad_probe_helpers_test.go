@@ -41,4 +41,3 @@ func measureRealPageBroadLowercaseProbeAgainstPoppler(
 		fullSkipOnly: renderPageSimilarityAgainstPopplerForProbe(t, tc.target, popplerPNG, fullTargetFontSkipEnvForProbe(targetOnlyEnv, tc.baseFont)),
 	}
 }
-

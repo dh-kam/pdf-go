@@ -162,11 +162,12 @@ func TestType1Font_DecryptEexec(t *testing.T) {
 	// Test eexec decryption
 	// This is a simple test to verify the decryption function works
 
-	// Create test data (known plaintext)
+	// Eexec decryption discards the first four random bytes.
+	randomPrefix := []byte{0xAA, 0xBB, 0xCC, 0xDD}
 	plaintext := []byte{0x01, 0x02, 0x03, 0x04}
 
 	// Encrypt then decrypt
-	encrypted, err := type1font.EncryptEexec(plaintext)
+	encrypted, err := type1font.EncryptEexec(append(randomPrefix, plaintext...))
 	require.NoError(t, err)
 
 	decrypted, err := type1font.DecryptEexec(encrypted)

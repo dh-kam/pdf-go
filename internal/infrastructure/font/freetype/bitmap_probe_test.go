@@ -13,7 +13,7 @@ func TestBitmapDimensions(t *testing.T) {
 	if _, err := os.Stat(fontPath); err != nil {
 		t.Skip("test PDF not found")
 	}
-	
+
 	// We need raw Type1 font data to test. Let's use a system font instead.
 	// Try /usr/share/fonts/type1/gsfonts/n021003l.pfb (Nimbus Roman = Times-Roman)
 	pfbPaths := []string{
@@ -22,7 +22,7 @@ func TestBitmapDimensions(t *testing.T) {
 		"/usr/share/fonts/X11/Type1/NimbusRoman-Regular.pfb",
 		"/usr/share/fonts/X11/Type1/C059-Italic.pfb",
 	}
-	
+
 	var fontData []byte
 	for _, p := range pfbPaths {
 		data, err := os.ReadFile(p)
@@ -32,23 +32,23 @@ func TestBitmapDimensions(t *testing.T) {
 			break
 		}
 	}
-	
+
 	if len(fontData) == 0 {
 		t.Skip("no system Type1 font found")
 	}
-	
+
 	// Render 'A' at sizePt=10, dpi=1501 (like our compute)
 	sizePt := 10.0
 	dpi := 1501
 	glyph := uint32('A') // 65
-	
+
 	buf, bw, bh, bleft, btop, err := RenderGlyphBitmap(fontData, glyph, sizePt, dpi)
 	if err != nil {
 		t.Logf("RenderGlyphBitmap at dpi=%d: %v", dpi, err)
 	} else {
 		t.Logf("'A' at sizePt=%.0f dpi=%d: buf_len=%d bw=%d bh=%d bleft=%d btop=%d", sizePt, dpi, len(buf), bw, bh, bleft, btop)
 	}
-	
+
 	// Same at 150 DPI
 	buf2, bw2, bh2, bleft2, btop2, err2 := RenderGlyphBitmap(fontData, glyph, sizePt, 150)
 	if err2 != nil {

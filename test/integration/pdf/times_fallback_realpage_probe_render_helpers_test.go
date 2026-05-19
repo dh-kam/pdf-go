@@ -61,6 +61,7 @@ func preparePopplerPageForProbe(t *testing.T, target realPageProbeTarget) string
 
 func preparePopplerPageForProbeAtDPI(t *testing.T, target realPageProbeTarget, dpi int) string {
 	t.Helper()
+	requirePopplerProbeOptIn(t)
 
 	root := t.TempDir()
 	popplerRoot := filepath.Join(root, "poppler")

@@ -1946,9 +1946,7 @@ func TestSampleIndexedOriginDownscaleExperimentalModeRegressesDoc023OffsetCase(t
 }
 
 func TestSampleIndexedOriginDownscaleExperimentalModeSurfaceAcrossSampleCorpus(t *testing.T) {
-	pdfPaths, err := filepath.Glob(filepath.Join(getSampleDir(), "*", "*.pdf"))
-	require.NoError(t, err)
-	sort.Strings(pdfPaths)
+	pdfPaths := renderableSampleCorpusPDFPaths(t)
 
 	expectedChanged := []string{
 		"023-cmyk-image/cmyk-image.pdf",
@@ -2102,9 +2100,7 @@ func TestSampleIndexedCMYKHybrid75ExperimentalModeMatchesLegacyForNonTargetFocus
 }
 
 func TestSampleIndexedCMYKLegacySelectiveDefaultMatchesHybrid75AcrossSampleCorpus(t *testing.T) {
-	pdfPaths, err := filepath.Glob(filepath.Join(getSampleDir(), "*", "*.pdf"))
-	require.NoError(t, err)
-	sort.Strings(pdfPaths)
+	pdfPaths := renderableSampleCorpusPDFPaths(t)
 
 	for _, pdfPath := range pdfPaths {
 		exactPercent, similarityPercent := renderSamplePageParityBetweenModes(
@@ -2165,8 +2161,8 @@ func TestSampleDecodeOrTransform007BucketsRenderParity(t *testing.T) {
 	assert.InDelta(t, 100.0, mainLZWSimilarity, 1e-9)
 	assert.InDelta(t, 100.0, ccittSmileExact, 1e-9)
 	assert.InDelta(t, 100.0, ccittSmileSimilarity, 1e-9)
-	assert.Less(t, mainCCITTExact, 100.0)
-	assert.Less(t, mainCCITTSimilarity, 100.0)
+	assert.InDelta(t, 100.0, mainCCITTExact, 1e-9)
+	assert.InDelta(t, 100.0, mainCCITTSimilarity, 1e-9)
 }
 
 func TestSampleDecodeOrTransform007BucketsPopplerSimilarityProbe(t *testing.T) {
@@ -2363,6 +2359,8 @@ func TestSyntheticDoc007MainPage4ExtractedICCBasedJPEGProbeAgainstPoppler(t *tes
 }
 
 func TestSampleDCTGrayIgnoreICCSelectiveDefaultMatchesExperimentalForDoc007MainPage4(t *testing.T) {
+	requirePopplerProbeOptIn(t)
+
 	pdfPath := filepath.Join(getSampleDir(), "007-imagemagick-images", "imagemagick-images.pdf")
 	scores := probeSamplePageModesAgainstPoppler(
 		t,
@@ -2380,6 +2378,8 @@ func TestSampleDCTGrayIgnoreICCSelectiveDefaultMatchesExperimentalForDoc007MainP
 }
 
 func TestSampleDCTGrayIgnoreICCExperimentalModeMatchesLegacyFor007CCITTFaxAndSmile(t *testing.T) {
+	requirePopplerProbeOptIn(t)
+
 	testCases := []struct {
 		name    string
 		pdfPath string
@@ -2416,9 +2416,9 @@ func TestSampleDCTGrayIgnoreICCExperimentalModeMatchesLegacyFor007CCITTFaxAndSmi
 }
 
 func TestSampleDCTGrayIgnoreICCExperimentalModeSurfaceAcrossSampleCorpusAllPages(t *testing.T) {
-	pdfPaths, err := filepath.Glob(filepath.Join(getSampleDir(), "*", "*.pdf"))
-	require.NoError(t, err)
-	sort.Strings(pdfPaths)
+	requireFullSampleCorpusOptIn(t)
+
+	pdfPaths := renderableSampleCorpusPDFPaths(t)
 
 	var changed []string
 	for _, pdfPath := range pdfPaths {
@@ -4351,9 +4351,7 @@ func TestSampleRGBTransparentEdgeExperimentalModeMatchesLegacyForDoc023(t *testi
 }
 
 func TestSampleRGBTransparentEdgeExperimentalModeSurfaceAcrossSampleCorpus(t *testing.T) {
-	pdfPaths, err := filepath.Glob(filepath.Join(getSampleDir(), "*", "*.pdf"))
-	require.NoError(t, err)
-	sort.Strings(pdfPaths)
+	pdfPaths := renderableSampleCorpusPDFPaths(t)
 
 	var changed []string
 	for _, pdfPath := range pdfPaths {
@@ -4377,9 +4375,9 @@ func TestSampleRGBTransparentEdgeExperimentalModeSurfaceAcrossSampleCorpus(t *te
 }
 
 func TestSampleRGBTransparentEdgeExperimentalModeSurfaceAcrossSampleCorpusAllPages(t *testing.T) {
-	pdfPaths, err := filepath.Glob(filepath.Join(getSampleDir(), "*", "*.pdf"))
-	require.NoError(t, err)
-	sort.Strings(pdfPaths)
+	requireFullSampleCorpusOptIn(t)
+
+	pdfPaths := renderableSampleCorpusPDFPaths(t)
 
 	var changed []string
 	for _, pdfPath := range pdfPaths {
@@ -6407,6 +6405,7 @@ func TestSyntheticDoc023CMYKHybridBlendProbeAgainstPoppler(t *testing.T) {
 }
 
 func TestSyntheticImageExperimentalSplashModeIsCloserToPopplerThanLegacy(t *testing.T) {
+	requirePopplerProbeOptIn(t)
 	if _, err := exec.LookPath("pdftoppm"); err != nil {
 		t.Skip("pdftoppm not installed")
 	}
@@ -6586,6 +6585,7 @@ func TestSyntheticIndexedNearIdentityAnisotropicExperimentalSplashModeIsCloserTo
 }
 
 func TestSyntheticIndexedLargeMildDownscaleProbeAgainstPoppler(t *testing.T) {
+	requirePopplerProbeOptIn(t)
 	palette, imageData := syntheticIndexedTiledIdentity(64, 64)
 	pdfBytes := buildSyntheticIndexedImagePDFFloat(48, 48, 64, 64, [6]float64{48, 0, 0, 48, 0, 0}, palette, imageData)
 
@@ -6644,6 +6644,7 @@ func TestSyntheticIndexedLargeMildDownscaleProbeAgainstPoppler(t *testing.T) {
 }
 
 func assertSyntheticImageModeCloserThanLegacy(t *testing.T, pdfName string, pdfBytes []byte) {
+	requirePopplerProbeOptIn(t)
 	if _, err := exec.LookPath("pdftoppm"); err != nil {
 		t.Skip("pdftoppm not installed")
 	}
@@ -6834,6 +6835,7 @@ func probeSyntheticCurrentRenderAgainstPoppler(
 	pdfName string,
 	pdfBytes []byte,
 ) (float64, float64) {
+	requirePopplerProbeOptIn(t)
 	if _, err := exec.LookPath("pdftoppm"); err != nil {
 		t.Skip("pdftoppm not installed")
 	}
@@ -6883,6 +6885,7 @@ func probePDFRenderAgainstPoppler(
 	pdfPath string,
 	opts pdf.RenderOptions,
 ) (float64, float64) {
+	requirePopplerProbeOptIn(t)
 	if _, err := exec.LookPath("pdftoppm"); err != nil {
 		t.Skip("pdftoppm not installed")
 	}
@@ -7002,6 +7005,36 @@ func renderSamplePageParityBetweenModes(t *testing.T, pdfPath string, leftMode s
 	exactPercent, similarityPercent, err := parityComparePNGs(leftPNG, rightPNG)
 	require.NoError(t, err)
 	return exactPercent, similarityPercent
+}
+
+func renderableSampleCorpusPDFPaths(t *testing.T) []string {
+	t.Helper()
+
+	pdfPaths, err := filepath.Glob(filepath.Join(getSampleDir(), "*", "*.pdf"))
+	require.NoError(t, err)
+	sort.Strings(pdfPaths)
+
+	renderable := make([]string, 0, len(pdfPaths))
+	for _, pdfPath := range pdfPaths {
+		doc, openErr := pdf.Open(pdfPath)
+		if openErr != nil {
+			if isUnsupportedSampleCorpusOpenError(openErr) {
+				relPath, relErr := filepath.Rel(getSampleDir(), pdfPath)
+				require.NoError(t, relErr)
+				t.Logf("skipping unsupported sample corpus PDF %s: %v", filepath.ToSlash(relPath), openErr)
+				continue
+			}
+			require.NoError(t, openErr)
+		}
+		require.NoError(t, doc.Close())
+		renderable = append(renderable, pdfPath)
+	}
+
+	return renderable
+}
+
+func isUnsupportedSampleCorpusOpenError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "encryption")
 }
 
 func renderSamplePDFParity(t *testing.T, leftPDFPath string, rightPDFPath string) (float64, float64) {

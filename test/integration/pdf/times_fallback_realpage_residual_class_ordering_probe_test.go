@@ -33,4 +33,3 @@ func TestRealPageResidualClassExpandedResidualGapOrderingRanksNonLowerAboveLongT
 
 	require.Greater(t, result.nonLowerExpanded.residualGap(), result.longTailExpanded.residualGap())
 }
-

@@ -41,5 +41,7 @@ func TestSplashClipToRectMasksFillAA(t *testing.T) {
 	assertRGB(1, 3, Color{0xFF, 0xFF, 0xFF})
 	assertRGB(2, 3, Color{})
 	assertRGB(5, 5, Color{})
-	assertRGB(6, 5, Color{0xFF, 0xFF, 0xFF})
+	// Poppler clips AA lines with splashFloor(xMax * splashAASize) + 1, so the
+	// first subpixel beyond the right edge still contributes 1/8 black coverage.
+	assertRGB(6, 5, Color{0xDF, 0xDF, 0xDF})
 }

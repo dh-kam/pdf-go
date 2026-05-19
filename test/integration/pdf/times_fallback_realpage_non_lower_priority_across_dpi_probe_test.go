@@ -26,4 +26,3 @@ func TestRealPageNonLowerGapShrinksAt150DPIWhileGlyphSourceSwapStaysFlat(t *test
 	require.Equal(t, result.dpi72.coreGlyphSwapGain, result.dpi150.coreGlyphSwapGain)
 	require.Equal(t, result.dpi72.expandedGlyphSwapGain, result.dpi150.expandedGlyphSwapGain)
 }
-

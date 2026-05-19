@@ -10,7 +10,7 @@ import (
 
 func TestMinimalPDFOpen(t *testing.T) {
 	// Test with the actual PDF
-	doc, err := pdf.Open("/workspace/pdf-reader/go-pdf/test.pdf")
+	doc, err := pdf.Open(rootTestPDFPath(t))
 	if err != nil {
 		require.FailNowf(t, "test failed", "Failed to open PDF: %v", err)
 	}

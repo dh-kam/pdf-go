@@ -9,7 +9,7 @@ This document tracks the current implementation status and the major technical a
 ## Current Status
 
 - Public package: `github.com/dh-kam/pdf-go/pkg/pdf`.
-- Default CI path: no-CGo build with `nojpx,nojbig2,nofreetype,nocairo` tags.
+- Default CI path: pure Go build with `CGO_ENABLED=0` and no feature-disabling build tags.
 - Release gate: `make release-ci`.
 - Release artifact build: `make release-package RELEASE_VERSION=v0.9.0-poppler24-02-0-202605.1`.
 - Primary rendering reference: Poppler raster output.

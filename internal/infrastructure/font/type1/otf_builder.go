@@ -552,12 +552,12 @@ func buildCmapTable(codeToGlyphIdx map[uint32]int) []byte {
 	subtableLen := 14 + segCount*8
 	var sub []byte
 	sub = appendU16(sub, 4)                   // format
-	sub = appendU16(sub, uint16(subtableLen))  // length
-	sub = appendU16(sub, 0)                    // language
-	sub = appendU16(sub, uint16(segCount*2))   // segCountX2
-	sub = appendU16(sub, searchRange)          // searchRange
-	sub = appendU16(sub, entrySelector)        // entrySelector
-	sub = appendU16(sub, rangeShift)           // rangeShift
+	sub = appendU16(sub, uint16(subtableLen)) // length
+	sub = appendU16(sub, 0)                   // language
+	sub = appendU16(sub, uint16(segCount*2))  // segCountX2
+	sub = appendU16(sub, searchRange)         // searchRange
+	sub = appendU16(sub, entrySelector)       // entrySelector
+	sub = appendU16(sub, rangeShift)          // rangeShift
 
 	for _, s := range merged {
 		sub = appendU16(sub, s.end)
@@ -628,17 +628,17 @@ func buildNameTable(fontName string) []byte {
 
 	// Simple name table with one entry (nameID=4, full name)
 	var t []byte
-	t = appendU16(t, 0) // format
-	t = appendU16(t, 1) // count
+	t = appendU16(t, 0)            // format
+	t = appendU16(t, 1)            // count
 	stringOffset := uint16(6 + 12) // header(6) + 1 record(12)
 	t = appendU16(t, stringOffset) // stringOffset
 	// Record: platformID=3, encodingID=1, languageID=0x0409, nameID=4
-	t = appendU16(t, 3)                      // platformID
-	t = appendU16(t, 1)                      // encodingID
-	t = appendU16(t, 0x0409)                 // languageID
-	t = appendU16(t, 4)                      // nameID (full font name)
+	t = appendU16(t, 3)                        // platformID
+	t = appendU16(t, 1)                        // encodingID
+	t = appendU16(t, 0x0409)                   // languageID
+	t = appendU16(t, 4)                        // nameID (full font name)
 	t = appendU16(t, uint16(len(nameBytes)*2)) // length (UTF-16BE)
-	t = appendU16(t, 0)                      // offset
+	t = appendU16(t, 0)                        // offset
 
 	// String data (UTF-16BE)
 	for _, b := range nameBytes {

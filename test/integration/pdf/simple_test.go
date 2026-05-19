@@ -12,7 +12,7 @@ import (
 // TestOpenPDF tests opening a simple PDF file.
 func TestOpenPDF(t *testing.T) {
 	// Use test PDF in project root
-	doc, err := pdf.Open("/workspace/pdf-reader/go-pdf/test.pdf")
+	doc, err := pdf.Open(rootTestPDFPath(t))
 	require.NoError(t, err, "Failed to open PDF")
 	defer doc.Close()
 

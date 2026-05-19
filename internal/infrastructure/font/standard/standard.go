@@ -26,7 +26,7 @@ import (
 
 	"github.com/dh-kam/pdf-go/internal/domain/entity"
 	"github.com/dh-kam/pdf-go/internal/domain/errors"
-	ftcgo "github.com/dh-kam/pdf-go/internal/infrastructure/cgo/freetype"
+	ftcgo "github.com/dh-kam/pdf-go/internal/infrastructure/font/freetype"
 )
 
 // Standard14 contains the 14 standard PDF fonts.
@@ -253,16 +253,7 @@ func (f *StandardFont) GlyphIDByName(name string) (uint32, bool) {
 		return uint32('f'), true
 	}
 
-	candidates := map[string]uint32{
-		`"`: '"',
-		"'": '\'',
-		",": ',',
-		"-": '-',
-		".": '.',
-		"+": '+',
-		"<": '<',
-	}
-	if glyph, ok := candidates[name]; ok {
+	if glyph, ok := standardGlyphByName[name]; ok {
 		return glyph, true
 	}
 	return 0, false
@@ -503,13 +494,76 @@ func (f *StandardFont) glyphIndex(glyph uint32) (sfnt.GlyphIndex, error) {
 
 // getGlyphName returns the Adobe glyph name for a glyph ID.
 func getGlyphName(glyph uint32) string {
-	// Standard glyph names for first 256 characters
-	// For simplicity, return the code as hex for special characters
 	if glyph < 32 || glyph > 126 {
 		return fmt.Sprintf(".notdef.%d", glyph)
 	}
+	if name, ok := standardGlyphNameByCode[glyph]; ok {
+		return name
+	}
 	return string(byte(glyph))
 }
+
+var standardGlyphNameByCode = map[uint32]string{
+	0x20: "space",
+	0x21: "exclam",
+	0x22: "quotedbl",
+	0x23: "numbersign",
+	0x24: "dollar",
+	0x25: "percent",
+	0x26: "ampersand",
+	0x27: "quoteright",
+	0x28: "parenleft",
+	0x29: "parenright",
+	0x2A: "asterisk",
+	0x2B: "plus",
+	0x2C: "comma",
+	0x2D: "hyphen",
+	0x2E: "period",
+	0x2F: "slash",
+	0x30: "zero",
+	0x31: "one",
+	0x32: "two",
+	0x33: "three",
+	0x34: "four",
+	0x35: "five",
+	0x36: "six",
+	0x37: "seven",
+	0x38: "eight",
+	0x39: "nine",
+	0x3A: "colon",
+	0x3B: "semicolon",
+	0x3C: "less",
+	0x3D: "equal",
+	0x3E: "greater",
+	0x3F: "question",
+	0x40: "at",
+	0x5B: "bracketleft",
+	0x5C: "backslash",
+	0x5D: "bracketright",
+	0x5E: "asciicircum",
+	0x5F: "underscore",
+	0x60: "quoteleft",
+	0x7B: "braceleft",
+	0x7C: "bar",
+	0x7D: "braceright",
+	0x7E: "asciitilde",
+}
+
+var standardGlyphByName = func() map[string]uint32 {
+	out := map[string]uint32{
+		`"`: '"',
+		"'": '\'',
+		",": ',',
+		"-": '-',
+		".": '.',
+		"+": '+',
+		"<": '<',
+	}
+	for code, name := range standardGlyphNameByCode {
+		out[name] = code
+	}
+	return out
+}()
 
 // Font width tables (simplified - would have actual metrics in production)
 func getWidths(fontName string) []float64 {

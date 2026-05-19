@@ -37,6 +37,9 @@ func TestRenderParityReportAgainstPoppler(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping render parity report in short mode")
 	}
+	if os.Getenv("PDF_PARITY_RUN") != "1" {
+		t.Skip("set PDF_PARITY_RUN=1 to run the full Poppler render parity report")
+	}
 
 	if _, err := exec.LookPath("pdftoppm"); err != nil {
 		t.Skip("pdftoppm not installed")

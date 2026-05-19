@@ -8,6 +8,58 @@ Korean localization: [TODO.ko.md](TODO.ko.md).
 - [ ] Reclassify the `GeoTopo p55` pattern, fill, and stroke residuals as segment stroke and tiling-pattern issues rather than image or soft-mask issues.
 - [ ] Review `GeoTopo p55`, `p23`, `p44`, and `p97` together to narrow the Poppler `strokeNarrow` and `strokeWide` branch conditions.
 
+## Pure Go Porting Plan
+
+- [x] Treat historical `nojpx,nojbig2` exact100 as corpus coverage only, not JPX/JBIG2 port completion.
+- [x] Replace the CGo inventory gate with a zero-`import "C"` assertion.
+- [x] Wire PDF `DecodeParms` / `JBIG2Globals` into JBIG2 decode options and keep full-corpus exact100.
+- [x] Port the JBIG2 MQ arithmetic decoder and arithmetic generic bitmap region templates 0-3.
+- [x] Match Poppler JBIG2 arithmetic generic-region typical prediction (`TPGDON`) row handling.
+- [x] Match Poppler JBIG2 external region combination operators and compose multiple immediate generic regions in segment order.
+- [x] Match Poppler JBIG2 page default-pixel initialization from Page Information flags.
+- [x] Port JBIG2 pattern dictionary and halftone skip/multi-plane arithmetic gray-image composition.
+- [x] Port Poppler-aligned JBIG2 generic refinement region parsing, contexts, TPGR handling, and shared arithmetic refinement decoding.
+- [x] Add Poppler-aligned JBIG2 arithmetic integer/IAID decoding plus symbol dictionary and text region header parsing/storage scaffolding.
+- [x] Port Poppler-aligned JBIG2 arithmetic symbol dictionary refinement/aggregate bitmap decoding and export flow.
+- [x] Port JBIG2 multi-plane MMR halftone gray-image decoding and intermediate halftone region storage.
+- [x] Port Poppler-aligned JBIG2 default Huffman text region placement and refinement switching.
+- [x] Port Poppler-aligned JBIG2 default Huffman symbol dictionary collective bitmap, refinement/aggregate, and export flow.
+- [x] Port JBIG2 custom Huffman code-table segment parsing and referenced-table dispatch for symbol/text regions.
+- [x] Decode the first supported text, halftone, refinement, or generic bitmap segment in the no-PageInfo fallback path after collecting dictionaries and code tables.
+- [x] Match Poppler `JBIG2Globals` priority when global and page streams reuse a segment number.
+- [x] Match Poppler generic-refinement bitmap lifetime by discarding the referenced intermediate bitmap after refinement decoding.
+- [ ] Finish remaining JBIG2 native decoder edge cases around malformed/interleaved `JBIG2Globals` references.
+- [x] Add a real pure Go JPEG2000 decoder path for JP2 boxes and raw codestreams.
+- [x] Add JPX unit coverage for both JP2 container and raw J2K codestream decode paths.
+- [ ] Validate JPX exact parity against Poppler/OpenJPEG coverage and close unsupported JPEG2000 feature gaps.
+- [x] Add a pure Go SFNT fallback for FreeType glyph lookup, glyph names, outlines, bounding boxes, transforms, and approximate bitmap rasterization.
+- [x] Match Poppler-style ppem/matrix normalization for non-Type1 pure-Go SFNT bitmap glyphs.
+- [x] Keep Type1 no-CGo glyph rasterization separately gated so it can be disabled for isolation, while defaulting it on under `PDF_FREETYPE_GO=1` because it improves Type1-heavy parity.
+- [x] Update `freetype-go` to preserve Type1/CFF cubic outlines and raster cubic tags, then bump the git dependency without a local replace.
+- [x] Gate FreeType fill-rule coverage for Type1/CFF `freetype-go` raster paths and bump the git dependency after full-corpus parity validation.
+- [x] Match FreeType bitmap placement for top-zero pure-Go glyph bitmaps without flipping manually created raster test surfaces.
+- [x] Match FreeType CFF design-unit outline scaling so pure-Go CFF glyph bitmaps align with FreeType rounding.
+- [x] Match FreeType TrueType phantom-origin outline translation so pure-Go glyph bitmaps align with Poppler on `pdfkit.pdf`.
+- [x] Match FreeType TrueType high-precision design-unit scaling so pure-Go glyph bitmaps align with Poppler on `libreoffice-form.pdf`.
+- [x] Remove the pure-Go rotated TrueType Y-phase hotfix after matching Poppler/FreeType matrix phase behavior on `habibi-rotated.pdf`.
+- [x] Match FreeType Type1 size-metric scaling so pure-Go Type1 glyph outlines follow `FT_Set_Pixel_Sizes` / `FT_Request_Metrics`.
+- [x] Trust embedded subset Type1 fonts without ASCII renderability probes so one-glyph subsets do not fall back to standard fonts.
+- [x] Replace FreeType-dependent glyph APIs with pure Go glyph lookup, bbox, outline, transform, bitmap, phase, and matrix raster paths.
+- [x] Replace Cairo glyph mask rasterization with a pure Go raster strategy or remove the Cairo path when Splash exact parity is preserved.
+- [x] Remove FreeType, JPX, JBIG2, and Cairo CGo wrappers from the source tree.
+- [x] Remove feature-disabling build tags from e2e child `go run` / `go build` commands.
+- [x] Add a no-CGo release gate that builds and tests with `CGO_ENABLED=0`.
+- [x] Force Makefile no-CGo validation targets to run with `CGO_ENABLED=0` and keep race checks as a separate CGo-required gate.
+- [x] Keep full-corpus Poppler exact100 HTML generation available with `-timeout-sec 0` for long-running verification.
+
+## FreeType-Go Upstream Workflow
+
+- [ ] For every confirmed FreeType parity gap, reproduce it in `freetype-go` with a minimal fixture and record the exact API inputs, pure Go function, and observed delta.
+- [ ] Fix confirmed `freetype-go` defects in `/workspace/freetype-go` first, verify them there, then update `pdf-go` to consume the upstreamable behavior.
+- [ ] Open a GitHub issue in `dh-kam/freetype-go` for each confirmed gap with pure Go mismatch, fixture/page evidence, and proposed fix; add implementation notes as issue comments when needed.
+- [ ] Run `git fetch origin` before `freetype-go` work and only `git pull --rebase` when the local worktree is clean or local changes are safely committed/stashed.
+- [ ] Upstream the raw CFF Type1C Encoding charmap and FontBBox parity gap found while matching `GeoTopo-komprimiert.pdf` no-CGo Splash exact100.
+
 ## Rendering Accuracy
 
 - [ ] Merge the `pdf.js` fixture corpus with the existing sample fixtures and iterate on the highest render-mismatch documents until they reach 98%+.

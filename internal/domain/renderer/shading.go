@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 
+	"github.com/dh-kam/pdf-go/internal/domain/colorspace"
 	"github.com/dh-kam/pdf-go/internal/domain/entity"
 	"github.com/dh-kam/pdf-go/internal/domain/errors"
 	"github.com/dh-kam/pdf-go/internal/infrastructure/pdf/stream"
@@ -1381,7 +1382,7 @@ func evaluateShadingFunctionColor(fn entity.Function, t float64) color.Color {
 		if v > 1 {
 			v = 1
 		}
-		return uint8(math.Round(v * 255))
+		return colorspace.ConvertComponentToByte(v)
 	}
 
 	if len(values) == 1 {

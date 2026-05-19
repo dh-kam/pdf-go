@@ -205,9 +205,7 @@ func (s *Scanner) computeIntersections() {
 	}
 }
 
-// addIntersection mirrors SplashXPathScanner::addIntersection
-// (SplashXPathScanner.cc:295-310). Poppler records winding count only on rows
-// inside the segment's half-open vertical extent: segYMin <= y < segYMax.
+// addIntersection mirrors SplashXPathScanner::addIntersection.
 func (s *Scanner) addIntersection(segYMin, segYMax float64, y, x0, x1, count int) {
 	var ent intersect
 	ent.Y = y
@@ -221,9 +219,6 @@ func (s *Scanner) addIntersection(segYMin, segYMax float64, y, x0, x1, count int
 	} else {
 		ent.Count = 0
 	}
-	// Poppler's SplashXPathScanner::addIntersection appends raw intersections
-	// and defers all overlap handling to renderAALine()/NextSpan() after the
-	// per-row sort. Merging here changes winding counts for adjacent AA edges.
 	s.allIntersections[y-s.yMin] = append(s.allIntersections[y-s.yMin], ent)
 }
 

@@ -14,7 +14,7 @@ import (
 )
 
 func TestSimulateParsingFlow(t *testing.T) {
-	data, err := os.ReadFile("/workspace/pdf-reader/go-pdf/test.pdf")
+	data, err := os.ReadFile(rootTestPDFPath(t))
 	if err != nil {
 		require.FailNowf(t, "test failed", "Failed to read PDF: %v", err)
 	}

@@ -1857,7 +1857,7 @@ func splashRectCoverageAlpha(x, y int, rect transformedAxisAlignedRect) uint8 {
 	firstSubpixel := x * aaSize
 	lastSubpixel := firstSubpixel + aaSize - 1
 	rectFirstSubpixel := int(math.Floor(rect.minX * aaSize))
-	rectLastSubpixel := int(math.Ceil(rect.maxX*aaSize)) - 1
+	rectLastSubpixel := int(math.Floor(rect.maxX * aaSize))
 	if rectFirstSubpixel > firstSubpixel {
 		firstSubpixel = rectFirstSubpixel
 	}
@@ -5616,15 +5616,7 @@ func (c *ImageCanvas) colorArrayToRGBA(colors []float64) color.RGBA {
 }
 
 func colorComponentToByte(component float64) uint8 {
-	if component < 0 {
-		return 0
-	}
-	if component > 1 {
-		return 255
-	}
-	const gfxColorComp1 = 0x10000
-	fixed := int(component * gfxColorComp1)
-	return uint8(((fixed << 8) - fixed + 0x8000) >> 16)
+	return domaincolorspace.ConvertComponentToByte(component)
 }
 
 // patternXRef is a minimal XRef implementation for pattern content streams.

@@ -105,6 +105,14 @@ type faithfulSyntheticBoundaryBandMetrics struct {
 	boundary   faithfulSyntheticMaskedParityMetrics
 }
 
+func skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t *testing.T) {
+	t.Helper()
+
+	if os.Getenv("PDF_RUN_FAITHFUL_SYNTHETIC_TEXT_PROBES") != "1" {
+		t.Skip("set PDF_RUN_FAITHFUL_SYNTHETIC_TEXT_PROBES=1 to run the slow Poppler text-composition probes")
+	}
+}
+
 type faithfulSyntheticParentContextReplayVariantProbe struct {
 	name       string
 	content    []byte
@@ -113,6 +121,8 @@ type faithfulSyntheticParentContextReplayVariantProbe struct {
 }
 
 func TestFaithfulSyntheticTextCompositionProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	for _, tc := range faithfulSyntheticTextCompositionProbeCases() {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -146,6 +156,8 @@ func TestFaithfulSyntheticTextCompositionProbeAgainstPoppler(t *testing.T) {
 }
 
 func TestFaithfulSyntheticTextCompositionOriginalBridgeProbe(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	for _, tc := range faithfulSyntheticTextCompositionProbeCases() {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -189,6 +201,8 @@ func TestFaithfulSyntheticTextCompositionOriginalBridgeProbe(t *testing.T) {
 }
 
 func TestFaithfulSyntheticTextCompositionVariantProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -227,6 +241,8 @@ func TestFaithfulSyntheticTextCompositionVariantProbeAgainstPoppler(t *testing.T
 }
 
 func TestFaithfulSyntheticTextCompositionFormGraphVariantProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -267,6 +283,8 @@ func TestFaithfulSyntheticTextCompositionFormGraphVariantProbeAgainstPoppler(t *
 }
 
 func TestFaithfulSyntheticTextCompositionDebugGateProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -314,6 +332,8 @@ func TestFaithfulSyntheticTextCompositionDebugGateProbeAgainstPoppler(t *testing
 }
 
 func TestFaithfulSyntheticTextCompositionIm17FocusedDiffProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -366,6 +386,8 @@ func TestFaithfulSyntheticTextCompositionIm17FocusedDiffProbeAgainstPoppler(t *t
 }
 
 func TestFaithfulSyntheticTextCompositionIm17ChildFormDiffProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -405,6 +427,8 @@ func TestFaithfulSyntheticTextCompositionIm17ChildFormDiffProbeAgainstPoppler(t 
 }
 
 func TestFaithfulSyntheticTextCompositionFm184PixelSampleProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -447,6 +471,8 @@ func TestFaithfulSyntheticTextCompositionFm184PixelSampleProbeAgainstPoppler(t *
 }
 
 func TestFaithfulSyntheticTextCompositionFm184PatternPlacementProbe(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -559,6 +585,8 @@ func TestFaithfulSyntheticTextCompositionFm184PatternPlacementProbe(t *testing.T
 }
 
 func TestFaithfulSyntheticTextCompositionFm184StandaloneRenderProbe(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -700,6 +728,8 @@ func TestFaithfulSyntheticTextCompositionFm184StandaloneRenderProbe(t *testing.T
 }
 
 func TestFaithfulSyntheticTextCompositionIm17OperatorResourceProbe(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -740,6 +770,8 @@ func TestFaithfulSyntheticTextCompositionIm17OperatorResourceProbe(t *testing.T)
 }
 
 func TestFaithfulSyntheticTextCompositionIm17WorstChildOperatorProbe(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -904,6 +936,8 @@ func TestFaithfulSyntheticTextCompositionIm17WorstChildOperatorProbe(t *testing.
 }
 
 func TestFaithfulSyntheticTextCompositionIm17WorstChildBoundaryBandSplitProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -969,6 +1003,8 @@ func TestFaithfulSyntheticTextCompositionIm17WorstChildBoundaryBandSplitProbeAga
 }
 
 func TestFaithfulSyntheticTextCompositionIm17WorstChildStandaloneBoundaryBandSplitProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -1095,6 +1131,8 @@ func TestFaithfulSyntheticTextCompositionIm17WorstChildStandaloneBoundaryBandSpl
 }
 
 func TestFaithfulSyntheticTextCompositionIm17ParentContextReplayProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -1270,6 +1308,8 @@ func TestFaithfulSyntheticTextCompositionIm17ParentContextReplayProbeAgainstPopp
 }
 
 func TestFaithfulSyntheticTextCompositionIm17PrefixDivergenceProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -1359,6 +1399,8 @@ func TestFaithfulSyntheticTextCompositionIm17PrefixDivergenceProbeAgainstPoppler
 }
 
 func TestFaithfulSyntheticTextCompositionIm17OverlapIsolationProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -1519,6 +1561,8 @@ func TestFaithfulSyntheticTextCompositionIm17OverlapIsolationProbeAgainstPoppler
 }
 
 func TestFaithfulSyntheticTextCompositionIm17BackdropOperatorClassProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -1717,6 +1761,8 @@ func TestFaithfulSyntheticTextCompositionIm17BackdropOperatorClassProbeAgainstPo
 }
 
 func TestFaithfulSyntheticTextCompositionIm17StrokePrefixProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -1902,6 +1948,8 @@ func TestFaithfulSyntheticTextCompositionIm17StrokePrefixProbeAgainstPoppler(t *
 }
 
 func TestFaithfulSyntheticTextCompositionPageHotspotPrefixProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -2019,6 +2067,8 @@ func TestFaithfulSyntheticTextCompositionPageHotspotPrefixProbeAgainstPoppler(t 
 }
 
 func TestFaithfulSyntheticTextCompositionF176BottomURLGlyphPrefixProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -2167,6 +2217,8 @@ func TestFaithfulSyntheticTextCompositionF176BottomURLGlyphPrefixProbeAgainstPop
 }
 
 func TestFaithfulSyntheticTextCompositionDeviceCMYKMagentaSolidProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	pdfBytes := buildSyntheticContentPDF(20, 20, []byte("0 1 0 0 k\n0 0 20 20 re f\n"))
 	popplerPNG, oursPNG := renderSyntheticPDFAgainstPopplerAtDPIToPNGs(t, "device_cmyk_magenta_solid.pdf", pdfBytes, "", 72)
 	popplerImg := loadPNGAsRGBAForProbe(t, popplerPNG)
@@ -2367,6 +2419,8 @@ func faithfulSyntheticOperatorSummaryForProbe(operators []domainrenderer.Operato
 }
 
 func TestFaithfulSyntheticTextCompositionIm17OverlapContributorProbe(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -2516,6 +2570,8 @@ func TestFaithfulSyntheticTextCompositionIm17OverlapContributorProbe(t *testing.
 }
 
 func TestFaithfulSyntheticTextCompositionIm17OverlapLastPainterProbeAgainstPoppler(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),
@@ -2851,6 +2907,8 @@ func collectFaithfulSyntheticIm17ChildFormDiffsForProbe(
 }
 
 func TestFaithfulSyntheticTextCompositionPopplerAssetProbe(t *testing.T) {
+	skipFaithfulSyntheticTextCompositionProbeUnlessEnabled(t)
+
 	tc := faithfulSyntheticTextCompositionProbeCase{
 		name:       "009_p95_all_text",
 		pdfPath:    filepath.Join(getSampleDir(), "009-pdflatex-geotopo", "GeoTopo.pdf"),

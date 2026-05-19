@@ -24,6 +24,11 @@ func (w *Wrapper) Decode(data []byte) (stdimage.Image, error) {
 	return w.decoder.Decode(data)
 }
 
+// DecodeWithOptions decodes JBIG2 image data with PDF DecodeParms.
+func (w *Wrapper) DecodeWithOptions(data []byte, opts DecodeOptions) (stdimage.Image, error) {
+	return w.decoder.DecodeWithOptions(data, opts)
+}
+
 // DecodeConfig returns the JBIG2 image configuration.
 func (w *Wrapper) DecodeConfig(data []byte) (stdimage.Config, error) {
 	return w.decoder.DecodeConfig(data)

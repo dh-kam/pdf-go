@@ -18,11 +18,11 @@ func measureRealPageNonLowerPriorityProbeAgainstPoppler(
 }
 
 type realPageNonLowerPriorityAtDPIProbeResult struct {
-	expandedResidualGap float64
-	codeSpecGap         float64
-	coreGlyphSwapGain   float64
+	expandedResidualGap   float64
+	codeSpecGap           float64
+	coreGlyphSwapGain     float64
 	expandedGlyphSwapGain float64
-	dpi                 int
+	dpi                   int
 }
 
 func measureRealPageNonLowerPriorityProbeAgainstPopplerAtDPI(
@@ -97,10 +97,10 @@ func measureRealPageNonLowerPriorityAtDPIProbeAgainstPoppler(
 	priority := measureRealPageNonLowerPriorityProbeAgainstPopplerAtDPI(t, dpi)
 
 	return realPageNonLowerPriorityAtDPIProbeResult{
-		expandedResidualGap: priority.expanded.residualGap(),
-		codeSpecGap:         priority.codeSpec.codeSpecGap(),
-		coreGlyphSwapGain:   coreGlyphSwap.overrideGain,
+		expandedResidualGap:   priority.expanded.residualGap(),
+		codeSpecGap:           priority.codeSpec.codeSpecGap(),
+		coreGlyphSwapGain:     coreGlyphSwap.overrideGain,
 		expandedGlyphSwapGain: expandedGlyphSwap.overrideGain,
-		dpi:                 dpi,
+		dpi:                   dpi,
 	}
 }

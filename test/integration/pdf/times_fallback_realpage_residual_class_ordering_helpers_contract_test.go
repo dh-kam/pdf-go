@@ -39,4 +39,3 @@ func TestRealPageResidualClassExpandedOrderingProbeResult_PrefersNonLowerResidua
 
 	require.Greater(t, result.nonLowerExpanded.residualGap(), result.longTailExpanded.residualGap())
 }
-

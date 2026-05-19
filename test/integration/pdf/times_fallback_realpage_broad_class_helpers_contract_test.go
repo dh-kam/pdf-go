@@ -28,4 +28,3 @@ func TestRunRealPageBroadLowercaseProbeHelpers_InvokeOnlyExpectedResidualClass(t
 	})
 	require.Equal(t, 1, nonLowerCalls)
 }
-

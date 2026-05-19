@@ -83,7 +83,7 @@ func TestStandardFont_UnitsPerEm(t *testing.T) {
 	font, found := standard.GetFont("Times-Roman")
 	require.True(t, found)
 
-	assert.Equal(t, uint16(1000), font.UnitsPerEm())
+	assert.Equal(t, uint16(2048), font.UnitsPerEm())
 }
 
 func TestStandardFont_CharCodeToGlyph(t *testing.T) {
@@ -99,8 +99,8 @@ func TestStandardFont_CharCodeToGlyph(t *testing.T) {
 		{"ASCII A", 65, 65, false},
 		{"ASCII space", 32, 32, false},
 		{"ASCII tilde", 126, 126, false},
-		{"out of range", 256, 0, true},
-		{"way out of range", 1000, 0, true},
+		{"Unicode code point", 256, 256, false},
+		{"way out of range", 0x110000, 0, true},
 	}
 
 	for _, tt := range tests {
@@ -128,7 +128,8 @@ func TestStandardFont_GetGlyphWidth(t *testing.T) {
 		{"glyph 0", 0, false},
 		{"glyph 65 (A)", 65, false},
 		{"glyph 255", 255, false},
-		{"out of range", 256, true},
+		{"Unicode glyph", 256, false},
+		{"out of Unicode range", 0x110000, true},
 	}
 
 	for _, tt := range tests {
@@ -167,7 +168,7 @@ func TestStandardFont_RenderGlyph(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "simple glyph", glyph: 65, size: 12.0, wantErr: false},
-		{name: "space", glyph: 32, size: 12.0, wantErr: false},
+		{name: "space has no outline", glyph: 32, size: 12.0, wantErr: true},
 		{name: "larger size", glyph: 65, size: 24.0, wantErr: false},
 		{name: "small size", glyph: 65, size: 8.0, wantErr: false},
 	}
@@ -183,12 +184,12 @@ func TestStandardFont_RenderGlyph(t *testing.T) {
 				assert.NotNil(t, path.Commands)
 				assert.Equal(t, 4, len(path.Bounds), "bounds should have 4 values")
 
-				// Check that bounds are reasonable
-				width, _ := font.GetGlyphWidth(tt.glyph)
-				require.NoError(t, err)
-				scale := tt.size / 1000.0
-				expectedWidth := width * scale
-				assert.InDelta(t, expectedWidth, path.Bounds[2], 0.01, "width should match")
+				// Check that outline bounds are populated; advance width is tested separately.
+				width, widthErr := font.GetGlyphWidth(tt.glyph)
+				require.NoError(t, widthErr)
+				assert.Greater(t, width, 0.0)
+				assert.Greater(t, path.Bounds[2]-path.Bounds[0], 0.0, "outline width should be positive")
+				assert.Greater(t, path.Bounds[3]-path.Bounds[1], 0.0, "outline height should be positive")
 			}
 		})
 	}
@@ -203,7 +204,7 @@ func TestStandardFont_GlyphName(t *testing.T) {
 		glyph        uint32
 	}{
 		{wantContains: "A", glyph: 65},            // ASCII character
-		{wantContains: " ", glyph: 32},            // Space
+		{wantContains: "space", glyph: 32},        // Adobe glyph name
 		{wantContains: ".notdef.0", glyph: 0},     // Control character
 		{wantContains: ".notdef.127", glyph: 127}, // DEL character
 	}
