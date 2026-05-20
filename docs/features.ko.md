@@ -20,11 +20,21 @@
 
 렌더러는 `ConcurrentRenderer`가 담당한다. 단일 페이지는 `RenderPage()`로, 여러 페이지는 `RenderPages()` 또는 `RenderAllPages()`로 렌더링한다. 여러 페이지 렌더링은 worker pool을 사용하며 결과는 channel로 반환한다.
 
-`RendererOptions.Backend`로 렌더링 백엔드를 선택한다. 기본값은 `image-canvas`이고, Poppler Splash 정합 작업에 사용하는 `splash` 백엔드도 제공한다. 빈 backend 값은 `image-canvas`와 같다.
+`RendererOptions.Backend`로 렌더링 백엔드를 선택한다. 기본값은 Poppler Splash 정합 작업에 사용하는 `splash`이고, `image-canvas` 백엔드는 진단용 fallback으로 제공한다. 빈 backend 값은 `splash`와 같다.
 
 `RenderOptions`는 DPI, scale, background color, page cache 사용 여부, 이미지 샘플링 debug, 이미지 샘플링 mode를 제어한다. DPI와 scale은 point 단위 PDF 좌표를 device pixel 크기로 변환할 때 사용한다.
 
 페이지 캐시는 page identity, DPI, scale, 배경색, 샘플링 mode를 포함한 키로 동작한다. Form XObject operator cache는 반복 사용되는 Form stream의 operator 파싱 결과를 재사용한다.
+
+## 브라우저 WebAssembly 렌더링
+
+`cmd/pdfwasm`은 브라우저 JavaScript에서 사용할 수 있는 `globalThis.pdfgo` API를 등록한다. `openDocument(Uint8Array, options)`는 브라우저 파일 바이트에서 PDF를 열고 document id와 page count를 반환한다.
+
+`renderPage(documentID, pageIndex, options)`는 0-based page index를 렌더링하고 width, height, RGBA `Uint8ClampedArray` pixel buffer를 반환한다. `pageInfo()`는 page metric과 media/crop box를 반환하고, `closeDocument()`는 WASM 내부 document store에서 문서를 제거한다.
+
+`make build-wasm`은 `GOOS=js`, `GOARCH=wasm`, `CGO_ENABLED=0`으로 `pdfwasm.wasm`을 만들고, Go의 `wasm_exec.js` 및 Worker 기반 browser demo를 `build/js-wasm/default/`에 배치한다. Demo는 렌더링을 Web Worker에서 수행해 큰 페이지가 UI thread를 막지 않도록 한다.
+
+Browser demo의 기본 backend는 `splash`이며, `image-canvas`는 진단용 fallback으로 선택 가능하게 유지한다. Worker와 WASM open/render 진행 로그는 페이지 log panel과 browser console에 함께 기록해 CDP로 확인할 수 있다.
 
 ## 콘텐츠 스트림 평가
 
@@ -111,4 +121,5 @@ JPX/JBIG2/FreeType/Splash 렌더링 경로는 기본적으로 순수 Go 구현�
 ```bash
 CGO_ENABLED=0 go build ./cmd/pdfrender
 CGO_ENABLED=0 go test ./...
+make build-wasm
 ```

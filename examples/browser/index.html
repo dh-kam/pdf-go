@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>pdf-go WASM Renderer</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #17201a;
+        --muted: #667064;
+        --paper: #f8f2e7;
+        --panel: #fffaf0;
+        --line: #d7cab8;
+        --accent: #cc4b24;
+        --accent-dark: #893018;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--ink);
+        font-family: Georgia, "Times New Roman", serif;
+        background:
+          radial-gradient(circle at 12% 18%, rgba(204, 75, 36, 0.13), transparent 34rem),
+          linear-gradient(135deg, #fbf7ee 0%, #ece0cd 100%);
+      }
+
+      main {
+        width: calc(100% - 32px);
+        margin: 0 auto;
+        padding: 40px 0;
+      }
+
+      header {
+        display: grid;
+        grid-template-columns: 1.1fr 0.9fr;
+        gap: 28px;
+        align-items: end;
+        margin-bottom: 24px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(2.2rem, 5vw, 5rem);
+        line-height: 0.92;
+        letter-spacing: -0.06em;
+      }
+
+      .intro {
+        margin: 0;
+        color: var(--muted);
+        font-size: 1rem;
+        line-height: 1.5;
+      }
+
+      .toolbar,
+      .viewer {
+        border: 1px solid var(--line);
+        background: color-mix(in srgb, var(--panel) 88%, white);
+        box-shadow: 0 24px 60px rgba(56, 42, 26, 0.14);
+      }
+
+      .toolbar {
+        display: grid;
+        grid-template-columns: 1.8fr repeat(4, minmax(96px, 1fr)) auto;
+        gap: 14px;
+        align-items: end;
+        padding: 18px;
+        margin-bottom: 20px;
+      }
+
+      label {
+        display: grid;
+        gap: 6px;
+        color: var(--muted);
+        font-size: 0.78rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      input,
+      select,
+      button {
+        min-height: 42px;
+        border: 1px solid var(--line);
+        border-radius: 0;
+        padding: 8px 10px;
+        color: var(--ink);
+        background: white;
+        font: inherit;
+      }
+
+      button {
+        border-color: var(--accent);
+        color: white;
+        background: var(--accent);
+        cursor: pointer;
+        font-weight: 700;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      .status {
+        min-height: 28px;
+        margin-bottom: 14px;
+        color: var(--accent-dark);
+        font-size: 0.95rem;
+      }
+
+      .log {
+        max-height: 180px;
+        overflow: auto;
+        margin: 0 0 18px;
+        padding: 14px;
+        border: 1px solid var(--line);
+        color: #3a3026;
+        background: rgba(255, 250, 240, 0.78);
+        font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+        font-size: 0.78rem;
+        line-height: 1.45;
+        white-space: pre-wrap;
+      }
+
+      .view-controls {
+        display: flex;
+        justify-content: flex-end;
+        align-items: center;
+        gap: 10px;
+        margin: 0 0 14px;
+      }
+
+      .view-label {
+        color: var(--muted);
+        font-size: 0.78rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .view-mode {
+        min-height: 36px;
+        padding: 6px 12px;
+        border-color: var(--line);
+        color: var(--accent-dark);
+        background: rgba(255, 250, 240, 0.86);
+      }
+
+      .view-mode[aria-pressed="true"] {
+        border-color: var(--accent-dark);
+        color: white;
+        background: var(--accent-dark);
+      }
+
+      .viewer {
+        overflow: auto;
+        min-height: 420px;
+        padding: 24px;
+      }
+
+      .page-stage {
+        display: grid;
+        grid-template-columns: 56px minmax(0, 1fr) 56px;
+        gap: 16px;
+        align-items: start;
+        min-width: 0;
+      }
+
+      .canvas-wrap {
+        min-width: 0;
+        width: 100%;
+      }
+
+      .canvas-wrap[data-rendered="false"] {
+        display: grid;
+        min-height: 320px;
+        place-items: center;
+      }
+
+      .canvas-wrap[data-rendered="false"] canvas {
+        width: 1px;
+        height: 1px;
+        box-shadow: none;
+      }
+
+      .canvas-wrap[data-view-mode="fit-width"][data-rendered="true"] canvas {
+        width: 100%;
+      }
+
+      .canvas-wrap[data-view-mode="actual-size"][data-rendered="true"] canvas {
+        width: auto;
+      }
+
+      .page-nav {
+        position: sticky;
+        top: 24px;
+        width: 56px;
+        min-height: 72px;
+        margin-top: 24px;
+        padding: 0;
+        border-color: var(--accent);
+        color: var(--accent-dark);
+        background: rgba(255, 250, 240, 0.86);
+        box-shadow: 0 12px 28px rgba(56, 42, 26, 0.12);
+        font-size: 2.4rem;
+        line-height: 1;
+      }
+
+      .page-nav:not(:disabled):hover {
+        color: white;
+        background: var(--accent);
+      }
+
+      canvas {
+        display: block;
+        width: auto;
+        max-width: none;
+        height: auto;
+        margin: 0 auto;
+        background: white;
+        box-shadow: 0 18px 42px rgba(40, 30, 20, 0.2);
+      }
+
+      @media (max-width: 820px) {
+        header,
+        .toolbar {
+          grid-template-columns: 1fr;
+        }
+
+        .view-controls {
+          justify-content: stretch;
+        }
+
+        .view-mode {
+          flex: 1;
+        }
+
+        .page-stage {
+          grid-template-columns: 44px minmax(0, 1fr) 44px;
+          gap: 10px;
+        }
+
+        .page-nav {
+          width: 44px;
+          min-height: 58px;
+          font-size: 1.8rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>pdf-go<br />WASM</h1>
+        <p class="intro">
+          Load a local PDF file, render it with the pure Go Splash-compatible backend in a Web Worker, and paint the returned RGBA pixels onto the canvas.
+        </p>
+      </header>
+
+      <section class="toolbar" aria-label="PDF renderer controls">
+        <label>
+          PDF file
+          <input id="file" type="file" accept="application/pdf,.pdf" />
+        </label>
+        <label>
+          Page
+          <input id="page" type="number" min="1" value="1" />
+        </label>
+        <label>
+          DPI
+          <input id="dpi" type="number" min="36" max="300" value="144" />
+        </label>
+        <label>
+          Scale
+          <input id="scale" type="number" min="0.1" max="4" step="0.1" value="1" />
+        </label>
+        <label>
+          Backend
+          <select id="backend">
+            <option value="splash" selected>Splash</option>
+            <option value="image-canvas">Image Canvas</option>
+          </select>
+        </label>
+        <button id="render" disabled>Render</button>
+      </section>
+
+      <div id="status" class="status">Build with <code>make build-wasm</code>, then choose a PDF.</div>
+      <pre id="log" class="log" aria-label="Renderer log"></pre>
+
+      <section class="view-controls" aria-label="PDF display size">
+        <span class="view-label">Display</span>
+        <button id="view-actual" class="view-mode" type="button" data-view-mode="actual-size" aria-pressed="false">100%</button>
+        <button id="view-fit" class="view-mode" type="button" data-view-mode="fit-width" aria-pressed="true">Fit width</button>
+      </section>
+
+      <section class="viewer" aria-label="Rendered PDF page">
+        <div class="page-stage">
+          <button id="prev-page" class="page-nav" type="button" aria-label="Render previous page">&lt;</button>
+          <div id="canvas-wrap" class="canvas-wrap" data-rendered="false" data-view-mode="fit-width">
+            <canvas id="canvas" width="1" height="1"></canvas>
+          </div>
+          <button id="next-page" class="page-nav" type="button" aria-label="Render next page">&gt;</button>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

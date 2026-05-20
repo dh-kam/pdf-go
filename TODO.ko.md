@@ -4,6 +4,7 @@
 - [ ] `GeoTopo p39` 22px stroke AA overlap 잔차를 Poppler `Splash::makeStrokePath()` 및 `Splash::pipeRunAARGB8()` 경로 기준으로 재검토한다.
 - [ ] `GeoTopo p55` pattern/fill/stroke 잔차를 image/soft-mask가 아닌 segment stroke 및 tiling pattern 축으로 재분해한다.
 - [ ] `GeoTopo p55`, `p23`, `p44`, `p97`을 함께 보면서 Poppler `strokeNarrow`와 `strokeWide` 분기 조건을 더 좁힌다.
+- [ ] native Splash는 `minimal-document.pdf`를 즉시 렌더링하지만 Node WASM Splash 렌더링이 20초 안에 반환되지 않는 원인을 진단한다.
 
 ## Pure Go 포팅 계획
 - [x] 과거 `nojpx,nojbig2` exact100은 현재 corpus 범위의 검증으로만 보고 JPX/JBIG2 포팅 완료로 간주하지 않는다.
@@ -40,6 +41,8 @@
 - [x] `CGO_ENABLED=0`으로 build/test하는 no-CGo release gate를 추가한다.
 - [x] Makefile no-CGo 검증 target이 실제로 `CGO_ENABLED=0`으로 실행되게 하고 race 검증은 CGo가 필요한 별도 gate로 분리한다.
 - [x] 장시간 검증이 필요한 full-corpus Poppler exact100 HTML 생성은 `-timeout-sec 0`으로 실행 가능하게 유지한다.
+- [x] pure Go PDF 렌더링을 브라우저에서 사용할 수 있도록 WebAssembly facade와 Worker 기반 demo를 추가한다.
+- [x] Browser WebAssembly demo 기본값을 Splash로 바꾸고 CDP에서 확인 가능한 runtime log를 노출한다.
 
 ## 렌더링 정확도 개선
 - [ ] `pdf.js` fixture와 기존 sample fixture를 합쳐 render mismatch 상위 문서부터 98%+까지 반복 개선한다.

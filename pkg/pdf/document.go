@@ -30,6 +30,7 @@ import (
 
 	"github.com/dh-kam/pdf-go/internal/domain/entity"
 	domainrenderer "github.com/dh-kam/pdf-go/internal/domain/renderer"
+	infrastructurecanvas "github.com/dh-kam/pdf-go/internal/infrastructure/canvas"
 	"github.com/dh-kam/pdf-go/internal/infrastructure/renderer"
 	pdfluence "github.com/dh-kam/pdf-go/internal/usecase/pdf"
 )
@@ -526,7 +527,15 @@ type RendererOptions struct {
 	MaxWorkers int
 	CacheSize  int
 	CacheTTL   time.Duration
+	Backend    string
 }
+
+const (
+	// RendererBackendImageCanvas selects the legacy image-canvas renderer.
+	RendererBackendImageCanvas = infrastructurecanvas.BackendImageCanvas
+	// RendererBackendSplash selects the Splash-compatible pure Go renderer.
+	RendererBackendSplash = infrastructurecanvas.BackendSplash
+)
 
 // DefaultRendererOptions returns default renderer options.
 func DefaultRendererOptions() RendererOptions {
@@ -543,6 +552,7 @@ func NewRenderer(options RendererOptions) *Renderer {
 		MaxWorkers: options.MaxWorkers,
 		CacheSize:  options.CacheSize,
 		CacheTTL:   options.CacheTTL,
+		Backend:    options.Backend,
 	}
 
 	r := renderer.NewConcurrentRenderer(opts)

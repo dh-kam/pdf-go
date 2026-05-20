@@ -7,6 +7,7 @@ Korean localization: [TODO.ko.md](TODO.ko.md).
 - [ ] Revisit the `GeoTopo p39` 22px stroke AA overlap residual against Poppler `Splash::makeStrokePath()` and `Splash::pipeRunAARGB8()`.
 - [ ] Reclassify the `GeoTopo p55` pattern, fill, and stroke residuals as segment stroke and tiling-pattern issues rather than image or soft-mask issues.
 - [ ] Review `GeoTopo p55`, `p23`, `p44`, and `p97` together to narrow the Poppler `strokeNarrow` and `strokeWide` branch conditions.
+- [ ] Diagnose why native Splash renders `minimal-document.pdf` immediately while Node WASM Splash rendering does not return within 20 seconds.
 
 ## Pure Go Porting Plan
 
@@ -51,6 +52,8 @@ Korean localization: [TODO.ko.md](TODO.ko.md).
 - [x] Add a no-CGo release gate that builds and tests with `CGO_ENABLED=0`.
 - [x] Force Makefile no-CGo validation targets to run with `CGO_ENABLED=0` and keep race checks as a separate CGo-required gate.
 - [x] Keep full-corpus Poppler exact100 HTML generation available with `-timeout-sec 0` for long-running verification.
+- [x] Add a browser WebAssembly renderer facade and worker-based demo for pure Go PDF rendering.
+- [x] Default the browser WebAssembly demo to Splash and expose CDP-visible runtime logs.
 
 ## FreeType-Go Upstream Workflow
 

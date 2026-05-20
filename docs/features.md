@@ -26,6 +26,19 @@ Korean localization: [features.ko.md](features.ko.md).
 - Image rendering with masks, color conversion, and sampler policy controls.
 - Clipping paths, patterns, and XObject handling.
 - Splash-backed rendering paths used to improve Poppler pixel parity.
+- Pure Go browser WebAssembly rendering through `cmd/pdfwasm`.
+
+## Browser WebAssembly
+
+- `cmd/pdfwasm` exposes a JavaScript API on `globalThis.pdfgo`.
+- `openDocument(Uint8Array, options)` loads a PDF from browser file bytes and returns a document id plus page count.
+- `renderPage(documentID, pageIndex, options)` renders a zero-based page index and returns width, height, and RGBA `Uint8ClampedArray` pixels.
+- `pageInfo(documentID, pageIndex)` returns page metrics, media box, crop box, and rotation.
+- `closeDocument(documentID)` releases the document from the WASM-side store.
+- `make build-wasm` builds `pdfwasm.wasm`, copies Go's `wasm_exec.js`, and stages the browser demo under `build/js-wasm/default/`.
+- The browser example runs rendering inside a Web Worker so large pages do not block the UI thread.
+- The browser example defaults to `splash`; `image-canvas` remains selectable as a diagnostic fallback.
+- Browser worker and WASM operations write progress logs to the page log panel and browser console for CDP inspection.
 
 ## Fonts
 
@@ -55,8 +68,8 @@ Korean localization: [features.ko.md](features.ko.md).
 ## Build Variants
 
 - Default no-CGo build for portable CI and release artifacts.
-- Optional CGo-enabled builds for integrations that require external native libraries.
 - Release artifacts are produced for Linux, macOS, and Windows on amd64 and arm64.
+- Browser WebAssembly artifacts are produced with `GOOS=js`, `GOARCH=wasm`, and `CGO_ENABLED=0`.
 
 ## Accuracy Workflow
 

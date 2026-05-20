@@ -1,4 +1,4 @@
-.PHONY: all build build-pdf-go build-cli build-examples build-pdfinfo build-pdftext build-pdfrender build-all build-pure build-all-cgo build-no-cgo test coverage lint mock-gen clean run-tests test-no-cgo test-no-cgo-race fmt-check-release test-release-no-cgo coverage-no-cgo coverage-core-no-cgo render-regression-no-cgo cgo-inventory check-no-cgo vet-no-cgo cli-smoke-no-cgo vuln-no-cgo vuln-release-no-cgo full-render-compare-html goal98-batch-test-no-cgo goal98-batch-no-cgo goal98-html-no-cgo sample-compare-html-no-cgo sample-compare-tradeoff-no-cgo sample-compare-backlog-no-cgo sample-compare-focus-no-cgo sample-compare-faildocs-recheck-no-cgo sample-compare-iccbased-focus-no-cgo nightly-snapshot-no-cgo nightly-compare-diff-no-cgo profile-render-no-cgo profile-render-guard-no-cgo render-leak-check-no-cgo goal98-compare-report goal98-batch-compare-no-cgo goal98-guard-no-cgo pdfjs-select-eq pdfjs-render-parity pdfjs-parity-clean render-parity-report-test lex-render-parity-report-test render-parity-priority porting-complete porting-complete-plus-goal98 release-ci release-build release-package release-preflight release-dry-run release-publish
+.PHONY: all build build-pdf-go build-cli build-examples build-pdfinfo build-pdftext build-pdfrender build-wasm build-all build-pure build-all-cgo build-no-cgo test coverage lint mock-gen clean run-tests test-no-cgo test-no-cgo-race fmt-check-release test-release-no-cgo coverage-no-cgo coverage-core-no-cgo render-regression-no-cgo cgo-inventory check-no-cgo vet-no-cgo cli-smoke-no-cgo vuln-no-cgo vuln-release-no-cgo full-render-compare-html goal98-batch-test-no-cgo goal98-batch-no-cgo goal98-html-no-cgo sample-compare-html-no-cgo sample-compare-tradeoff-no-cgo sample-compare-backlog-no-cgo sample-compare-focus-no-cgo sample-compare-faildocs-recheck-no-cgo sample-compare-iccbased-focus-no-cgo nightly-snapshot-no-cgo nightly-compare-diff-no-cgo profile-render-no-cgo profile-render-guard-no-cgo render-leak-check-no-cgo goal98-compare-report goal98-batch-compare-no-cgo goal98-guard-no-cgo pdfjs-select-eq pdfjs-render-parity pdfjs-parity-clean render-parity-report-test lex-render-parity-report-test render-parity-priority porting-complete porting-complete-plus-goal98 release-ci release-build release-package release-preflight release-dry-run release-publish
 
 # Build variables
 BINARY_NAME=pdfrender
@@ -10,6 +10,7 @@ EXAMPLES_DIR=./examples
 
 # Go variables
 GOCMD=go
+GO_ROOT?=$(shell $(GOCMD) env GOROOT)
 GOBUILD=$(GOCMD) build
 GOTEST=$(GOCMD) test
 GOGET=$(GOCMD) get
@@ -37,8 +38,12 @@ TARGET_TAG_FLAGS=$(if $(TARGET_TAGS),-tags='$(TARGET_TAGS)',)
 TARGET_EXE=$(if $(filter windows,$(TARGET_OS)),.exe,)
 HOST_EXE=$(if $(filter windows,$(HOST_OS)),.exe,)
 TARGET_BUILD_DIR=$(BUILD_ROOT)/$(TARGET_OS)-$(TARGET_ARCH)/$(TARGET_VARIANT)
+WASM_BUILD_DIR?=$(BUILD_ROOT)/js-wasm/default
+WASM_EXEC_JS?=$(shell if [ -f "$(GO_ROOT)/misc/wasm/wasm_exec.js" ]; then printf "%s" "$(GO_ROOT)/misc/wasm/wasm_exec.js"; else printf "%s" "$(GO_ROOT)/lib/wasm/wasm_exec.js"; fi)
+WASM_EXAMPLE_DIR?=$(EXAMPLES_DIR)/browser
 CORE_CLI_TOOLS=pdfinfo pdftext pdfrender
-CLI_PACKAGE_DIRS=$(sort $(dir $(wildcard $(CMD_DIR)/*/main.go)))
+CLI_PACKAGE_DIRS_ALL=$(sort $(dir $(wildcard $(CMD_DIR)/*/main.go)))
+CLI_PACKAGE_DIRS=$(filter-out $(CMD_DIR)/pdfwasm/,$(CLI_PACKAGE_DIRS_ALL))
 CLI_FILE_SOURCES=$(filter-out %_test.go,$(wildcard $(CMD_DIR)/*.go))
 EXAMPLE_SOURCES=$(filter-out %_test.go,$(wildcard $(EXAMPLES_DIR)/*.go))
 rwildcard=$(wildcard $(1)/$(2)) $(foreach d,$(wildcard $(1)/*),$(call rwildcard,$(d),$(2)))
@@ -67,8 +72,8 @@ all_for_arch_variant=$(foreach os,$(OS_LIST),$(call build_stamp,$(os),$(1),$(2))
 GO_PACKAGES_NO_TMP=$(shell $(GOCMD) list ./... | grep -v '^github.com/dh-kam/pdf-go/tmp$$' | grep -v '^github.com/dh-kam/pdf-go/tmp/' | grep -v '^github.com/dh-kam/pdf-go/cmd$$' | grep -v '^github.com/dh-kam/pdf-go/test$$' | sed 's|^github.com/dh-kam/pdf-go|.|')
 GO_PACKAGES_NO_TMP_NO_INTEG=$(shell echo "$(GO_PACKAGES_NO_TMP)" | tr ' ' '\n' | grep -v '^\./test/integration/pdf$$' | tr '\n' ' ')
 GO_PACKAGES_NO_TMP_NO_E2E=$(shell echo "$(GO_PACKAGES_NO_TMP)" | tr ' ' '\n' | grep -v '^\./test/e2e$$' | tr '\n' ' ')
-GO_PACKAGES_RELEASE?=./cmd/pdfcompare ./cmd/pdfinfo ./cmd/pdfrender ./cmd/pdftext ./pkg/pdf
-GO_FORMAT_PATHS_RELEASE?=cmd/pdfcompare cmd/pdfinfo cmd/pdfrender cmd/pdftext pkg/pdf
+GO_PACKAGES_RELEASE?=./cmd/pdfcompare ./cmd/pdfinfo ./cmd/pdfrender ./cmd/pdftext ./cmd/pdfwasm ./pkg/pdf
+GO_FORMAT_PATHS_RELEASE?=cmd/pdfcompare cmd/pdfinfo cmd/pdfrender cmd/pdftext cmd/pdfwasm pkg/pdf
 GOAL98_OUT?=$(CURDIR)/tmp/goal98_final_after_porting_complete_v2
 GOAL98_PREV_REPORT?=$(CURDIR)/tmp/goal98_prev_report.csv
 GOAL98_BASE_REPORT?=
@@ -213,6 +218,19 @@ build-pdfrender:
 	@mkdir -p "$(TARGET_BUILD_DIR)"
 	CGO_ENABLED=$(TARGET_CGO_ENABLED) GOOS=$(TARGET_OS) GOARCH=$(TARGET_ARCH) $(GOBUILD) $(TARGET_GOFLAGS) $(TARGET_TAG_FLAGS) -o "$(TARGET_BUILD_DIR)/pdfrender$(TARGET_EXE)" $(CMD_DIR)/pdfrender
 	@echo "Build complete: $(TARGET_BUILD_DIR)/pdfrender$(TARGET_EXE)"
+
+# Build the browser WebAssembly renderer and static demo assets.
+build-wasm:
+	@echo "Building browser WASM renderer into $(WASM_BUILD_DIR)..."
+	@mkdir -p "$(WASM_BUILD_DIR)"
+	CGO_ENABLED=0 GOOS=js GOARCH=wasm $(GOBUILD) $(GO_DEFAULT_FLAGS) -o "$(WASM_BUILD_DIR)/pdfwasm.wasm" $(CMD_DIR)/pdfwasm
+	@rm -f "$(WASM_BUILD_DIR)/wasm_exec.js"
+	@cp "$(WASM_EXEC_JS)" "$(WASM_BUILD_DIR)/wasm_exec.js"
+	@chmod u+w "$(WASM_BUILD_DIR)/wasm_exec.js"
+	@cp "$(WASM_EXAMPLE_DIR)/index.html" "$(WASM_BUILD_DIR)/index.html"
+	@cp "$(WASM_EXAMPLE_DIR)/main.js" "$(WASM_BUILD_DIR)/main.js"
+	@cp "$(WASM_EXAMPLE_DIR)/pdf_worker.js" "$(WASM_BUILD_DIR)/pdf_worker.js"
+	@echo "WASM demo complete: $(WASM_BUILD_DIR)/index.html"
 
 # Build all cmd/* CLI tools and cmd/*.go ad-hoc tools.
 build-cli:
@@ -801,6 +819,7 @@ help:
 	@echo "  build-pdfinfo  - Build pdfinfo tool into $(TARGET_BUILD_DIR)"
 	@echo "  build-pdftext  - Build pdftext tool into $(TARGET_BUILD_DIR)"
 	@echo "  build-pdfrender - Build pdfrender tool into $(TARGET_BUILD_DIR)"
+	@echo "  build-wasm     - Build browser WASM renderer and demo into $(WASM_BUILD_DIR)"
 	@echo "  build-all      - Build pdf-go, CLI tools, and examples into $(TARGET_BUILD_DIR)"
 	@echo "  build-pure     - Build pdf-go as pure Go"
 	@echo "  build-all-cgo  - Compatibility alias for pure Go build-all"
