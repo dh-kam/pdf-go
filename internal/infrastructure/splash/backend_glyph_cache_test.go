@@ -83,3 +83,13 @@ func TestSplashGlyphCacheHeightPrefersPopplerBBoxProvider(t *testing.T) {
 
 	assert.Equal(t, 83.0, splashGlyphCacheHeight(font, 10, 2))
 }
+
+func TestSplashGlyphCacheHeightForTransformUsesFullMatrix(t *testing.T) {
+	font := &glyphCacheHeightTestFont{
+		bbox:  [4]float64{0, 0, 1000, 10},
+		units: 1000,
+	}
+
+	assert.Equal(t, 3.0, splashGlyphCacheHeight(font, 60, 1))
+	assert.Equal(t, 63.0, splashGlyphCacheHeightForTransform(font, 60, [4]float64{0, 1, -1, 0}))
+}

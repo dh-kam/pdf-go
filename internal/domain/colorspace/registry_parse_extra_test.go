@@ -1,6 +1,7 @@
 package colorspace
 
 import (
+	"image/color"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -125,6 +126,24 @@ func TestRegistry_ParseColorSpace_IndexedAndSimpleCIE(t *testing.T) {
 	devN, err := r.ParseColorSpace(entity.NewArray(entity.NewName("DeviceN")))
 	require.NoError(t, err)
 	assert.Equal(t, "DeviceRGB", devN.Name())
+
+	tint := entity.NewDict()
+	tint.Set(entity.NewName("FunctionType"), entity.NewInteger(2))
+	tint.Set(entity.NewName("Domain"), entity.NewArray(entity.NewReal(0), entity.NewReal(1)))
+	tint.Set(entity.NewName("C0"), entity.NewArray(entity.NewReal(0), entity.NewReal(0), entity.NewReal(0)))
+	tint.Set(entity.NewName("C1"), entity.NewArray(entity.NewReal(1), entity.NewReal(0.5), entity.NewReal(0)))
+	tint.Set(entity.NewName("N"), entity.NewReal(1))
+	devNParsed, err := r.ParseColorSpace(entity.NewArray(
+		entity.NewName("DeviceN"),
+		entity.NewArray(entity.NewName("Spot")),
+		entity.NewName("DeviceRGB"),
+		tint,
+	))
+	require.NoError(t, err)
+	require.IsType(t, &DeviceNColorSpace{}, devNParsed)
+	assert.Equal(t, "DeviceN", devNParsed.Name())
+	assert.Equal(t, 1, devNParsed.GetNumComponents())
+	assert.Equal(t, color.RGBA{R: 255, G: 128, B: 0, A: 255}, devNParsed.ConvertToRGBA([]float64{1}))
 
 	calGray, err := r.ParseColorSpace(entity.NewArray(entity.NewName("CalGray")))
 	require.NoError(t, err)

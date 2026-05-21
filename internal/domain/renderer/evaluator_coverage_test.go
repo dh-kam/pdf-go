@@ -2205,6 +2205,7 @@ type testCanvas struct {
 	lineCap    int
 	lineJoin   int
 	miterLimit float64
+	blendMode  string
 }
 
 func newRecordingCanvas() *testCanvas {
@@ -2291,6 +2292,7 @@ func (c *testCanvas) SetMiterLimit(limit float64)                  { c.miterLimi
 func (c *testCanvas) SetDashPattern(dash []float64, phase float64) {}
 func (c *testCanvas) SetFillPattern(pattern entity.Pattern)        {}
 func (c *testCanvas) SetStrokePattern(pattern entity.Pattern)      {}
+func (c *testCanvas) SetBlendMode(name string)                     { c.blendMode = name }
 func (c *testCanvas) DrawTilingPattern(pattern *entity.TilingPattern, bbox [4]float64) error {
 	return nil
 }
@@ -4030,6 +4032,27 @@ func TestApplyGraphicsStateParametersAllEntries(t *testing.T) {
 	assert.Equal(t, 2.5, e.graphics.lineWidth)
 	assert.Equal(t, 0.8, e.graphics.strokeAlpha)
 	assert.Equal(t, 0.6, e.graphics.fillAlpha)
+}
+
+func TestApplyBlendModeObjectFallsBackToNormal(t *testing.T) {
+	e := NewEvaluator(nil)
+	canvas := newRecordingCanvas()
+	canvas.blendMode = "Multiply"
+	e.SetCanvas(canvas)
+
+	e.applyBlendModeObject(entity.Name("Unsupported"))
+
+	assert.Equal(t, "Normal", canvas.blendMode)
+}
+
+func TestApplyBlendModeObjectUsesFirstSupportedArrayEntry(t *testing.T) {
+	e := NewEvaluator(nil)
+	canvas := newRecordingCanvas()
+	e.SetCanvas(canvas)
+
+	e.applyBlendModeObject(entity.NewArray(entity.Name("Unsupported"), entity.Name("Screen")))
+
+	assert.Equal(t, "Screen", canvas.blendMode)
 }
 
 // Test applyGraphicsStateParameters nil/missing gs

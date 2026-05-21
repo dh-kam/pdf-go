@@ -712,11 +712,11 @@ func (c *splashCanvas) ShowText(text string) error {
 			glyphX = splashGlyphSnapCoord(glyphX)
 			glyphY = splashGlyphSnapCoord(glyphY)
 			if os.Getenv("SPLASH_DEBUG_GT") != "" {
-				phaseXSlot := splashGlyphXPhaseSlot(glyphX, font, fontSize, math.Abs(c.glyphTransform[3]))
-				phaseYSlot := splashGlyphYPhaseSlot(glyphY, font, fontSize, math.Abs(c.glyphTransform[3]))
+				phaseXSlot := splashGlyphXPhaseSlotForTransform(glyphX, font, fontSize, c.glyphTransform)
+				phaseYSlot := splashGlyphYPhaseSlotForTransform(glyphY, font, fontSize, c.glyphTransform)
 				fracX := glyphX - math.Floor(glyphX)
 				fracY := glyphY - math.Floor(glyphY)
-				cacheH := splashGlyphCacheHeight(font, fontSize, math.Abs(c.glyphTransform[3]))
+				cacheH := splashGlyphCacheHeightForTransform(font, fontSize, c.glyphTransform)
 				fmt.Fprintf(os.Stderr, "showGlyph font=%q code=%d glyph=%d x=%.17g y=%.17g glyphXY=(%.17g,%.17g) frac=(%.17g,%.17g) phase=(%.2f,%.2f) cacheH=%.4f userSpace=%t ctm=%v fillPattern=%T matrix=%v\n",
 					font.Name(), charCode, glyph, curX, curY, glyphX, glyphY, fracX, fracY, phaseXSlot, phaseYSlot, cacheH, c.textUserSpace, c.textCTM, c.s.state.fillPattern, c.s.state.matrix)
 			}
@@ -805,8 +805,8 @@ func (c *splashCanvas) fetchGlyphPhased(font entity.Font, glyph uint32, fontSize
 	if useFTFastPath && !axisAligned {
 		scaleY := math.Hypot(gt[2], gt[3])
 		if mpr, ok := unwrapSplashMatrixPhasedRenderer(font); ok && scaleY > 0 {
-			phaseXSlot := splashGlyphXPhaseSlot(phaseX, font, fontSize, scaleY)
-			phaseYSlot := splashGlyphYPhaseSlot(phaseY, font, fontSize, scaleY)
+			phaseXSlot := splashGlyphXPhaseSlotForTransform(phaseX, font, fontSize, gt)
+			phaseYSlot := splashGlyphYPhaseSlotForTransform(phaseY, font, fontSize, gt)
 			phaseXQ := splashGlyphPhaseQ(phaseXSlot)
 			phaseYQ := splashGlyphPhaseQ(phaseYSlot)
 			key := glyphCacheKey{
@@ -852,8 +852,8 @@ func (c *splashCanvas) fetchGlyphPhased(font entity.Font, glyph uint32, fontSize
 		scaleX := math.Abs(gt[0])
 		scaleY := math.Abs(gt[3])
 		if tpr, ok := unwrapSplashTransformedPhasedRenderer(font); ok && scaleX > 0 && scaleY > 0 && os.Getenv("PDF_DEBUG_SPLASH_GLYPH_SKIP_TRANSFORMED") == "" {
-			phaseXSlot := splashGlyphXPhaseSlot(phaseX, font, fontSize, scaleY)
-			phaseYSlot := splashGlyphYPhaseSlot(phaseY, font, fontSize, scaleY)
+			phaseXSlot := splashGlyphXPhaseSlotForTransform(phaseX, font, fontSize, gt)
+			phaseYSlot := splashGlyphYPhaseSlotForTransform(phaseY, font, fontSize, gt)
 			phaseXQ := splashGlyphPhaseQ(phaseXSlot)
 			phaseYQ := splashGlyphPhaseQ(phaseYSlot)
 			key := glyphCacheKey{
@@ -890,8 +890,8 @@ func (c *splashCanvas) fetchGlyphPhased(font entity.Font, glyph uint32, fontSize
 			dpi := int(math.Round(72 * scale))
 			if dpi > 0 {
 				if pr, ok := unwrapSplashPhasedRenderer(font); ok {
-					phaseXSlot := splashGlyphXPhaseSlot(phaseX, font, fontSize, scale)
-					phaseYSlot := splashGlyphYPhaseSlot(phaseY, font, fontSize, scale)
+					phaseXSlot := splashGlyphXPhaseSlotForTransform(phaseX, font, fontSize, gt)
+					phaseYSlot := splashGlyphYPhaseSlotForTransform(phaseY, font, fontSize, gt)
 					phaseXQ := splashGlyphPhaseQ(phaseXSlot)
 					phaseYQ := splashGlyphPhaseQ(phaseYSlot)
 					key := glyphCacheKey{
@@ -1074,7 +1074,15 @@ func unwrapSplashPhasedRenderer(font entity.Font) (entity.BitmapGlyphRendererPha
 // large glyphs (cache height > 50px) skip phasing for cache reuse parity
 // with poppler (canvas/image_canvas_text.go:152).
 func splashGlyphXPhaseSlot(x float64, font entity.Font, fontSize, scaleY float64) float64 {
-	if splashGlyphCacheHeight(font, fontSize, scaleY) > 50 {
+	return splashGlyphXPhaseSlotForCacheHeight(x, splashGlyphCacheHeight(font, fontSize, scaleY))
+}
+
+func splashGlyphXPhaseSlotForTransform(x float64, font entity.Font, fontSize float64, gt [4]float64) float64 {
+	return splashGlyphXPhaseSlotForCacheHeight(x, splashGlyphCacheHeightForTransform(font, fontSize, gt))
+}
+
+func splashGlyphXPhaseSlotForCacheHeight(x, cacheHeight float64) float64 {
+	if cacheHeight > 50 {
 		return 0
 	}
 	frac := x - math.Floor(x)
@@ -1130,6 +1138,13 @@ func splashGlyphYPhaseSlot(y float64, font entity.Font, fontSize, scaleY float64
 	return splashGlyphXPhaseSlot(y, font, fontSize, scaleY)
 }
 
+func splashGlyphYPhaseSlotForTransform(y float64, font entity.Font, fontSize float64, gt [4]float64) float64 {
+	if os.Getenv("PDF_DEBUG_SPLASH_GLYPH_Y_PHASE") == "" {
+		return 0
+	}
+	return splashGlyphXPhaseSlotForTransform(y, font, fontSize, gt)
+}
+
 func splashGlyphSnapCoord(v float64) float64 {
 	raw := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_GLYPH_SNAP_EPS"))
 	if raw == "" {
@@ -1161,27 +1176,50 @@ func splashGlyphCacheHeight(font entity.Font, fontSize, scaleY float64) float64 
 	if font == nil || fontSize <= 0 || scaleY <= 0 {
 		return 0
 	}
-	if _, yMin, _, yMax, units, ok := splashPopplerGlyphCacheBBox(font); ok && units > 0 {
-		scale := fontSize * scaleY / float64(units)
-		y0 := int(yMin * scale)
-		y1 := int(yMax * scale)
-		if y1 < y0 {
-			y0, y1 = y1, y0
+	return splashGlyphCacheHeightForTransform(font, fontSize, [4]float64{1, 0, 0, scaleY})
+}
+
+func splashGlyphCacheHeightForTransform(font entity.Font, fontSize float64, gt [4]float64) float64 {
+	if font == nil || fontSize <= 0 {
+		return 0
+	}
+	xMin, yMin, xMax, yMax, units := splashGlyphCacheBBoxAndUnits(font)
+	if units <= 0 {
+		return 0
+	}
+	scale := fontSize / float64(units)
+	y0 := splashGlyphCacheTransformedY(xMin, yMin, gt, scale)
+	y1 := y0
+	for _, pt := range [][2]float64{
+		{xMin, yMax},
+		{xMax, yMin},
+		{xMax, yMax},
+	} {
+		y := splashGlyphCacheTransformedY(pt[0], pt[1], gt, scale)
+		if y < y0 {
+			y0 = y
 		}
-		return float64(y1-y0) + 3
-	}
-	_, yMin, _, yMax := font.GetBoundingBox()
-	unitsPerEm := float64(font.UnitsPerEm())
-	if unitsPerEm <= 0 {
-		unitsPerEm = 1000
-	}
-	scale := fontSize * scaleY / unitsPerEm
-	y0 := int(yMin * scale)
-	y1 := int(yMax * scale)
-	if y1 < y0 {
-		y0, y1 = y1, y0
+		if y > y1 {
+			y1 = y
+		}
 	}
 	return float64(y1-y0) + 3
+}
+
+func splashGlyphCacheBBoxAndUnits(font entity.Font) (float64, float64, float64, float64, uint16) {
+	if xMin, yMin, xMax, yMax, units, ok := splashPopplerGlyphCacheBBox(font); ok && units > 0 {
+		return xMin, yMin, xMax, yMax, units
+	}
+	xMin, yMin, xMax, yMax := font.GetBoundingBox()
+	unitsPerEm := font.UnitsPerEm()
+	if unitsPerEm == 0 {
+		unitsPerEm = 1000
+	}
+	return xMin, yMin, xMax, yMax, unitsPerEm
+}
+
+func splashGlyphCacheTransformedY(x, y float64, gt [4]float64, scale float64) int {
+	return int((gt[1]*x + gt[3]*y) * scale)
 }
 
 type splashPopplerGlyphCacheBBoxProvider interface {
@@ -2004,6 +2042,47 @@ func (c *splashCanvas) SetStrokePattern(pattern entity.Pattern) {
 				}
 			}
 		}
+	}
+}
+
+// SetBlendMode maps a PDF blend mode name onto the Splash blend function.
+func (c *splashCanvas) SetBlendMode(name string) {
+	if c == nil || c.s == nil {
+		return
+	}
+	switch strings.TrimPrefix(strings.TrimSpace(name), "/") {
+	case "", "Normal", "Compatible":
+		c.s.SetBlendFunc(nil)
+	case "Multiply":
+		c.s.SetBlendFunc(BlendMultiply)
+	case "Screen":
+		c.s.SetBlendFunc(BlendScreen)
+	case "Overlay":
+		c.s.SetBlendFunc(BlendOverlay)
+	case "Darken":
+		c.s.SetBlendFunc(BlendDarken)
+	case "Lighten":
+		c.s.SetBlendFunc(BlendLighten)
+	case "ColorDodge":
+		c.s.SetBlendFunc(BlendColorDodge)
+	case "ColorBurn":
+		c.s.SetBlendFunc(BlendColorBurn)
+	case "HardLight":
+		c.s.SetBlendFunc(BlendHardLight)
+	case "SoftLight":
+		c.s.SetBlendFunc(BlendSoftLight)
+	case "Difference":
+		c.s.SetBlendFunc(BlendDifference)
+	case "Exclusion":
+		c.s.SetBlendFunc(BlendExclusion)
+	case "Hue":
+		c.s.SetBlendFunc(BlendHue)
+	case "Saturation":
+		c.s.SetBlendFunc(BlendSaturation)
+	case "Color":
+		c.s.SetBlendFunc(BlendColor)
+	case "Luminosity":
+		c.s.SetBlendFunc(BlendLuminosity)
 	}
 }
 

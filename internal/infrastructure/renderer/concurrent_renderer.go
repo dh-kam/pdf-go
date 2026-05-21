@@ -425,7 +425,7 @@ func (r *ConcurrentRenderer) RenderToCanvas(ctx context.Context, page *entity.Pa
 				0,
 				scaleY,
 				-xMin * scaleX,
-				0, // Y transform is handled in DrawText (baseCanvasY = height - y)
+				-yMin * scaleY, // Y flip is handled by the Splash canvas; subtract CropBox lower-left here.
 			}
 			setPageYOrigin((yMax - yMin) * scaleY)
 		}

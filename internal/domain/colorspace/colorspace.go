@@ -493,6 +493,61 @@ func (cs *SeparationColorSpace) GetNumComponents() int {
 	return 1
 }
 
+// DeviceNColorSpace represents the DeviceN color space.
+type DeviceNColorSpace struct {
+	alternate    ColorSpace
+	tintFunction entity.Function
+	names        []string
+}
+
+// NewDeviceNColorSpace creates a new DeviceN color space.
+func NewDeviceNColorSpace(names []string, alternate ColorSpace, tintFunction entity.Function) *DeviceNColorSpace {
+	return &DeviceNColorSpace{
+		names:        append([]string(nil), names...),
+		alternate:    alternate,
+		tintFunction: tintFunction,
+	}
+}
+
+// Type returns ColorSpaceDeviceN.
+func (cs *DeviceNColorSpace) Type() ColorSpaceType {
+	return ColorSpaceDeviceN
+}
+
+// Name returns "DeviceN".
+func (cs *DeviceNColorSpace) Name() string {
+	return "DeviceN"
+}
+
+// ConvertToRGBA converts DeviceN tint values through the tint transform and alternate space.
+func (cs *DeviceNColorSpace) ConvertToRGBA(values []float64) color.RGBA {
+	if cs == nil || cs.alternate == nil {
+		return color.RGBA{0, 0, 0, 255}
+	}
+	if cs.tintFunction == nil {
+		return cs.alternate.ConvertToRGBA(nil)
+	}
+	in := make([]float64, len(cs.names))
+	for i := range in {
+		if i < len(values) {
+			in[i] = values[i]
+		}
+	}
+	colorValues, err := cs.tintFunction.Evaluate(in)
+	if err != nil || colorValues == nil {
+		return cs.alternate.ConvertToRGBA(nil)
+	}
+	return cs.alternate.ConvertToRGBA(colorValues)
+}
+
+// GetNumComponents returns the number of DeviceN colorants.
+func (cs *DeviceNColorSpace) GetNumComponents() int {
+	if cs == nil || len(cs.names) == 0 {
+		return 0
+	}
+	return len(cs.names)
+}
+
 // Registry manages color spaces for PDF rendering.
 type Registry struct {
 	colorSpaces map[string]ColorSpace
@@ -694,9 +749,34 @@ func (r *Registry) parseSeparationColorSpace(arr *entity.Array) (ColorSpace, err
 
 // parseDeviceNColorSpace parses a DeviceN color space.
 func (r *Registry) parseDeviceNColorSpace(arr *entity.Array) (ColorSpace, error) {
-	// DeviceN is similar to Separation but with multiple colorants
-	// For simplicity, treat it as RGB for now
-	return NewDeviceRGB(), nil
+	if arr.Len() < 4 {
+		return NewDeviceRGB(), nil
+	}
+
+	namesObj, ok := arr.Get(1).(*entity.Array)
+	if !ok {
+		return nil, fmt.Errorf("DeviceN names must be an array")
+	}
+	names := make([]string, 0, namesObj.Len())
+	for i := 0; i < namesObj.Len(); i++ {
+		name, ok := namesObj.Get(i).(entity.Name)
+		if !ok {
+			return nil, fmt.Errorf("DeviceN colorant name must be a name object")
+		}
+		names = append(names, name.Value())
+	}
+
+	alternate, err := r.ParseColorSpace(arr.Get(2))
+	if err != nil {
+		return nil, fmt.Errorf("invalid DeviceN alternate color space: %w", err)
+	}
+
+	tintFunction, err := parseFunctionFromObject(arr.Get(3))
+	if err != nil {
+		return nil, fmt.Errorf("invalid DeviceN tint function: %w", err)
+	}
+
+	return NewDeviceNColorSpace(names, alternate, tintFunction), nil
 }
 
 // parseCalGrayColorSpace parses a CalGray color space.

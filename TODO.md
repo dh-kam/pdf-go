@@ -4,6 +4,15 @@ Korean localization: [TODO.ko.md](TODO.ko.md).
 
 ## Poppler Splash Exact100 Follow-up
 
+- [x] Reconfirm the restored local `test/2nd` PDF corpus is present for full exact100 runs while keeping it untracked.
+- [x] Revalidate the tracked `test/testdata/compare/pdfs` corpus with current no-CGo Splash defaults and Poppler `-cropbox`: `286/286` exact100, `0` errors, and `100.00000000%` pixel exact in `tmp/compare_pdfs_exact_splash_current_20260522_002020`.
+- [x] Harden `cmd/pdfcompare` output safety so repository roots, scan roots, and their ancestors cannot be deleted as output directories.
+- [x] Align `cmd/pdfcompare` metadata and execution by passing `pdftoppm -cropbox` whenever the HTML report says `poppler=-cropbox`.
+- [x] Match Poppler's glyph phase cache gate with transformed font bbox height for rotated/sheared glyphs.
+- [x] Reset unsupported ExtGState `/BM` values to `Normal` instead of preserving a previous blend mode.
+- [x] Validate the CropBox lower-left transform correction on the full `test/2nd` corpus: `509/1422` exact100, `392` improved pages, and `0` regressions versus `2nd_exact100_splash_cid_width_link_20260521_213859`.
+- [ ] Rework Form XObject and page transparency group parity before enabling it by default. The diagnostic gates `GO_PDF_ENABLE_FORM_TRANSPARENCY_GROUP=1` and `GO_PDF_ENABLE_PAGE_TRANSPARENCY_GROUP=1` are intentionally off because O2 regressed from `91.87095741` to `78.39788809` average exact when Form groups were enabled.
+- [ ] Keep djpeg-go DCTDecode disabled by default for the current 2nd-corpus path. The JPEG A/B subset regressed from `27/380` to `24/380` exact100 with `-pure-go-jpeg`, despite a small improvement on `tourism_map.pdf` page 2.
 - [ ] Revisit the `GeoTopo p39` 22px stroke AA overlap residual against Poppler `Splash::makeStrokePath()` and `Splash::pipeRunAARGB8()`.
 - [ ] Reclassify the `GeoTopo p55` pattern, fill, and stroke residuals as segment stroke and tiling-pattern issues rather than image or soft-mask issues.
 - [ ] Review `GeoTopo p55`, `p23`, `p44`, and `p97` together to narrow the Poppler `strokeNarrow` and `strokeWide` branch conditions.

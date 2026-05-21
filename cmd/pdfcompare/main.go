@@ -37,6 +37,7 @@ type config struct {
 	timeout              time.Duration
 	tileSize             int
 	skipCompressedCopies bool
+	pureGoJPEG           bool
 }
 
 const defaultPDFRenderBuildTags = ""
@@ -100,6 +101,7 @@ func parseFlags() config {
 	flag.IntVar(&cfg.workers, "workers", 4, "pdfrender workers")
 	flag.IntVar(&cfg.tileSize, "tile-size", 48, "diff marker tile size in pixels")
 	flag.BoolVar(&cfg.skipCompressedCopies, "skip-compressed-duplicates", false, "skip GeoTopo-komprimiert duplicate fixtures")
+	flag.BoolVar(&cfg.pureGoJPEG, "pure-go-jpeg", false, "run ours with pure-Go JPEG DCTDecode path by enabling djpeg-go and disabling ImageMagick JPEG fallback")
 	flag.Parse()
 	cfg.timeout = time.Duration(*timeoutSec) * time.Second
 	return cfg
@@ -114,6 +116,9 @@ func run(cfg config) error {
 	cfg.outDir, err = filepath.Abs(cfg.outDir)
 	if err != nil {
 		return fmt.Errorf("resolve output dir: %w", err)
+	}
+	if err := validateOutputDirectory(cfg.repoRoot, cfg.outDir, cfg.scanRoot); err != nil {
+		return err
 	}
 	if cfg.tileSize <= 0 {
 		cfg.tileSize = 48
@@ -145,7 +150,7 @@ func run(cfg config) error {
 	if len(jobs) == 0 {
 		return fmt.Errorf("no PDF files found under %q", cfg.scanRoot)
 	}
-	fmt.Printf("Comparing %d PDF files at %d DPI with backend=%s\n", len(jobs), cfg.dpi, cfg.backend)
+	fmt.Printf("Comparing %d PDF files at %d DPI with backend=%s pure-go-jpeg=%t\n", len(jobs), cfg.dpi, cfg.backend, cfg.pureGoJPEG)
 
 	rows := make([]pageRow, 0)
 	for _, job := range jobs {
@@ -191,6 +196,88 @@ func buildPDFRender(cfg config) error {
 		return fmt.Errorf("build pdfrender: %w\n%s", err, stderr.String())
 	}
 	return nil
+}
+
+func validateOutputDirectory(repoRoot, outDir, scanRoot string) error {
+	repoRoot = filepath.Clean(repoRoot)
+	outDir = filepath.Clean(outDir)
+	if isFilesystemRoot(outDir) {
+		return fmt.Errorf("refusing to use filesystem root as output directory: %q", outDir)
+	}
+	if anyPathContainsOrEqual(pathAliases(outDir), pathAliases(repoRoot)) {
+		return fmt.Errorf("refusing to use repository root or ancestor as output directory: %q contains %q", outDir, repoRoot)
+	}
+	for _, root := range resolvedScanRoots(repoRoot, scanRoot) {
+		if anyPathContainsOrEqual(pathAliases(outDir), pathAliases(root)) {
+			return fmt.Errorf("refusing to use scan root or ancestor as output directory: %q contains scan root %q", outDir, root)
+		}
+	}
+	return nil
+}
+
+func isFilesystemRoot(path string) bool {
+	clean := filepath.Clean(path)
+	return filepath.IsAbs(clean) && filepath.Dir(clean) == clean
+}
+
+func resolvedScanRoots(repoRoot, scanRoot string) []string {
+	roots := strings.Split(scanRoot, ",")
+	out := make([]string, 0, len(roots))
+	for _, root := range roots {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+		if !filepath.IsAbs(root) {
+			root = filepath.Join(repoRoot, root)
+		}
+		out = append(out, filepath.Clean(root))
+	}
+	return out
+}
+
+func pathContainsOrEqual(parent, child string) bool {
+	rel, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel))
+}
+
+func anyPathContainsOrEqual(parents, children []string) bool {
+	for _, parent := range parents {
+		for _, child := range children {
+			if pathContainsOrEqual(parent, child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func pathAliases(path string) []string {
+	clean := filepath.Clean(path)
+	aliases := []string{clean}
+	if resolved, ok := evalExistingPathPrefix(clean); ok && resolved != clean {
+		aliases = append(aliases, resolved)
+	}
+	return aliases
+}
+
+func evalExistingPathPrefix(path string) (string, bool) {
+	clean := filepath.Clean(path)
+	suffix := []string{}
+	for cur := clean; ; cur = filepath.Dir(cur) {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			parts := append([]string{resolved}, suffix...)
+			return filepath.Clean(filepath.Join(parts...)), true
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "", false
+		}
+		suffix = append([]string{filepath.Base(cur)}, suffix...)
+	}
 }
 
 func scanPDFs(cfg config) ([]pdfJob, error) {
@@ -262,7 +349,7 @@ func shouldSkipDir(name string, path string, cfg config) bool {
 		return true
 	}
 	abs, err := filepath.Abs(path)
-	if err == nil && strings.HasPrefix(abs, cfg.outDir) {
+	if err == nil && pathContainsOrEqual(cfg.outDir, abs) {
 		return true
 	}
 	return false
@@ -334,7 +421,7 @@ func compareDocument(cfg config, job pdfJob) []pageRow {
 }
 
 func renderPoppler(cfg config, pdfPath, outDir, logDir, password string) string {
-	args := []string{"-r", strconv.Itoa(cfg.dpi), "-png", "-aa", "yes", "-aaVector", "yes"}
+	args := []string{"-r", strconv.Itoa(cfg.dpi), "-png", "-aa", "yes", "-aaVector", "yes", "-cropbox"}
 	if password != "" {
 		args = append(args, "-upw", password)
 	}
@@ -370,6 +457,9 @@ func runLogged(cfg config, logDir, name, command string, args ...string) string 
 	cmd.Dir = cfg.repoRoot
 	if name == "ours" {
 		cmd.Env = append(os.Environ(), "PDF_FREETYPE_GO=1")
+		if cfg.pureGoJPEG {
+			cmd.Env = append(cmd.Env, "GO_PDF_ENABLE_DJPEG_GO=1", "GO_PDF_DISABLE_IMAGEMAGICK_JPEG=1")
+		}
 	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -684,7 +774,7 @@ a{color:#7a3b00;text-decoration:none}a:hover{text-decoration:underline}
 	writeCard(&b, "Overall Exact", fmt.Sprintf("%.6f%%", sum.OverallPercent))
 	writeCard(&b, "Error Rows", formatInt(int64(sum.ErrorRows)))
 	b.WriteString(`</div><div class="meta">`)
-	b.WriteString("scan-root=" + html.EscapeString(cfg.scanRoot) + " · dpi=" + strconv.Itoa(cfg.dpi) + " · backend=" + html.EscapeString(cfg.backend))
+	b.WriteString("scan-root=" + html.EscapeString(cfg.scanRoot) + " · dpi=" + strconv.Itoa(cfg.dpi) + " · backend=" + html.EscapeString(cfg.backend) + " · pure-go-jpeg=" + strconv.FormatBool(cfg.pureGoJPEG) + " · poppler=-cropbox")
 	b.WriteString(`</div></section>`)
 	b.WriteString(`<table><thead><tr><th>PDF / Page</th><th>Stats</th><th>Poppler</th><th>Ours</th><th>XOR + Red Circles</th></tr></thead><tbody>`)
 	for _, row := range rows {

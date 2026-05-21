@@ -3399,6 +3399,9 @@ func (e *Evaluator) applyGraphicsStateParameters(op Operator) error {
 			e.graphics.fillAlpha = clamp(value, 0, 1)
 		}
 	}
+	if blendMode := gsDict.Get(entity.Name("BM")); blendMode != nil {
+		e.applyBlendModeObject(blendMode)
+	}
 	if transfer := gsDict.Get(entity.Name("TR2")); transfer != nil {
 		e.applyTransferObject(transfer)
 	} else if transfer := gsDict.Get(entity.Name("TR")); transfer != nil {
@@ -3406,6 +3409,80 @@ func (e *Evaluator) applyGraphicsStateParameters(op Operator) error {
 	}
 
 	return nil
+}
+
+type blendModeSetter interface {
+	SetBlendMode(name string)
+}
+
+func (e *Evaluator) applyBlendModeObject(obj entity.Object) {
+	name, ok := e.firstSupportedBlendModeName(obj, 0)
+	if !ok {
+		name = "Normal"
+	}
+	if setter, ok := e.canvas.(blendModeSetter); ok {
+		setter.SetBlendMode(name)
+	}
+}
+
+func (e *Evaluator) firstSupportedBlendModeName(obj entity.Object, depth int) (string, bool) {
+	if obj == nil || depth > 8 {
+		return "", false
+	}
+	switch v := obj.(type) {
+	case entity.Name:
+		return supportedBlendModeName(v.Value())
+	case entity.Ref:
+		if e.xref == nil {
+			return "", false
+		}
+		resolved, err := e.xref.Fetch(v)
+		if err != nil {
+			return "", false
+		}
+		return e.firstSupportedBlendModeName(resolved, depth+1)
+	case *entity.Array:
+		for i := 0; i < v.Len(); i++ {
+			if name, ok := e.firstSupportedBlendModeName(v.Get(i), depth+1); ok {
+				return name, true
+			}
+		}
+	}
+	return "", false
+}
+
+func supportedBlendModeName(name string) (string, bool) {
+	normalized := normalizeBlendModeName(name)
+	switch normalized {
+	case "Compatible":
+		return "Normal", true
+	case "Normal", "Multiply", "Screen", "Overlay", "Darken", "Lighten",
+		"ColorDodge", "ColorBurn", "HardLight", "SoftLight", "Difference", "Exclusion",
+		"Hue", "Saturation", "Color", "Luminosity":
+		return normalized, true
+	default:
+		return "", false
+	}
+}
+
+func normalizeBlendModeName(name string) string {
+	name = strings.TrimPrefix(strings.TrimSpace(name), "/")
+	if name == "" {
+		return ""
+	}
+	lower := strings.ToLower(name)
+	switch lower {
+	case "colordodge":
+		return "ColorDodge"
+	case "colorburn":
+		return "ColorBurn"
+	case "hardlight":
+		return "HardLight"
+	case "softlight":
+		return "SoftLight"
+	default:
+		return strings.ToUpper(lower[:1]) + lower[1:]
+	}
 }
 
 func (e *Evaluator) applyTransferObject(obj entity.Object) {
