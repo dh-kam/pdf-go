@@ -188,6 +188,7 @@ Korean localization: [TODO.ko.md](TODO.ko.md).
 - [x] Consolidate GitHub Actions no-CGo validation and build workflow.
 - [x] Add the manually triggered release-train tag bump workflow.
 - [x] Add tag-push release artifact build and GitHub Release workflow.
-- [ ] Tag release.
-- [ ] Create GitHub release.
-- [ ] Publish Go module.
+- [x] Tag release `v0.9.0-poppler24-02-0-202606.1`.
+- [x] Create GitHub release `v0.9.0-poppler24-02-0-202606.1`.
+- [x] Publish Go module `github.com/dh-kam/pdf-go@v0.9.0-poppler24-02-0-202606.1`.
+- [x] Publish the WebAssembly demo to GitHub Pages.
