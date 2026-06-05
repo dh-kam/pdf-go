@@ -158,5 +158,5 @@ func testPDFPath(t *testing.T) string {
 	t.Helper()
 	_, filename, _, ok := runtime.Caller(0)
 	require.True(t, ok)
-	return filepath.Join(filepath.Dir(filename), "..", "..", "test", "testdata", "sample-files", "002-trivial-libre-office-writer", "002-trivial-libre-office-writer.pdf")
+	return filepath.Join(filepath.Dir(filename), "..", "..", "test", "testdata", "compare", "pdfs", "002-trivial-libre-office-writer.pdf")
 }
