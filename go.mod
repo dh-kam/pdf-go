@@ -1,6 +1,6 @@
 module github.com/dh-kam/pdf-go
 
-go 1.25.10
+go 1.25.11
 
 require (
 	github.com/ajroetker/go-jpeg2000 v0.0.1

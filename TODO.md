@@ -132,6 +132,7 @@ Korean localization: [TODO.ko.md](TODO.ko.md).
 - [x] Remove feature-disabling build tags from e2e child `go run` / `go build` commands.
 - [x] Add a no-CGo release gate that builds and tests with `CGO_ENABLED=0`.
 - [x] Force Makefile no-CGo validation targets to run with `CGO_ENABLED=0` and keep race checks as a separate CGo-required gate.
+- [x] Pin the release Go toolchain to `1.25.11` so GitHub Actions `govulncheck` uses the fixed `crypto/x509` standard library.
 - [x] Keep release-safe CLI and `pkg/pdf` tests on tracked fixture PDFs so clean release worktrees do not depend on untracked `sample-files` copies.
 - [x] Exclude `cmd/doc.go` from ad-hoc CLI file builds so release builds do not try to build package documentation as a binary.
 - [x] Keep full-corpus Poppler exact100 HTML generation available with `-timeout-sec 0` for long-running verification.
