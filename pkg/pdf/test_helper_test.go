@@ -12,8 +12,8 @@ func samplePDFPath(t *testing.T) string {
 		"..",
 		"test",
 		"testdata",
-		"sample-files",
-		"001-trivial",
+		"compare",
+		"pdfs",
 		"minimal-document.pdf",
 	)
 }
