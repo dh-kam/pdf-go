@@ -46,6 +46,8 @@ type RadialShader struct {
 	dxAxis, dyAxis, dr float64
 	a                  float64
 	degenerate         bool
+
+	skipEdgeCorrection bool
 }
 
 // NewRadialShader builds a RadialShader between two circles (Splash.cc:6240).
@@ -168,13 +170,29 @@ func (s *RadialShader) TestPosition(x, y int) bool {
 	}
 	t, ok := s.computeT(fx, fy)
 	if !ok {
+		if shouldTraceRadialPixel(x, y) {
+			fmt.Fprintf(os.Stderr, "SPLASH_RADIAL_TEST_TRACE x=%d y=%d fx=%.12f fy=%.12f ok=false\n", x, y, fx, fy)
+		}
 		return false
 	}
 	funcT := s.T0 + t*(s.T1-s.T0)
+	inside := false
 	if s.T0 < s.T1 {
-		return funcT > s.T0 && funcT < s.T1
+		inside = funcT > s.T0 && funcT < s.T1
+	} else {
+		inside = funcT > s.T1 && funcT < s.T0
 	}
-	return funcT > s.T1 && funcT < s.T0
+	if shouldTraceRadialPixel(x, y) {
+		fmt.Fprintf(os.Stderr, "SPLASH_RADIAL_TEST_TRACE x=%d y=%d fx=%.12f fy=%.12f s=%.12f t=%.12f inside=%t\n",
+			x, y, fx, fy, t, funcT, inside)
+	}
+	return inside
+}
+
+// SkipShadedFillEdgeCorrection reports whether shadedFill should leave AA edge
+// coverage untouched for this shader.
+func (s *RadialShader) SkipShadedFillEdgeCorrection() bool {
+	return s != nil && s.skipEdgeCorrection
 }
 
 // IsStatic reports whether the pattern is constant — radial varies (SplashPattern.h:54).

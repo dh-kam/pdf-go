@@ -6,7 +6,7 @@ func pipeRunSimpleMono8(p *pipe) {
 	src := p.cSrc
 	if p.pattern != nil {
 		var c Color
-		if !p.pattern.GetColor(p.x, p.y, &c) {
+		if !p.pattern.GetColor(pipePatternX(p), p.y, &c) {
 			// Splash.cc:313-315: pattern hole — advance cursor and skip pixel.
 			if p.aDestRow != nil {
 				p.aDestOff++
@@ -25,7 +25,7 @@ func pipeRunSimpleMono8(p *pipe) {
 		}
 		src = c
 	}
-	p.destRow[p.destOff] = src[0]
+	p.destRow[p.destOff] = p.s.state.grayTransfer[src[0]]
 	if p.aDestRow != nil {
 		p.aDestRow[p.aDestOff] = 255
 		p.aDestOff++
@@ -40,7 +40,7 @@ func pipeRunAAMono8(p *pipe) {
 	src := p.cSrc
 	if p.pattern != nil {
 		var c Color
-		if !p.pattern.GetColor(p.x, p.y, &c) {
+		if !p.pattern.GetColor(pipePatternX(p), p.y, &c) {
 			// Splash.cc:313-315: pattern hole — advance cursor and skip pixel.
 			if p.aDestRow != nil {
 				p.aDestOff++
@@ -65,13 +65,12 @@ func pipeRunAAMono8(p *pipe) {
 		aDest = p.aDestRow[p.aDestOff]
 	}
 	aSrc := pipeSourceAlpha(p)
-	aResult := aSrc + aDest - byte(Div255(int(aSrc)*int(aDest)))
-	alpha2 := aResult
+	aResult, alpha2, _ := pipeResultAlphas(p, aSrc, aDest)
 	var c0 byte
 	if alpha2 == 0 {
 		c0 = 0
 	} else {
-		c0 = byte((int(alpha2-aSrc)*int(dest) + int(aSrc)*int(src[0])) / int(alpha2))
+		c0 = p.s.state.grayTransfer[byte(((alpha2-int(aSrc))*int(dest)+int(aSrc)*int(src[0]))/alpha2)]
 	}
 	p.destRow[p.destOff] = c0
 	if p.aDestRow != nil {

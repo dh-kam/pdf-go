@@ -157,15 +157,20 @@ func (x *Table) findStartXRef() (uint64, error) {
 		return 0, fmt.Errorf("startxref not found")
 	}
 
-	// Read the offset after "startxref"
-	reader := bufio.NewReader(bytes.NewReader(data[startFrom+idx:]))
-	if _, err := reader.ReadBytes('\n'); err != nil {
-		return 0, err
+	offsetStart := startFrom + idx + len("startxref")
+	for offsetStart < len(data) && isWhitespace(data[offsetStart]) {
+		offsetStart++
+	}
+	if offsetStart >= len(data) || !isDigitByte(data[offsetStart]) {
+		return 0, fmt.Errorf("invalid startxref offset")
 	}
 
-	// Read offset value
-	var offset uint64
-	_, err := fmt.Fscanf(reader, "%d", &offset)
+	offsetEnd := offsetStart
+	for offsetEnd < len(data) && isDigitByte(data[offsetEnd]) {
+		offsetEnd++
+	}
+
+	offset, err := strconv.ParseUint(string(data[offsetStart:offsetEnd]), 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("invalid startxref offset: %w", err)
 	}
@@ -1873,6 +1878,9 @@ func (x *Table) parseObjectStream(streamNum uint32, index uint16, ref entity.Ref
 	// Find the object at the given index
 	if int(index) >= len(offsets) {
 		return nil, fmt.Errorf("object index %d out of range", index)
+	}
+	if objNumbers[int(index)] != int64(ref.Num()) {
+		return nil, fmt.Errorf("object stream index %d contains object %d, expected %d", index, objNumbers[int(index)], ref.Num())
 	}
 
 	objStart := firstOffset + offsets[int(index)]

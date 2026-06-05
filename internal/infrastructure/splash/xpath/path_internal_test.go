@@ -271,6 +271,48 @@ func TestPathOffsetZeroIsIdentity(t *testing.T) {
 	}
 }
 
+func TestPathIntegralSubpathYMinNudgeClonesClosedSubpathOnly(t *testing.T) {
+	p := NewPath()
+	_ = p.MoveTo(1, 12)
+	_ = p.LineTo(5, 10)
+	_ = p.LineTo(9, 10)
+	_ = p.Close(false)
+	_ = p.MoveTo(20, 10)
+	_ = p.LineTo(21, 10)
+
+	got := p.WithIntegralSubpathYMinNudgedDown()
+	if got == p {
+		t.Fatal("WithIntegralSubpathYMinNudgedDown returned original path for a closed integral y-min")
+	}
+	wantY := math.Nextafter(10, math.Inf(-1))
+	for _, idx := range []int{1, 2} {
+		if got.pts[idx].Y != wantY {
+			t.Fatalf("closed subpath point %d Y = %.17g, want %.17g", idx, got.pts[idx].Y, wantY)
+		}
+		if p.pts[idx].Y != 10 {
+			t.Fatalf("original path point %d was mutated to %.17g", idx, p.pts[idx].Y)
+		}
+	}
+	if got.pts[0].Y != 12 {
+		t.Fatalf("non-boundary point Y = %.17g, want 12", got.pts[0].Y)
+	}
+	if got.pts[4].Y != 10 || got.pts[5].Y != 10 {
+		t.Fatalf("open subpath was nudged: %.17g %.17g", got.pts[4].Y, got.pts[5].Y)
+	}
+}
+
+func TestPathIntegralSubpathYMinNudgeSkipsNonIntegralYMin(t *testing.T) {
+	p := NewPath()
+	_ = p.MoveTo(0, 10.25)
+	_ = p.LineTo(1, 10.25)
+	_ = p.LineTo(1, 11)
+	_ = p.Close(false)
+
+	if got := p.WithIntegralSubpathYMinNudgedDown(); got != p {
+		t.Fatal("WithIntegralSubpathYMinNudgedDown cloned a non-integral y-min path")
+	}
+}
+
 // TestPathAddPath concatenates and re-bases curSubpath (SplashPath.cc:113).
 func TestPathAddPath(t *testing.T) {
 	a := NewPath()

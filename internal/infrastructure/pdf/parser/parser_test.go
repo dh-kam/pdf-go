@@ -143,6 +143,20 @@ func TestParser_ParseObject_DictAndArray(t *testing.T) {
 	assert.Equal(t, int64(3), children.Items()[2].(*entity.Integer).Value())
 }
 
+func TestParser_ParseArrayReferenceAfterInteger(t *testing.T) {
+	data := []byte("[/Indexed /DeviceRGB 32 2080 0 R]")
+	p := NewParser(NewLexerBytes(data), nil)
+
+	obj, err := p.ParseObject()
+	require.NoError(t, err)
+
+	arr, ok := obj.(*entity.Array)
+	require.True(t, ok)
+	require.Len(t, arr.Items(), 4)
+	assert.Equal(t, int64(32), arr.Get(2).(*entity.Integer).Value())
+	assert.Equal(t, entity.NewRef(2080, 0), arr.Get(3))
+}
+
 func TestParser_ParseObject_MalformedStructure(t *testing.T) {
 	t.Run("invalid_integer", func(t *testing.T) {
 		_, err := parseInteger("12x")

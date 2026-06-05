@@ -57,15 +57,17 @@ const (
 // Tiling patterns define a small content stream (the pattern cell) that is
 // repeated to fill an area, similar to wallpaper.
 type TilingPattern struct {
-	resources  *Dict
-	name       string
-	content    []byte
-	matrix     [6]float64
-	bbox       [4]float64
-	paintType  int
-	tilingType TilingType
-	xStep      float64
-	yStep      float64
+	resources     *Dict
+	resourceStack []*Dict
+	xref          XRef
+	name          string
+	content       []byte
+	matrix        [6]float64
+	bbox          [4]float64
+	paintType     int
+	tilingType    TilingType
+	xStep         float64
+	yStep         float64
 }
 
 // NewTilingPattern creates a new TilingPattern.
@@ -157,6 +159,26 @@ func (p *TilingPattern) GetResources() *Dict {
 // SetResources sets the resource dictionary for the pattern cell.
 func (p *TilingPattern) SetResources(resources *Dict) {
 	p.resources = resources
+}
+
+// GetResourceStack returns the resource lookup chain for pattern-cell replay.
+func (p *TilingPattern) GetResourceStack() []*Dict {
+	return append([]*Dict(nil), p.resourceStack...)
+}
+
+// SetResourceStack sets the resource lookup chain for pattern-cell replay.
+func (p *TilingPattern) SetResourceStack(resources []*Dict) {
+	p.resourceStack = append([]*Dict(nil), resources...)
+}
+
+// XRef returns the cross-reference table used to resolve pattern-cell resources.
+func (p *TilingPattern) XRef() XRef {
+	return p.xref
+}
+
+// SetXRef sets the cross-reference table used to resolve pattern-cell resources.
+func (p *TilingPattern) SetXRef(xref XRef) {
+	p.xref = xref
 }
 
 // GetContent returns the content stream for drawing the pattern cell.
@@ -272,6 +294,7 @@ func (t ShadingType) String() string {
 // Shadings define color gradients for filling areas.
 type Shading struct {
 	background   color.Color
+	colorMapper  ShadingColorMapper
 	colorSpace   string
 	decode       []float64
 	vertices     []Vertex
@@ -288,6 +311,14 @@ type Shading struct {
 	shadingType  ShadingType
 	extend       [2]bool
 	antiAlias    bool
+}
+
+// ShadingColorMapper converts shading color tuples to device RGB.
+type ShadingColorMapper interface {
+	// ConvertToRGBA converts color values to RGBA.
+	ConvertToRGBA(values []float64) color.RGBA
+	// GetNumComponents returns the number of expected input components.
+	GetNumComponents() int
 }
 
 // NewShading creates a new Shading.
@@ -318,6 +349,22 @@ func (s *Shading) GetColorSpace() string {
 // SetColorSpace sets the color space name.
 func (s *Shading) SetColorSpace(colorSpace string) {
 	s.colorSpace = colorSpace
+}
+
+// GetColorMapper returns the parsed shading color converter.
+func (s *Shading) GetColorMapper() ShadingColorMapper {
+	if s == nil {
+		return nil
+	}
+	return s.colorMapper
+}
+
+// SetColorMapper sets the parsed shading color converter.
+func (s *Shading) SetColorMapper(mapper ShadingColorMapper) {
+	if s == nil {
+		return
+	}
+	s.colorMapper = mapper
 }
 
 // GetBackground returns the background color.
@@ -596,6 +643,10 @@ func (f *SampledFunction) Evaluate(inputs []float64) ([]float64, error) {
 			for dim := 0; dim < len(f.Size); dim++ {
 				idx := lowIndices[dim]
 				useHigh := (corner>>dim)&1 == 1
+				if useHigh && highIndices[dim] == lowIndices[dim] {
+					weight = 0
+					break
+				}
 				if useHigh {
 					idx = highIndices[dim]
 				}

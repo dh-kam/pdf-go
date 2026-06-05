@@ -73,7 +73,7 @@ func TestStandardFontHelveticaBBoxTriggersPopplerLargeGlyphPhaseRule(t *testing.
 }
 
 func TestReadURWAFMFontBBoxFallsBackToPopplerBuiltinBBox(t *testing.T) {
-	bbox := readURWAFMFontBBox("missing.afm", [4]float64{-166, -225, 1000, 931})
+	bbox := readURWAFMFontBBox("missing.afm", [4]float64{-166, -225, 1000, 931}, standardWidthScale)
 
 	assert.InDelta(t, -166*standardWidthScale, bbox.XMin, 1e-9)
 	assert.InDelta(t, -225*standardWidthScale, bbox.YMin, 1e-9)
@@ -120,4 +120,37 @@ func TestStandardFontGlyphIDByNameAndUnicodeRender(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, path)
 	assert.NotEmpty(t, path.Commands)
+}
+
+func TestStandardFontZapfDingbatsUsesURWEncodingAndRasterData(t *testing.T) {
+	if len(readURWAFMGlyphNames("D050000L.afm")) == 0 {
+		t.Skip("URW Base35 AFM fixtures are not installed")
+	}
+
+	font, ok := GetFont("ZapfDingbats")
+	require.True(t, ok)
+
+	glyph, err := font.CharCodeToGlyph(uint32('n'))
+	require.NoError(t, err)
+	assert.Equal(t, "a73", font.GlyphName(glyph))
+
+	namedGlyph, found := font.GlyphIDByName("a73")
+	require.True(t, found)
+	assert.Equal(t, glyph, namedGlyph)
+
+	if len(readURWBase35Font("D050000L.otf")) == 0 {
+		t.Skip("URW Base35 OTF fixtures are not installed")
+	}
+	assert.True(t, font.SourceExactGlyphBlend())
+	assert.Equal(t, uint16(1000), font.UnitsPerEm())
+
+	glyphWidth, err := font.GetGlyphWidth(glyph)
+	require.NoError(t, err)
+	assert.InDelta(t, 761.0, glyphWidth, 1e-9)
+
+	bitmap, bitmapWidth, height, _, _, err := font.RenderGlyphBitmap(glyph, 12, 150)
+	require.NoError(t, err)
+	assert.NotEmpty(t, bitmap)
+	assert.Positive(t, bitmapWidth)
+	assert.Positive(t, height)
 }

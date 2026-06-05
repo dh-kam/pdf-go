@@ -61,6 +61,39 @@ func TestApplyFontMetricsFromDict_AfterEncodingMapUsesResolvedGlyphIDs(t *testin
 	assert.Equal(t, 700.0, widthB)
 }
 
+func TestGlyphAdvanceUsesSimpleFontCharCodeWidthBeforeGlyphWidth(t *testing.T) {
+	eval := NewEvaluator(nil)
+	baseFont := &encodingTestFont{
+		widths: map[uint32]float64{
+			200: 700,
+		},
+		names: map[uint32]string{
+			200: "A",
+		},
+	}
+
+	encoding := entity.NewDict()
+	encoding.Set(
+		entity.Name("Differences"),
+		entity.NewArray(
+			entity.NewInteger(65),
+			entity.Name("A"),
+		),
+	)
+
+	fontDict := entity.NewDict()
+	fontDict.Set(entity.Name("Encoding"), encoding)
+	fontDict.Set(entity.Name("FirstChar"), entity.NewInteger(65))
+	fontDict.Set(entity.Name("LastChar"), entity.NewInteger(65))
+	fontDict.Set(entity.Name("Widths"), entity.NewArray(entity.NewInteger(612)))
+
+	wrapped := eval.applyFontEncodingFromDict(fontDict, baseFont)
+	mapped := eval.applyFontMetricsFromDict(fontDict, wrapped)
+	require.NotNil(t, mapped)
+
+	assert.Equal(t, 6.12, eval.glyphAdvance(65, mapped, 10))
+}
+
 func TestApplyFontEncodingFromDict_UsesGlyphNameLookupThroughWrappedFonts(t *testing.T) {
 	eval := NewEvaluator(nil)
 	baseFont := &encodingTestFont{
@@ -215,6 +248,165 @@ func TestApplyFontMetricsFromDict_CIDWUsesPDFThousandUnitAdvances(t *testing.T) 
 	rangeWidth, err := mapped.GetGlyphWidth(1012)
 	require.NoError(t, err)
 	assert.InDelta(t, 6.1, rangeWidth/float64(mapped.UnitsPerEm())*25.0, 1e-9)
+}
+
+func TestApplyFontMetricsFromDict_CIDWKeysWidthsAfterIdentityWrapper(t *testing.T) {
+	eval := NewEvaluator(nil)
+	baseFont := &glyphRenderTestFont{
+		name: "CIDIdentityEmbedded",
+		widths: map[uint32]float64{
+			914: 1200,
+			915: 333,
+			999: 1200,
+		},
+		charMap: map[uint32]uint32{
+			914: 999, // Embedded cmap may not use the CID as the glyph ID.
+		},
+		upem: 1000,
+	}
+	font := &cidIdentityFont{base: baseFont}
+
+	fontDict := entity.NewDict()
+	fontDict.Set(entity.Name("DW"), entity.NewInteger(1000))
+	fontDict.Set(
+		entity.Name("W"),
+		entity.NewArray(
+			entity.NewInteger(914),
+			entity.NewArray(entity.NewInteger(244)),
+		),
+	)
+
+	mapped := eval.applyFontMetricsFromDict(fontDict, font)
+	require.NotNil(t, mapped)
+
+	glyph, err := mapped.CharCodeToGlyph(914)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(914), glyph)
+
+	width, err := mapped.GetGlyphWidth(glyph)
+	require.NoError(t, err)
+	assert.Equal(t, 244.0, width)
+
+	defaultWidth, err := mapped.GetGlyphWidth(915)
+	require.NoError(t, err)
+	assert.Equal(t, 1000.0, defaultWidth)
+}
+
+func TestApplyFontMetricsFromDict_CIDHonorsDWWithoutWArray(t *testing.T) {
+	eval := NewEvaluator(nil)
+	font := &cidIdentityFont{
+		base: &glyphRenderTestFont{
+			name:   "CIDIdentityDefaultWidth",
+			widths: map[uint32]float64{7: 333},
+			upem:   1000,
+		},
+	}
+
+	fontDict := entity.NewDict()
+	fontDict.Set(entity.Name("DW"), entity.NewInteger(750))
+
+	mapped := eval.applyFontMetricsFromDict(fontDict, font)
+	require.NotNil(t, mapped)
+
+	width, err := mapped.GetGlyphWidth(7)
+	require.NoError(t, err)
+	assert.Equal(t, 750.0, width)
+}
+
+func TestCIDIdentityFontCanMapThroughToUnicodeCMap(t *testing.T) {
+	baseFont := &glyphRenderTestFont{
+		name: "CIDIdentityUnicode",
+		charMap: map[uint32]uint32{
+			uint32('K'): 46,
+		},
+	}
+
+	direct := &cidIdentityFont{
+		base:      baseFont,
+		toUnicode: map[uint32]rune{0x002e: 'K'},
+	}
+	glyph, err := direct.CharCodeToGlyph(0x002e)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(0x002e), glyph)
+
+	viaUnicode := &cidIdentityFont{
+		base:                baseFont,
+		toUnicode:           map[uint32]rune{0x002e: 'K'},
+		preferToUnicodeCMap: true,
+	}
+	glyph, err = viaUnicode.CharCodeToGlyph(0x002e)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(46), glyph)
+}
+
+func TestShouldUseToUnicodeCMapForCIDIdentity_AutoOnlyLatinFallback(t *testing.T) {
+	t.Setenv("PDF_DEBUG_CID_IDENTITY_TOUNICODE_CMAP", "auto")
+
+	latinMap := map[uint32]rune{
+		0x002c: 'I',
+		0x0057: 't',
+		0x00b1: 0x2013,
+	}
+	assert.True(t, shouldUseToUnicodeCMapForCIDIdentity("YZIAWQ+ArialMT", latinMap, []byte("bad truetype"), nil))
+	assert.True(t, shouldUseToUnicodeCMapForCIDIdentity("ArialMT", latinMap, nil, assert.AnError))
+
+	cjkMap := map[uint32]rune{
+		0x95b5: 0xac00,
+	}
+	assert.False(t, shouldUseToUnicodeCMapForCIDIdentity("QOXWJG+ArialUnicodeMS", cjkMap, []byte("bad truetype"), nil))
+	assert.False(t, shouldUseToUnicodeCMapForCIDIdentity("BCDIEE+MalgunGothic", cjkMap, []byte("bad truetype"), nil))
+}
+
+func TestShouldUseToUnicodeCMapForCIDIdentity_DefaultAutoCanBeDisabledAndForced(t *testing.T) {
+	latinMap := map[uint32]rune{0x002c: 'I'}
+
+	assert.True(t, shouldUseToUnicodeCMapForCIDIdentity("ArialMT", latinMap, nil, assert.AnError))
+	assert.False(t, shouldUseToUnicodeCMapForCIDIdentity("QOXWJG+ArialUnicodeMS", map[uint32]rune{0x95b5: 0xac00}, nil, nil))
+
+	t.Setenv("PDF_DEBUG_CID_IDENTITY_TOUNICODE_CMAP", "0")
+	assert.False(t, shouldUseToUnicodeCMapForCIDIdentity("ArialMT", latinMap, nil, assert.AnError))
+
+	t.Setenv("PDF_DEBUG_CID_IDENTITY_TOUNICODE_CMAP", "1")
+	assert.True(t, shouldUseToUnicodeCMapForCIDIdentity("QOXWJG+ArialUnicodeMS", map[uint32]rune{0x95b5: 0xac00}, nil, nil))
+}
+
+func TestApplyFontMetricsFromDict_CIDWAfterToUnicodeWrapperUsesRenderedGlyph(t *testing.T) {
+	eval := NewEvaluator(nil)
+	baseFont := &glyphRenderTestFont{
+		name: "CIDIdentityUnicode",
+		widths: map[uint32]float64{
+			46: 500,
+		},
+		charMap: map[uint32]uint32{
+			uint32('K'): 46,
+		},
+		upem: 1000,
+	}
+	font := &cidIdentityFont{
+		base:                baseFont,
+		toUnicode:           map[uint32]rune{0x002e: 'K'},
+		preferToUnicodeCMap: true,
+	}
+
+	fontDict := entity.NewDict()
+	fontDict.Set(
+		entity.Name("W"),
+		entity.NewArray(
+			entity.NewInteger(0x002e),
+			entity.NewArray(entity.NewInteger(722)),
+		),
+	)
+
+	mapped := eval.applyFontMetricsFromDict(fontDict, font)
+	require.NotNil(t, mapped)
+
+	glyph, err := mapped.CharCodeToGlyph(0x002e)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(46), glyph)
+
+	width, err := mapped.GetGlyphWidth(glyph)
+	require.NoError(t, err)
+	assert.Equal(t, 722.0, width)
 }
 
 func TestGlyphSourceOverrideFont_RenderGlyphUsesOverridePathButKeepsBaseWidth(t *testing.T) {

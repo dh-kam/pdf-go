@@ -113,6 +113,14 @@ func GetGlyphNameByCharCode(fontData []byte, charCode uint32) (string, bool) {
 	return name, true
 }
 
+// GetCIDToGIDMap returns the Poppler-style CID-to-GID map for CID-keyed CFF fonts.
+func GetCIDToGIDMap(fontData []byte) (map[uint32]uint32, bool) {
+	if cidToGID, ok, handled := getCIDToGIDMapFreeTypeGo(fontData); handled {
+		return cidToGID, ok
+	}
+	return nil, false
+}
+
 // GetFaceBoundingBox returns the sfnt face bounds in font units.
 func GetFaceBoundingBox(fontData []byte) (float64, float64, float64, float64, uint16, bool) {
 	if xMin, yMin, xMax, yMax, units, ok, handled := getFaceBoundingBoxFreeTypeGo(fontData); handled {
@@ -233,6 +241,25 @@ func RenderGlyphBitmapMatrixPhased(fontData []byte, glyphCode uint32, sizePt flo
 // RenderGlyphBitmapByIndexMatrixPhased renders a glyph bitmap by sfnt glyph index with a 2x2 transform matrix.
 func RenderGlyphBitmapByIndexMatrixPhased(fontData []byte, glyphIndex uint32, sizePt float64, matrix [4]float64, phaseX, phaseY float64) ([]byte, int, int, int, int, error) {
 	return renderGlyphBitmapByIndexMode(fontData, glyphIndex, sizePt, matrix, phaseX, phaseY, 72, true, true)
+}
+
+// RenderGlyphPathByIndexMatrix renders a glyph outline by sfnt glyph index
+// through the same FreeType pixel-size/matrix normalization used by Poppler's
+// SplashFTFont::getGlyphPath.
+func RenderGlyphPathByIndexMatrix(fontData []byte, glyphIndex uint32, sizePt float64, matrix [4]float64) (*entity.GlyphPath, error) {
+	if path, handled, err := renderGlyphPathByIndexFreeTypeGo(fontData, glyphIndex, sizePt, matrix); handled {
+		return path, err
+	}
+	return nil, fmt.Errorf("purego freetype glyph path not available")
+}
+
+// RenderGlyphPathByIndexTextMatrix renders a glyph outline in Poppler callback
+// text coordinates, leaving the final device matrix for Splash path construction.
+func RenderGlyphPathByIndexTextMatrix(fontData []byte, glyphIndex uint32, sizePt float64, matrix [4]float64) (*entity.GlyphPath, error) {
+	if path, handled, err := renderGlyphPathByIndexTextMatrixFreeTypeGo(fontData, glyphIndex, sizePt, matrix); handled {
+		return path, err
+	}
+	return nil, fmt.Errorf("purego freetype glyph text path not available")
 }
 
 // RenderGlyphBitmapByIndexMatrixPhasedLegacy renders a matrix-transformed glyph with the legacy pure-Go path.

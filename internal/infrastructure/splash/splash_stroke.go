@@ -17,6 +17,7 @@ const (
 	pathFlagFirst  byte = 0x01 // SplashPath.h:42
 	pathFlagLast   byte = 0x02 // SplashPath.h:45
 	pathFlagClosed byte = 0x04 // SplashPath.h:49
+	pathFlagCurve  byte = 0x08 // SplashPath.h:52
 )
 
 // bezierCircle / bezierCircle2 mirror the two constants used at Splash.cc near round-cap
@@ -113,11 +114,11 @@ func (s *Splash) strokeNarrowXPath(xPath *xpath.XPath) error {
 		return nil
 	}
 
-	var c Color
-	if s.state.strokePattern != nil {
-		s.state.strokePattern.GetColor(0, 0, &c)
-	}
 	alpha := uint8(Round(s.state.strokeAlpha * 255))
+	var p pipe
+	s.pipeInit(&p, 0, 0, s.state.strokePattern, nil, alpha, false, false)
+	_, clipYMin, _, clipYMax := s.strokeClipIntBounds()
+	_, clipYMinFP, _, clipYMaxFP := s.strokeClipBounds()
 
 	for i := range xPath.Segs {
 		seg := xPath.Segs[i]
@@ -134,11 +135,21 @@ func (s *Splash) strokeNarrowXPath(xPath *xpath.XPath) error {
 			x1 = Floor(seg.X0)
 		}
 
+		drawXMin, drawXMax := x0, x1
+		if drawXMin > drawXMax {
+			drawXMin, drawXMax = drawXMax, drawXMin
+		}
+		clipRes := s.testRect(drawXMin, y0, drawXMax, y1)
+		if clipRes == xpath.ClipAllOutside {
+			continue
+		}
+		noClip := clipRes == xpath.ClipAllInside
+
 		if y0 == y1 {
 			if x0 <= x1 {
-				s.drawSpan(x0, x1, y0, c, alpha)
+				s.drawStrokeSpanPipe(&p, x0, x1, y0, noClip)
 			} else {
-				s.drawSpan(x1, x0, y0, c, alpha)
+				s.drawStrokeSpanPipe(&p, x1, x0, y0, noClip)
 			}
 			continue
 		}
@@ -154,6 +165,17 @@ func (s *Splash) strokeNarrowXPath(xPath *xpath.XPath) error {
 			segX0 = seg.X1
 			segY0 = seg.Y1
 		}
+		if y0 < clipYMin {
+			y0 = clipYMin
+			x0 = Floor(seg.X0 + (clipYMinFP-seg.Y0)*dxdy)
+		}
+		if y1 > clipYMax {
+			y1 = clipYMax
+			x1 = Floor(seg.X0 + (clipYMaxFP-seg.Y0)*dxdy)
+		}
+		if y0 > y1 {
+			continue
+		}
 
 		if x0 <= x1 {
 			xa := x0
@@ -165,9 +187,9 @@ func (s *Splash) strokeNarrowXPath(xPath *xpath.XPath) error {
 					xb = x1 + 1 // inclusive last pixel (Splash.cc:1995-1997)
 				}
 				if xa == xb {
-					s.drawPixel(xa, y, c, alpha)
+					s.drawStrokeSpanPipe(&p, xa, xa, y, noClip)
 				} else {
-					s.drawSpan(xa, xb-1, y, c, alpha)
+					s.drawStrokeSpanPipe(&p, xa, xb-1, y, noClip)
 				}
 				xa = xb
 			}
@@ -181,15 +203,35 @@ func (s *Splash) strokeNarrowXPath(xPath *xpath.XPath) error {
 					xb = x1 - 1 // inclusive last pixel (Splash.cc:2010-2012)
 				}
 				if xa == xb {
-					s.drawPixel(xa, y, c, alpha)
+					s.drawStrokeSpanPipe(&p, xa, xa, y, noClip)
 				} else {
-					s.drawSpan(xb+1, xa, y, c, alpha)
+					s.drawStrokeSpanPipe(&p, xb+1, xa, y, noClip)
 				}
 				xa = xb
 			}
 		}
 	}
 	return nil
+}
+
+func (s *Splash) strokeClipIntBounds() (xMin, yMin, xMax, yMax int) {
+	if clip, ok := s.state.clip.(*xpath.Clip); ok && clip != nil {
+		return clip.IntBounds()
+	}
+	if s.bitmap == nil {
+		return 0, 0, -1, -1
+	}
+	return 0, 0, s.bitmap.width - 1, s.bitmap.height - 1
+}
+
+func (s *Splash) strokeClipBounds() (xMin, yMin, xMax, yMax float64) {
+	if clip, ok := s.state.clip.(*xpath.Clip); ok && clip != nil {
+		return clip.Bounds()
+	}
+	if s.bitmap == nil {
+		return 0, 0, -1, -1
+	}
+	return 0, 0, float64(s.bitmap.width), float64(s.bitmap.height)
 }
 
 // strokeWide builds a fillable stroke outline and fills it (Splash.cc:2034-2042).
@@ -200,11 +242,12 @@ func (s *Splash) strokeNarrowXPath(xPath *xpath.XPath) error {
 // stashing+restoring the fill side around the call, then drive non-zero (eo=false)
 // fill semantics per Splash.cc:2042.
 func (s *Splash) strokeWide(p *xpath.Path, w float64, dashedStroke bool) error {
+	s.debugTraceStrokeInput(s.debugStrokeIndex, p, w, dashedStroke)
 	outline := s.makeStrokePath(p, w, false, dashedStroke)
 	if outline == nil || outline.IsEmpty() {
 		return nil
 	}
-	debugTraceStrokeOutline(s.debugStrokeIndex, outline)
+	s.debugTraceStrokeOutline(s.debugStrokeIndex, outline)
 	savedPat := s.state.fillPattern
 	savedAlpha := s.state.fillAlpha
 	s.state.fillPattern = s.state.strokePattern
@@ -215,10 +258,15 @@ func (s *Splash) strokeWide(p *xpath.Path, w float64, dashedStroke bool) error {
 	return err
 }
 
-func debugTraceStrokeOutline(index int, p *xpath.Path) {
-	mode := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_STROKE_OUTLINE_TRACE"))
+func (s *Splash) debugTraceStrokeInput(index int, p *xpath.Path, w float64, dashedStroke bool) {
+	mode := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_STROKE_INPUT_TRACE"))
 	if mode == "" || p == nil {
 		return
+	}
+	if filter := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_STROKE_INPUT_CONTEXT")); filter != "" {
+		if s == nil || !strings.Contains(s.debugPaintContext, filter) {
+			return
+		}
 	}
 	if mode != "all" {
 		want, err := strconv.Atoi(mode)
@@ -226,7 +274,46 @@ func debugTraceStrokeOutline(index int, p *xpath.Path) {
 			return
 		}
 	}
-	fmt.Fprintf(os.Stderr, "SPLASH_STROKE_OUTLINE index=%d pathLen=%d hints=%d\n", index, p.Length(), len(p.Hints()))
+	ctx := ""
+	lineCap, lineJoin := 0, 0
+	miterLimit := 0.0
+	if s != nil {
+		ctx = s.debugPaintContext
+		lineCap = s.state.lineCap
+		lineJoin = s.state.lineJoin
+		miterLimit = s.state.miterLimit
+	}
+	fmt.Fprintf(os.Stderr, "SPLASH_STROKE_INPUT index=%d pathLen=%d hints=%d w=%.12f dashed=%v cap=%d join=%d miter=%.12f ctx=%q\n", index, p.Length(), len(p.Hints()), w, dashedStroke, lineCap, lineJoin, miterLimit, ctx)
+	for i := 0; i < p.Length(); i++ {
+		pt, flag := p.Point(i)
+		fmt.Fprintf(os.Stderr, "  in[%03d]=(%.12f,%.12f) flag=0x%02x\n", i, pt.X, pt.Y, flag)
+	}
+	for i, h := range p.Hints() {
+		fmt.Fprintf(os.Stderr, "  hint[%03d]=ctrl(%d,%d) pts(%d,%d)\n", i, h.Ctrl0, h.Ctrl1, h.FirstPt, h.LastPt)
+	}
+}
+
+func (s *Splash) debugTraceStrokeOutline(index int, p *xpath.Path) {
+	mode := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_STROKE_OUTLINE_TRACE"))
+	if mode == "" || p == nil {
+		return
+	}
+	if filter := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_STROKE_OUTLINE_CONTEXT")); filter != "" {
+		if s == nil || !strings.Contains(s.debugPaintContext, filter) {
+			return
+		}
+	}
+	if mode != "all" {
+		want, err := strconv.Atoi(mode)
+		if err != nil || want != index {
+			return
+		}
+	}
+	ctx := ""
+	if s != nil && s.debugPaintContext != "" {
+		ctx = s.debugPaintContext
+	}
+	fmt.Fprintf(os.Stderr, "SPLASH_STROKE_OUTLINE index=%d pathLen=%d hints=%d ctx=%q\n", index, p.Length(), len(p.Hints()), ctx)
 	for i := 0; i < p.Length(); i++ {
 		pt, flag := p.Point(i)
 		fmt.Fprintf(os.Stderr, "  out[%03d]=(%.8f,%.8f) flag=0x%02x\n", i, pt.X, pt.Y, flag)
@@ -254,6 +341,7 @@ func (s *Splash) makeStrokePath(p *xpath.Path, w float64, flatten bool, dashedSt
 	n := p.Length()
 	halfW := 0.5 * w
 	mirrorNormals := s.shouldMirrorStrokeNormalsForPath(p, w, dashedStroke)
+	popplerWalker := usePopplerStrokeWalker()
 
 	// Walk subpaths. For Phase 1 we collapse repeated identical points (Splash.cc:5880).
 	i0 := 0
@@ -308,6 +396,16 @@ func (s *Splash) makeStrokePath(p *xpath.Path, w float64, flatten bool, dashedSt
 		leftFirst, rightFirst, firstPt := 0, 0, 0
 		for a := i0; a < subEnd; a++ {
 			b := a + 1
+			if popplerWalker {
+				b = strokeNextDistinctPoint(p, a, subEnd)
+				if b > subEnd {
+					break
+				}
+			}
+			runEnd := b
+			if popplerWalker {
+				runEnd = strokeDuplicateRunEnd(p, b, subEnd)
+			}
 			pa, _ := p.Point(a)
 			pb, _ := p.Point(b)
 			dx, dy, ok := unitVec(pa.X, pa.Y, pb.X, pb.Y)
@@ -322,6 +420,9 @@ func (s *Splash) makeStrokePath(p *xpath.Path, w float64, flatten bool, dashedSt
 			}
 
 			isLast := b == subEnd
+			if popplerWalker {
+				isLast = runEnd == subEnd
+			}
 
 			// Start cap (only on the first segment of an open subpath).
 			startCap := first && !closed
@@ -396,26 +497,33 @@ func (s *Splash) makeStrokePath(p *xpath.Path, w float64, flatten bool, dashedSt
 			// Join at pb if not the final endpoint of an open subpath.
 			join2 := out.Length()
 			if !isLast || closed {
-				// Find next segment endpoint.
-				ja := b
-				jb := b + 1
-				if isLast && closed {
-					jb = i0 + 1
-				}
-				if jb > subEnd && !closed {
-					break
-				}
-				pja, _ := p.Point(ja)
-				var pjb xpath.PathPoint
-				if jb <= subEnd {
-					pjb, _ = p.Point(jb)
+				if popplerWalker {
+					dxn, dyn, okn := popplerStrokeNextDirection(p, i0, subEnd, runEnd, isLast, closed)
+					if okn {
+						s.emitJoin(out, pb.X, pb.Y, dx, dy, dxn, dyn, halfW, mirrorNormals)
+					}
 				} else {
-					// closed: wrap to subpath start+1 to get next direction
-					pjb, _ = p.Point(i0 + 1)
-				}
-				dxn, dyn, okn := unitVec(pja.X, pja.Y, pjb.X, pjb.Y)
-				if okn {
-					s.emitJoin(out, pb.X, pb.Y, dx, dy, dxn, dyn, halfW, mirrorNormals)
+					// Find next segment endpoint.
+					ja := b
+					jb := b + 1
+					if isLast && closed {
+						jb = i0 + 1
+					}
+					if jb > subEnd && !closed {
+						break
+					}
+					pja, _ := p.Point(ja)
+					var pjb xpath.PathPoint
+					if jb <= subEnd {
+						pjb, _ = p.Point(jb)
+					} else {
+						// closed: wrap to subpath start+1 to get next direction
+						pjb, _ = p.Point(i0 + 1)
+					}
+					dxn, dyn, okn := unitVec(pja.X, pja.Y, pjb.X, pjb.Y)
+					if okn {
+						s.emitJoin(out, pb.X, pb.Y, dx, dy, dxn, dyn, halfW, mirrorNormals)
+					}
 				}
 			}
 
@@ -482,6 +590,9 @@ func (s *Splash) makeStrokePath(p *xpath.Path, w float64, flatten bool, dashedSt
 
 			first = false
 			seg++
+			if popplerWalker {
+				a = runEnd - 1
+			}
 		}
 
 		i0 = subEnd + 1
@@ -591,6 +702,63 @@ func shouldMirrorDashedButtStrokeNormalsForPath(p *xpath.Path, w float64) bool {
 		sawSegment = true
 	}
 	return sawSegment
+}
+
+func usePopplerStrokeWalker() bool {
+	if os.Getenv("PDF_DEBUG_SPLASH_DISABLE_POPPLER_STROKE_WALKER") == "1" {
+		return false
+	}
+	return true
+}
+
+func strokeNextDistinctPoint(p *xpath.Path, from, subEnd int) int {
+	if p == nil || from < 0 || from >= p.Length() {
+		return subEnd + 1
+	}
+	base, _ := p.Point(from)
+	for i := from + 1; i <= subEnd && i < p.Length(); i++ {
+		pt, _ := p.Point(i)
+		if pt.X != base.X || pt.Y != base.Y {
+			return i
+		}
+	}
+	return subEnd + 1
+}
+
+func strokeDuplicateRunEnd(p *xpath.Path, start, subEnd int) int {
+	if p == nil || start < 0 || start >= p.Length() {
+		return start
+	}
+	if subEnd >= p.Length() {
+		subEnd = p.Length() - 1
+	}
+	for i := start; i < subEnd; i++ {
+		pt, _ := p.Point(i)
+		next, _ := p.Point(i + 1)
+		if next.X != pt.X || next.Y != pt.Y {
+			return i
+		}
+	}
+	return subEnd
+}
+
+func popplerStrokeNextDirection(p *xpath.Path, subStart, subEnd, runEnd int, isLast, closed bool) (float64, float64, bool) {
+	if p == nil || runEnd < 0 || runEnd >= p.Length() {
+		return 0, 0, false
+	}
+	next := runEnd + 1
+	if isLast {
+		if !closed {
+			return 0, 0, false
+		}
+		next = strokeNextDistinctPoint(p, subStart, subEnd)
+	}
+	if next > subEnd || next >= p.Length() {
+		return 0, 0, false
+	}
+	a, _ := p.Point(runEnd)
+	b, _ := p.Point(next)
+	return unitVec(a.X, a.Y, b.X, b.Y)
 }
 
 func shouldMirrorAxisButtStrokeNormals(p0 xpath.PathPoint, f0 byte, p1 xpath.PathPoint, f1 byte, w float64) bool {
@@ -827,12 +995,17 @@ func (s *Splash) drawSpan(x0, x1, y int, c Color, alpha byte) {
 		alphaOff := y*s.bitmap.width + x0
 		for x := x0; x <= x1; x++ {
 			if inside(x) {
+				before := lastWriterSample{}
+				if shouldTraceLastWriterPixel(x, y) {
+					before = captureLastWriterSample(s.bitmap, x, y)
+				}
 				s.bitmap.data[off+0] = c[0]
 				s.bitmap.data[off+1] = c[1]
 				s.bitmap.data[off+2] = c[2]
 				if s.bitmap.alpha != nil {
 					s.bitmap.alpha[alphaOff] = alpha
 				}
+				traceLastWriter("drawSpan", s, s.bitmap, x, y, before)
 			}
 			off += 3
 			alphaOff++
@@ -843,16 +1016,81 @@ func (s *Splash) drawSpan(x0, x1, y int, c Color, alpha byte) {
 		alphaOff := y*s.bitmap.width + x0
 		for x := x0; x <= x1; x++ {
 			if inside(x) {
+				before := lastWriterSample{}
+				if shouldTraceLastWriterPixel(x, y) {
+					before = captureLastWriterSample(s.bitmap, x, y)
+				}
 				s.bitmap.data[off] = c[0]
 				if s.bitmap.alpha != nil {
 					s.bitmap.alpha[alphaOff] = alpha
 				}
+				traceLastWriter("drawSpan", s, s.bitmap, x, y, before)
 			}
 			off++
 			alphaOff++
 		}
 	default:
 		// Other modes wired up in Phase 2.
+	}
+}
+
+func (s *Splash) drawStrokeSpanPipe(p *pipe, x0, x1, y int, noClip bool) {
+	if s.bitmap == nil || s.bitmap.data == nil || p == nil {
+		return
+	}
+	if y < 0 || y >= s.bitmap.height {
+		return
+	}
+	if x0 > x1 {
+		x0, x1 = x1, x0
+	}
+	if noClip {
+		if x0 < 0 {
+			x0 = 0
+		}
+		if x1 >= s.bitmap.width {
+			x1 = s.bitmap.width - 1
+		}
+		if x0 > x1 {
+			return
+		}
+		s.pipeSetXY(p, x0, y)
+		for x := x0; x <= x1; x++ {
+			p.run(p)
+		}
+		return
+	}
+
+	var clip *xpath.Clip
+	if c, ok := s.state.clip.(*xpath.Clip); ok {
+		clip = c
+	}
+	if clip != nil {
+		xMin, _, xMax, _ := clip.IntBounds()
+		if x0 < xMin {
+			x0 = xMin
+		}
+		if x1 > xMax {
+			x1 = xMax
+		}
+	} else {
+		if x0 < 0 {
+			x0 = 0
+		}
+		if x1 >= s.bitmap.width {
+			x1 = s.bitmap.width - 1
+		}
+	}
+	if x0 > x1 {
+		return
+	}
+	s.pipeSetXY(p, x0, y)
+	for x := x0; x <= x1; x++ {
+		if clip == nil || clip.Test(x, y) {
+			p.run(p)
+		} else {
+			s.pipeIncX(p)
+		}
 	}
 }
 

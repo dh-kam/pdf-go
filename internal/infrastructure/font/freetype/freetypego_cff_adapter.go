@@ -4,6 +4,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
+	"os"
+	"strconv"
+	"strings"
 
 	ftapi "github.com/dh-kam/freetype-go/api"
 	ftcff "github.com/dh-kam/freetype-go/cff"
@@ -13,11 +17,14 @@ import (
 )
 
 const (
-	rawCFFOpCharset  = 15
-	rawCFFOpEncoding = 16
-	rawCFFOpFontBBox = 5
-	rawCFFUnitsPerEm = 1000
-	rawCFFStringBias = 391
+	rawCFFOpCharset    = 15
+	rawCFFOpEncoding   = 16
+	rawCFFOpFontBBox   = 5
+	rawCFFOpFontMatrix = 12<<8 | 7
+	rawCFFOpROS        = 12<<8 | 30
+	rawCFFOpFDArray    = 12<<8 | 36
+	rawCFFUnitsPerEm   = 1000
+	rawCFFStringBias   = 391
 )
 
 type rawCFFFreeTypeGoFace struct {
@@ -25,6 +32,7 @@ type rawCFFFreeTypeGoFace struct {
 	glyphSlot        *rawCFFGlyphSlot
 	xPPEM            int
 	yPPEM            int
+	cidToGID         map[uint32]uint32
 	glyphIndexByName map[string]int
 	glyphIndexByCode map[uint32]int
 	glyphNameByCode  map[uint32]string
@@ -35,6 +43,16 @@ type rawCFFFreeTypeGoFace struct {
 type rawCFFGlyphSlot struct {
 	outline ftapi.Outline
 	bitmap  ftapi.Bitmap
+}
+
+type rawCFFFontMatrix struct {
+	xx         int32
+	yx         int32
+	xy         int32
+	yy         int32
+	offsetX    int32
+	offsetY    int32
+	unitsPerEm int
 }
 
 func loadRawCFFFreeTypeGoFace(stream ftapi.Stream) (ftapi.Face, error) {
@@ -51,12 +69,14 @@ func loadRawCFFFreeTypeGoFace(stream ftapi.Stream) (ftapi.Face, error) {
 	glyphNames := rawCFFGlyphNames(font)
 	glyphIndexByName := rawCFFGlyphIndexByName(glyphNames)
 	glyphIndexByCode, glyphNameByCode := rawCFFEncodingByCode(font, glyphNames, glyphIndexByName)
+	cidToGID, _ := rawCFFCIDToGIDMap(font)
 	bbox, hasBBox := rawCFFFontBBox(font)
 	return &rawCFFFreeTypeGoFace{
 		font:             font,
 		glyphSlot:        &rawCFFGlyphSlot{},
 		xPPEM:            rawCFFUnitsPerEm,
 		yPPEM:            rawCFFUnitsPerEm,
+		cidToGID:         cidToGID,
 		glyphIndexByName: glyphIndexByName,
 		glyphIndexByCode: glyphIndexByCode,
 		glyphNameByCode:  glyphNameByCode,
@@ -94,6 +114,7 @@ func (f *rawCFFFreeTypeGoFace) LoadGlyph(glyphIndex int, loadFlags int) (ftapi.G
 	if f == nil || f.font == nil {
 		return nil, errors.New("nil raw CFF face")
 	}
+	glyphIndex = f.resolveGlyphIndex(glyphIndex)
 	if glyphIndex < 0 || glyphIndex >= f.GetNumGlyphs() {
 		return nil, fmt.Errorf("raw CFF glyph index %d out of range", glyphIndex)
 	}
@@ -105,7 +126,7 @@ func (f *rawCFFFreeTypeGoFace) LoadGlyph(glyphIndex int, loadFlags int) (ftapi.G
 		outline = &ftcore.Outline{}
 	}
 	if loadFlags&ftapi.LoadNoScale == 0 {
-		rawCFFScaleOutline(outline, f.xPPEM, f.yPPEM)
+		rawCFFScaleOutline(outline, f.font, glyphIndex, f.xPPEM, f.yPPEM)
 	}
 	slot := &rawCFFGlyphSlot{outline: outline}
 	f.glyphSlot = slot
@@ -150,6 +171,16 @@ func (f *rawCFFFreeTypeGoFace) GetGlyphNameByCharCode(charCode uint32) (string, 
 	return name, ok
 }
 
+func (f *rawCFFFreeTypeGoFace) CIDToGIDMap() (map[uint32]uint32, bool) {
+	if f == nil {
+		return nil, false
+	}
+	if len(f.cidToGID) > 0 {
+		return f.cidToGID, true
+	}
+	return rawCFFCIDToGIDMap(f.font)
+}
+
 func (f *rawCFFFreeTypeGoFace) GetFaceBoundingBox() (float64, float64, float64, float64, uint16, bool) {
 	if f == nil || !f.hasBBox {
 		return 0, 0, 0, 0, 0, false
@@ -158,10 +189,21 @@ func (f *rawCFFFreeTypeGoFace) GetFaceBoundingBox() (float64, float64, float64, 
 }
 
 func (f *rawCFFFreeTypeGoFace) GetGlyphMetrics(glyphIndex int) (advance int32, lsb int32, err error) {
+	glyphIndex = f.resolveGlyphIndex(glyphIndex)
 	if glyphIndex < 0 || glyphIndex >= f.GetNumGlyphs() {
 		return 0, 0, fmt.Errorf("raw CFF glyph index %d out of range", glyphIndex)
 	}
 	return 0, 0, nil
+}
+
+func (f *rawCFFFreeTypeGoFace) resolveGlyphIndex(glyphIndex int) int {
+	if f == nil || len(f.cidToGID) == 0 || glyphIndex < 0 {
+		return glyphIndex
+	}
+	if localGID, ok := f.cidToGID[uint32(glyphIndex)]; ok {
+		return int(localGID)
+	}
+	return glyphIndex
 }
 
 func (f *rawCFFFreeTypeGoFace) Shape(text string) ([]int, []ftapi.Vector) {
@@ -201,8 +243,14 @@ func (s *rawCFFGlyphSlot) GetImage() *ftapi.Image {
 	return nil
 }
 
-func rawCFFScaleOutline(outline *ftcore.Outline, xPPEM, yPPEM int) {
+func rawCFFScaleOutline(outline *ftcore.Outline, font *ftcff.CFF, glyphIndex int, xPPEM, yPPEM int) {
 	if outline == nil {
+		return
+	}
+	matrix, hasMatrix := rawCFFGlyphFontMatrix(font, glyphIndex)
+	if hasMatrix && !rawCFFDisableFontMatrixNormalization() {
+		rawCFFApplyFontMatrix(outline, matrix)
+		rawCFFScaleOutlineByUnits(outline, xPPEM, yPPEM, matrix.unitsPerEm)
 		return
 	}
 	xScale := rawCFFSizeScale(xPPEM)
@@ -213,11 +261,154 @@ func rawCFFScaleOutline(outline *ftcore.Outline, xPPEM, yPPEM int) {
 	}
 }
 
+func rawCFFGlyphFontMatrix(font *ftcff.CFF, glyphIndex int) (rawCFFFontMatrix, bool) {
+	if font == nil {
+		return rawCFFFontMatrix{}, false
+	}
+	if matrix, ok := rawCFFFontMatrixFromDict(font.TopDict); ok {
+		return matrix, true
+	}
+	if font.FDSelect == nil || len(font.FontDicts) == 0 {
+		return rawCFFFontMatrix{}, false
+	}
+	fdIndex, err := font.FDSelect.FDIndex(glyphIndex)
+	if err != nil || fdIndex < 0 || fdIndex >= len(font.FontDicts) {
+		return rawCFFFontMatrix{}, false
+	}
+	return rawCFFFontMatrixFromDict(font.FontDicts[fdIndex].Dict)
+}
+
+func rawCFFFontMatrixFromDict(dict map[int][]float64) (rawCFFFontMatrix, bool) {
+	operands, ok := dict[rawCFFOpFontMatrix]
+	if !ok || len(operands) < 6 {
+		return rawCFFFontMatrix{}, false
+	}
+	var matrix [6]float64
+	for i := range matrix {
+		if math.IsInf(operands[i], 0) || math.IsNaN(operands[i]) {
+			return rawCFFFontMatrix{}, false
+		}
+		matrix[i] = operands[i]
+	}
+	if rawCFFDefaultFontMatrix(matrix) {
+		return rawCFFFontMatrix{}, false
+	}
+	return rawCFFNormalizeFontMatrix(matrix)
+}
+
+func rawCFFDefaultFontMatrix(matrix [6]float64) bool {
+	const eps = 1e-12
+	return math.Abs(matrix[0]-0.001) < eps &&
+		math.Abs(matrix[1]) < eps &&
+		math.Abs(matrix[2]) < eps &&
+		math.Abs(matrix[3]-0.001) < eps &&
+		math.Abs(matrix[4]) < eps &&
+		math.Abs(matrix[5]) < eps
+}
+
+func rawCFFNormalizeFontMatrix(matrix [6]float64) (rawCFFFontMatrix, bool) {
+	temp := math.Abs(matrix[3])
+	if temp == 0 {
+		temp = math.Abs(matrix[1])
+	}
+	if temp == 0 || math.IsInf(temp, 0) || math.IsNaN(temp) {
+		return rawCFFFontMatrix{}, false
+	}
+	unitsPerEm := int(math.Floor((1.0 / temp) + 0.5))
+	if unitsPerEm <= 0 {
+		return rawCFFFontMatrix{}, false
+	}
+
+	fixed := func(v float64) int32 {
+		return int32(math.Round((v / temp) * 65536.0))
+	}
+	offset := func(v float64) int32 {
+		return int32(math.Round(v / temp))
+	}
+	return rawCFFFontMatrix{
+		xx:         fixed(matrix[0]),
+		yx:         fixed(matrix[1]),
+		xy:         fixed(matrix[2]),
+		yy:         fixed(matrix[3]),
+		offsetX:    offset(matrix[4]),
+		offsetY:    offset(matrix[5]),
+		unitsPerEm: unitsPerEm,
+	}, true
+}
+
+func rawCFFApplyFontMatrix(outline *ftcore.Outline, matrix rawCFFFontMatrix) {
+	for i, p := range outline.Points {
+		x := int64(ftmath.MulFix(p.X, matrix.xx)) + int64(ftmath.MulFix(p.Y, matrix.xy)) + int64(matrix.offsetX)
+		y := int64(ftmath.MulFix(p.X, matrix.yx)) + int64(ftmath.MulFix(p.Y, matrix.yy)) + int64(matrix.offsetY)
+		outline.Points[i].X = rawCFFClampInt32(x)
+		outline.Points[i].Y = rawCFFClampInt32(y)
+	}
+}
+
+func rawCFFClampInt32(v int64) int32 {
+	const (
+		maxInt32 = int64(1<<31 - 1)
+		minInt32 = -1 << 31
+	)
+	if v > maxInt32 {
+		return int32(maxInt32)
+	}
+	if v < minInt32 {
+		return int32(minInt32)
+	}
+	return int32(v)
+}
+
+func rawCFFScaleOutlineFractional(outline *ftcore.Outline, xPPEM, yPPEM int) {
+	rawCFFScaleOutlineByUnits(outline, xPPEM, yPPEM, rawCFFUnitsPerEm)
+}
+
+func rawCFFScaleOutlineByUnits(outline *ftcore.Outline, xPPEM, yPPEM, unitsPerEm int) {
+	if rawCFFDisableFractionalScale() {
+		xScale := rawCFFSizeScaleForUnits(xPPEM, unitsPerEm)
+		yScale := rawCFFSizeScaleForUnits(yPPEM, unitsPerEm)
+		for i := range outline.Points {
+			outline.Points[i].X = ftmath.MulFix(rawCFFDesignUnit(outline.Points[i].X), xScale)
+			outline.Points[i].Y = ftmath.MulFix(rawCFFDesignUnit(outline.Points[i].Y), yScale)
+		}
+		return
+	}
+	for i := range outline.Points {
+		outline.Points[i].X = rawCFFScaleFractionalDesignCoord(outline.Points[i].X, xPPEM, unitsPerEm)
+		outline.Points[i].Y = rawCFFScaleFractionalDesignCoord(outline.Points[i].Y, yPPEM, unitsPerEm)
+	}
+}
+
+func rawCFFDisableFontMatrixNormalization() bool {
+	v := strings.TrimSpace(os.Getenv("PDF_DEBUG_RAW_CFF_DISABLE_FONT_MATRIX_NORMALIZATION"))
+	return v != "" && v != "0" && !strings.EqualFold(v, "false")
+}
+
+func rawCFFDisableFractionalScale() bool {
+	v := strings.TrimSpace(os.Getenv("PDF_DEBUG_RAW_CFF_DISABLE_FRACTIONAL_SCALE"))
+	return v != "" && v != "0" && !strings.EqualFold(v, "false")
+}
+
+func rawCFFScaleFractionalDesignCoord(v int32, ppem, unitsPerEm int) int32 {
+	if ppem <= 0 || unitsPerEm <= 0 {
+		return v
+	}
+	scale := int32((int64(ppem) << 16) / int64(unitsPerEm))
+	return ftmath.MulFix(v, scale)
+}
+
 func rawCFFSizeScale(ppem int) int32 {
+	return rawCFFSizeScaleForUnits(ppem, rawCFFUnitsPerEm)
+}
+
+func rawCFFSizeScaleForUnits(ppem, unitsPerEm int) int32 {
 	if ppem <= 0 {
 		return 1 << 16
 	}
-	return ftmath.DivFix(int32(ppem)<<6, rawCFFUnitsPerEm)
+	if unitsPerEm <= 0 {
+		unitsPerEm = rawCFFUnitsPerEm
+	}
+	return ftmath.DivFix(int32(ppem)<<6, int32(unitsPerEm))
 }
 
 func rawCFFDesignUnit(v int32) int32 {
@@ -305,6 +496,32 @@ func rawCFFGlyphIndexByName(glyphNames []string) map[string]int {
 		}
 	}
 	return names
+}
+
+func rawCFFCIDToGIDMap(font *ftcff.CFF) (map[uint32]uint32, bool) {
+	if font == nil || len(font.Charset) == 0 {
+		return nil, false
+	}
+	if _, ok := font.TopDict[rawCFFOpROS]; !ok {
+		if _, ok := font.TopDict[rawCFFOpFDArray]; !ok {
+			return nil, false
+		}
+	}
+
+	cidToGID := map[uint32]uint32{0: 0}
+	for gid, name := range font.Charset {
+		if gid == 0 || !strings.HasPrefix(name, "cid") {
+			continue
+		}
+		cid, err := strconv.ParseUint(strings.TrimPrefix(name, "cid"), 10, 32)
+		if err != nil {
+			continue
+		}
+		if _, exists := cidToGID[uint32(cid)]; !exists {
+			cidToGID[uint32(cid)] = uint32(gid)
+		}
+	}
+	return cidToGID, len(cidToGID) > 1
 }
 
 func rawCFFSetGlyphName(names []string, font *ftcff.CFF, sid uint16, gid int) {

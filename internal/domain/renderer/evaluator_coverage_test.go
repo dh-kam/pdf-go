@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/dh-kam/pdf-go/internal/domain/colorspace"
 	"github.com/dh-kam/pdf-go/internal/domain/entity"
 	"github.com/dh-kam/pdf-go/internal/domain/graphics"
 	domainimage "github.com/dh-kam/pdf-go/internal/domain/image"
@@ -57,6 +58,80 @@ func TestPathLifecycle(t *testing.T) {
 	p.Clear()
 	assert.True(t, p.IsEmpty())
 	assert.Empty(t, p.Elements())
+}
+
+func TestPopplerOrderFillPathCandidateRequiresSmallClosedOrCurvedPath(t *testing.T) {
+	p := NewPath()
+	p.AddElement(&MoveTo{X: 0, Y: 0})
+	p.AddElement(&LineTo{X: 5, Y: 0})
+	p.AddElement(&LineTo{X: 5, Y: 5})
+	p.AddElement(&Close{})
+	if !popplerOrderFillPathCandidate(p) {
+		t.Fatal("small closed path should be a Poppler-order fill candidate")
+	}
+
+	openLine := NewPath()
+	openLine.AddElement(&MoveTo{X: 0, Y: 0})
+	openLine.AddElement(&LineTo{X: 5, Y: 0})
+	openLine.AddElement(&LineTo{X: 5, Y: 5})
+	if popplerOrderFillPathCandidate(openLine) {
+		t.Fatal("open line-only path should not be a Poppler-order fill candidate")
+	}
+
+	closedCurve := NewPath()
+	closedCurve.AddElement(&MoveTo{X: 0, Y: 0})
+	closedCurve.AddElement(&CurveTo{X1: 1, Y1: 0, X2: 5, Y2: 4, X: 5, Y: 5})
+	closedCurve.AddElement(&Close{})
+	if !popplerOrderFillPathCandidate(closedCurve) {
+		t.Fatal("small closed curved path should be a default Poppler-order fill candidate")
+	}
+
+	openCurve := NewPath()
+	openCurve.AddElement(&MoveTo{X: 0, Y: 0})
+	openCurve.AddElement(&CurveTo{X1: 1, Y1: 0, X2: 5, Y2: 4, X: 5, Y: 5})
+	if !popplerOrderFillPathCandidate(openCurve) {
+		t.Fatal("small curved open path should be a default Poppler-order fill candidate")
+	}
+	t.Setenv("PDF_DEBUG_SPLASH_POPPLER_ORDER_FILL_OPEN_CURVE_PATH", "0")
+	if popplerOrderFillPathCandidate(openCurve) {
+		t.Fatal("small curved open path should respect the legacy opt-out")
+	}
+
+	large := NewPath()
+	large.AddElement(&MoveTo{X: 0, Y: 0})
+	large.AddElement(&LineTo{X: 45, Y: 0})
+	large.AddElement(&LineTo{X: 45, Y: 5})
+	large.AddElement(&Close{})
+	if popplerOrderFillPathCandidate(large) {
+		t.Fatal("large path should not be a scoped Poppler-order fill candidate")
+	}
+
+	mediumClosedCurve := NewPath()
+	mediumClosedCurve.AddElement(&MoveTo{X: 0, Y: 0})
+	for i := 0; i < 8; i++ {
+		x := float64((i + 1) * 25)
+		mediumClosedCurve.AddElement(&CurveTo{
+			X1: x - 15, Y1: 20,
+			X2: x - 5, Y2: 80,
+			X: x, Y: float64((i%3)+1) * 25,
+		})
+	}
+	mediumClosedCurve.AddElement(&LineTo{X: 250, Y: 230})
+	mediumClosedCurve.AddElement(&LineTo{X: 0, Y: 230})
+	mediumClosedCurve.AddElement(&Close{})
+	if !popplerOrderFillPathCandidate(mediumClosedCurve) {
+		t.Fatal("medium closed curved path should use Poppler-order fill")
+	}
+
+	mediumLineOnly := NewPath()
+	mediumLineOnly.AddElement(&MoveTo{X: 0, Y: 0})
+	mediumLineOnly.AddElement(&LineTo{X: 250, Y: 0})
+	mediumLineOnly.AddElement(&LineTo{X: 250, Y: 230})
+	mediumLineOnly.AddElement(&LineTo{X: 0, Y: 230})
+	mediumLineOnly.AddElement(&Close{})
+	if popplerOrderFillPathCandidate(mediumLineOnly) {
+		t.Fatal("medium line-only path should remain outside the scoped Poppler-order fill candidate")
+	}
 }
 
 func TestMatrixAndTransform(t *testing.T) {
@@ -2214,6 +2289,22 @@ func newRecordingCanvas() *testCanvas {
 	}
 }
 
+type glyphTransformRecordingCanvas struct {
+	*testCanvas
+	glyphTransform    [4]float64
+	glyphTransformSet bool
+	textRenderMode    int
+}
+
+func (c *glyphTransformRecordingCanvas) SetGlyphTransform(transform [4]float64) {
+	c.glyphTransform = transform
+	c.glyphTransformSet = true
+}
+
+func (c *glyphTransformRecordingCanvas) SetTextRenderMode(mode int) {
+	c.textRenderMode = mode
+}
+
 type combinedTestCanvas struct {
 	*testCanvas
 	fillAndStrokeCalls        int
@@ -2575,6 +2666,48 @@ func TestResolveSoftMask_ValidMaskStream(t *testing.T) {
 	e := NewEvaluator(nil)
 	mask := e.resolveSoftMask(maskStream)
 	assert.NotNil(t, mask)
+}
+
+func TestResolveSoftMask_AcceptsImageDictionaryAliases(t *testing.T) {
+	dict := entity.NewDict()
+	dict.Set(entity.Name("W"), entity.NewInteger(1))
+	dict.Set(entity.Name("H"), entity.NewInteger(1))
+	dict.Set(entity.Name("BPC"), entity.NewInteger(8))
+	dict.Set(entity.Name("CS"), entity.Name("G"))
+	dict.Set(entity.Name("D"), entity.NewArray(entity.NewInteger(1), entity.NewInteger(0)))
+	maskStream := entity.NewStream(dict, []byte{255})
+
+	mask := NewEvaluator(nil).resolveSoftMask(maskStream)
+	require.NotNil(t, mask)
+	gray := color.GrayModel.Convert(mask.Image().At(0, 0)).(color.Gray)
+	assert.Equal(t, uint8(0), gray.Y)
+}
+
+func TestResolveSoftMaskRejectsNonGrayColorSpace(t *testing.T) {
+	dict := entity.NewDict()
+	dict.Set(entity.Name("Width"), entity.NewInteger(1))
+	dict.Set(entity.Name("Height"), entity.NewInteger(1))
+	dict.Set(entity.Name("BitsPerComponent"), entity.NewInteger(8))
+	dict.Set(entity.Name("ColorSpace"), entity.Name("DeviceRGB"))
+	maskStream := entity.NewStream(dict, []byte{255, 255, 255})
+
+	assert.Nil(t, NewEvaluator(nil).resolveSoftMask(maskStream))
+}
+
+func TestResolveSoftMask_AppliesDecodeArray(t *testing.T) {
+	dict := entity.NewDict()
+	dict.Set(entity.Name("Width"), entity.NewInteger(1))
+	dict.Set(entity.Name("Height"), entity.NewInteger(1))
+	dict.Set(entity.Name("BitsPerComponent"), entity.NewInteger(8))
+	dict.Set(entity.Name("ColorSpace"), entity.Name("DeviceGray"))
+	decode := entity.NewArray(entity.NewInteger(1), entity.NewInteger(0))
+	dict.Set(entity.Name("Decode"), decode)
+	maskStream := entity.NewStream(dict, []byte{255})
+
+	mask := NewEvaluator(nil).resolveSoftMask(maskStream)
+	require.NotNil(t, mask)
+	gray := color.GrayModel.Convert(mask.Image().At(0, 0)).(color.Gray)
+	assert.Equal(t, uint8(0), gray.Y)
 }
 
 func TestResolveSoftMask_ViaReference(t *testing.T) {
@@ -3225,8 +3358,27 @@ func TestPatternForCanvasShadingUsesFormBaseMatrix(t *testing.T) {
 	assert.Equal(t, multiplyMatrix(base, pattern.Matrix()), got.Matrix())
 }
 
-func TestPatternForCanvasTilingUsesFormBaseMatrix(t *testing.T) {
+func TestPatternForCanvasShadingPopplerOrderProbe(t *testing.T) {
+	t.Setenv("PDF_DEBUG_SHADING_PATTERN_MATRIX_POPPLER_ORDER", "1")
 	e := NewEvaluator(nil)
+	base := [6]float64{2, 0, 0, 3, 5, 7}
+	content := [6]float64{1, 0, 0, 1, 100, 200}
+	e.SetInitialTransform(base)
+	e.graphics.transform = multiplyMatrix(base, content)
+	e.graphics.baseTransform = base
+
+	shading := entity.NewShading(entity.ShadingAxial, "DeviceRGB")
+	pattern := entity.NewShadingPattern("axial", shading)
+	pattern.SetMatrix([6]float64{1, 0, 0, 1, 11, 13})
+
+	got, ok := e.patternForCanvas(pattern).(*entity.ShadingPattern)
+	require.True(t, ok)
+	assert.Equal(t, multiplyMatrix(pattern.Matrix(), base), got.Matrix())
+}
+
+func TestPatternForCanvasTilingUsesFormBaseMatrix(t *testing.T) {
+	xref := &testMapXRef{}
+	e := NewEvaluator(xref)
 	base := [6]float64{2, 0, 0, 3, 5, 7}
 	content := [6]float64{1, 0, 0, 1, 100, 200}
 	e.SetInitialTransform(base)
@@ -3245,6 +3397,7 @@ func TestPatternForCanvasTilingUsesFormBaseMatrix(t *testing.T) {
 	assert.Equal(t, pattern.GetBBox(), got.GetBBox())
 	assert.Equal(t, pattern.GetXStep(), got.GetXStep())
 	assert.Equal(t, pattern.GetYStep(), got.GetYStep())
+	assert.Same(t, xref, got.XRef())
 }
 
 func TestFormXObjectRestoresBaseMatrix(t *testing.T) {
@@ -4219,6 +4372,7 @@ func TestSetColorBySpacePatternWithPatternName(t *testing.T) {
 func TestSetColorBySpacePatternWithValuesAndPatternName(t *testing.T) {
 	e := NewEvaluator(nil)
 	e.graphics.fillCS = "Pattern"
+	e.graphics.fillPatternBaseCS = "DeviceRGB"
 	patternDict := entity.NewDict()
 	patternDict.Set(entity.Name("PatternType"), entity.NewInteger(1))
 	patternDict.Set(entity.Name("PaintType"), entity.NewInteger(2))
@@ -4236,6 +4390,7 @@ func TestSetColorBySpacePatternWithValuesAndPatternName(t *testing.T) {
 	e.SetResources(resources)
 
 	require.NoError(t, e.setColorBySpace(Operator{
+		Opcode: "scn",
 		Operands: []entity.Object{
 			entity.NewReal(1),
 			entity.NewReal(0),
@@ -4251,11 +4406,116 @@ func TestSetColorBySpacePatternWithValuesAndPatternName(t *testing.T) {
 	require.Equal(t, "FF0000", fillColor.Hex)
 }
 
+func TestBarePatternColorOperatorRejectsUnderlyingOperands(t *testing.T) {
+	e := NewEvaluator(nil)
+	oldFill := entity.NewTilingPattern("old-fill", 1, entity.TilingConstantSpacing)
+	e.graphics.fillCS = "Pattern"
+	e.graphics.fillPattern = oldFill
+	e.graphics.fillColor = &ColorSpace{Color: &Color{Hex: "123456"}}
+
+	require.NoError(t, e.setFillColorBySpace(Operator{Opcode: "scn", Operands: []entity.Object{
+		entity.NewReal(1),
+		entity.NewReal(0),
+		entity.NewReal(0),
+		entity.Name("P1"),
+	}}))
+
+	assert.True(t, oldFill == e.graphics.fillPattern)
+	require.NotNil(t, e.graphics.fillColor)
+	fillColor, ok := e.graphics.fillColor.Color.(*Color)
+	require.True(t, ok)
+	assert.Equal(t, "123456", fillColor.Hex)
+}
+
+func TestPatternColorOperatorPreservesPatternOnNoOpOperands(t *testing.T) {
+	e := NewEvaluator(nil)
+	oldFill := entity.NewTilingPattern("old-fill", 1, entity.TilingConstantSpacing)
+	oldStroke := entity.NewTilingPattern("old-stroke", 1, entity.TilingConstantSpacing)
+	e.graphics.fillCS = "Pattern"
+	e.graphics.strokeCS = "Pattern"
+	e.graphics.fillPattern = oldFill
+	e.graphics.strokePattern = oldStroke
+
+	require.NoError(t, e.setFillColorBySpace(Operator{}))
+	require.NoError(t, e.setStrokeColorBySpace(Operator{}))
+	assert.True(t, oldFill == e.graphics.fillPattern)
+	assert.True(t, oldStroke == e.graphics.strokePattern)
+
+	require.NoError(t, e.setFillColorBySpace(Operator{Opcode: "scn", Operands: []entity.Object{entity.NewReal(0.5)}}))
+	require.NoError(t, e.setStrokeColorBySpace(Operator{Opcode: "SCN", Operands: []entity.Object{entity.Name("Missing")}}))
+	assert.True(t, oldFill == e.graphics.fillPattern)
+	assert.True(t, oldStroke == e.graphics.strokePattern)
+}
+
+func TestPatternColorOperatorPreservesPatternWhenOnlyUnderlyingColorChanges(t *testing.T) {
+	e := NewEvaluator(nil)
+	oldFill := entity.NewTilingPattern("old-fill", 1, entity.TilingConstantSpacing)
+	e.graphics.fillCS = "Pattern"
+	e.graphics.fillPatternBaseCS = "DeviceRGB"
+	e.graphics.fillPattern = oldFill
+	e.graphics.fillColor = &ColorSpace{Color: &Color{Hex: "123456"}}
+
+	require.NoError(t, e.setFillColorBySpace(Operator{Opcode: "scn", Operands: []entity.Object{
+		entity.NewReal(1),
+		entity.NewReal(0),
+		entity.NewReal(0),
+		entity.NewReal(0.25),
+	}}))
+
+	assert.True(t, oldFill == e.graphics.fillPattern)
+	require.NotNil(t, e.graphics.fillColor)
+	fillColor, ok := e.graphics.fillColor.Color.(*Color)
+	require.True(t, ok)
+	assert.Equal(t, "FF0000", fillColor.Hex)
+}
+
+func TestPatternColorOperatorRejectsInvalidUnderlyingCountWithoutClearingPattern(t *testing.T) {
+	e := NewEvaluator(nil)
+	oldFill := entity.NewTilingPattern("old-fill", 1, entity.TilingConstantSpacing)
+	e.graphics.fillCS = "Pattern"
+	e.graphics.fillPatternBaseCS = "DeviceRGB"
+	e.graphics.fillPattern = oldFill
+	e.graphics.fillColor = &ColorSpace{Color: &Color{Hex: "123456"}}
+
+	require.NoError(t, e.setFillColorBySpace(Operator{Opcode: "scn", Operands: []entity.Object{
+		entity.NewReal(1),
+		entity.NewReal(0),
+	}}))
+
+	assert.True(t, oldFill == e.graphics.fillPattern)
+	require.NotNil(t, e.graphics.fillColor)
+	fillColor, ok := e.graphics.fillColor.Color.(*Color)
+	require.True(t, ok)
+	assert.Equal(t, "123456", fillColor.Hex)
+}
+
+func TestPatternColorOperatorPreservesPatternOnLookupFailureAfterColorUpdate(t *testing.T) {
+	e := NewEvaluator(nil)
+	oldFill := entity.NewTilingPattern("old-fill", 1, entity.TilingConstantSpacing)
+	e.graphics.fillCS = "Pattern"
+	e.graphics.fillPatternBaseCS = "DeviceRGB"
+	e.graphics.fillPattern = oldFill
+
+	require.NoError(t, e.setFillColorBySpace(Operator{Opcode: "scn", Operands: []entity.Object{
+		entity.NewReal(0),
+		entity.NewReal(1),
+		entity.NewReal(0),
+		entity.Name("Missing"),
+	}}))
+
+	assert.True(t, oldFill == e.graphics.fillPattern)
+	require.NotNil(t, e.graphics.fillColor)
+	fillColor, ok := e.graphics.fillColor.Color.(*Color)
+	require.True(t, ok)
+	assert.Equal(t, "00FF00", fillColor.Hex)
+}
+
 // Test setColorBySpace Pattern stroke resolution
 func TestSetColorBySpacePatternStrokeResolution(t *testing.T) {
 	e := NewEvaluator(nil)
 	e.graphics.strokeCS = "Pattern"
 	require.NoError(t, e.setColorBySpace(Operator{
+		Opcode:   "SCN",
 		Operands: []entity.Object{entity.Name("P1")},
 	}, true))
 }
@@ -4426,36 +4686,63 @@ func TestRenderType3GlyphNilCharproc(t *testing.T) {
 }
 
 func TestType3CharProcUsesD1CacheGate(t *testing.T) {
+	validFont := entity.NewType3Font("ValidT3", [6]float64{0.001, 0, 0, 0.001, 0, 0},
+		map[string]*entity.Stream{}, map[uint32]string{}, map[uint32]float64{}, 0, 255, [4]float64{-1000, -1000, 1000, 1000})
+	dallEStyleFont := entity.NewType3Font("BadBBoxT3", [6]float64{0.001, 0, 0, -0.001, 0, 0},
+		map[string]*entity.Stream{}, map[uint32]string{}, map[uint32]float64{}, 0, 255, [4]float64{0, 0, 1, -1})
+	glyphCTM := [6]float64{0.03, 0, 0, 0.03, 100, 200}
+	d1 := func(llx, lly, urx, ury float64) Operator {
+		return Operator{Opcode: "d1", Operands: []entity.Object{
+			entity.NewReal(0),
+			entity.NewReal(0),
+			entity.NewReal(llx),
+			entity.NewReal(lly),
+			entity.NewReal(urx),
+			entity.NewReal(ury),
+		}}
+	}
+
 	tests := []struct {
 		name string
+		font *entity.Type3Font
 		ops  []Operator
 		want bool
 	}{
 		{
 			name: "d1 charproc uses cached bitmap placement",
-			ops:  []Operator{{Opcode: "d1"}, {Opcode: "q"}},
+			font: validFont,
+			ops:  []Operator{d1(-1000, -1000, 1000, 1000), {Opcode: "q"}},
 			want: true,
 		},
 		{
 			name: "d0 charproc keeps direct vector placement",
-			ops:  []Operator{{Opcode: "d0"}, {Opcode: "d1"}},
+			font: validFont,
+			ops:  []Operator{{Opcode: "d0"}, d1(-1000, -1000, 1000, 1000)},
 			want: false,
 		},
 		{
 			name: "graphics state before d1 keeps existing inline path",
-			ops:  []Operator{{Opcode: "q"}, {Opcode: "d1"}},
+			font: validFont,
+			ops:  []Operator{{Opcode: "q"}, d1(-1000, -1000, 1000, 1000)},
 			want: false,
 		},
 		{
 			name: "missing d1 does not quantize",
+			font: validFont,
 			ops:  []Operator{{Opcode: "cm"}, {Opcode: "f"}},
+			want: false,
+		},
+		{
+			name: "d1 outside invalid font bbox keeps Poppler direct placement",
+			font: dallEStyleFont,
+			ops:  []Operator{d1(41, -549, 533, 218)},
 			want: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, type3CharProcUsesD1Cache(tt.ops))
+			assert.Equal(t, tt.want, type3CharProcUsesD1Cache(tt.font, tt.ops, glyphCTM))
 		})
 	}
 }
@@ -4471,6 +4758,71 @@ func TestType3GlyphCTMMatchesPopplerDoShowText(t *testing.T) {
 
 	got := e.type3GlyphCTM(font, 123, 456, 12)
 	assert.InDeltaSlice(t, []float64{0.031416, 0.020544, 0.02304, 0.09318, 123, 456}, got[:], 1e-12)
+}
+
+func TestSyncCanvasGlyphTransformAppliesHorizontalScaling(t *testing.T) {
+	e := NewEvaluator(nil)
+	canvas := &glyphTransformRecordingCanvas{testCanvas: newRecordingCanvas()}
+	e.SetCanvas(canvas)
+	e.graphics.transform = [6]float64{2, 0.5, 0.25, 3, 11, 13}
+	e.textMatrix = [6]float64{1, 0, 0, 1, 7, 9}
+	e.graphics.currentState.SetHorizontalScaling(150)
+	e.graphics.currentState.SetTextRenderMode(2)
+
+	e.syncCanvasGlyphTransform()
+
+	require.True(t, canvas.glyphTransformSet)
+	assert.InDeltaSlice(t, []float64{3, 0.75, 0.25, 3}, canvas.glyphTransform[:], 1e-12)
+	assert.Equal(t, 2, canvas.textRenderMode)
+}
+
+func TestApplySoftMaskMatteUnblendRGB(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 2, 1))
+	src.SetRGBA(0, 0, color.RGBA{R: 64, G: 128, B: 255, A: 255})
+	src.SetRGBA(1, 0, color.RGBA{R: 10, G: 20, B: 30, A: 255})
+	maskImg := image.NewGray(image.Rect(0, 0, 2, 1))
+	maskImg.SetGray(0, 0, color.Gray{Y: 128})
+	maskImg.SetGray(1, 0, color.Gray{Y: 0})
+	mask := imginfra.NewBitmapMaskFromImage(maskImg, false)
+
+	got := applySoftMaskMatteUnblend(src, mask, []float64{0, 0, 0}, "DeviceRGB", colorspace.NewDeviceRGB()).(*image.RGBA)
+	assert.Equal(t, color.RGBA{R: 127, G: 255, B: 255, A: 255}, got.RGBAAt(0, 0))
+	assert.Equal(t, color.RGBA{R: 0, G: 0, B: 0, A: 255}, got.RGBAAt(1, 0))
+}
+
+func TestSoftMaskMatteRGBUsesResolvedColorMapper(t *testing.T) {
+	mapper := matteColorSpaceStub{
+		components: 3,
+		rgba:       color.RGBA{R: 17, G: 34, B: 51, A: 255},
+	}
+
+	got, ok := softMaskMatteRGB([]float64{0.25, 0.5, 0.75}, "CalRGB", mapper)
+	require.True(t, ok)
+	assert.Equal(t, [3]uint8{17, 34, 51}, got)
+
+	_, ok = softMaskMatteRGB([]float64{0.25, 0.5}, "CalRGB", mapper)
+	assert.False(t, ok)
+}
+
+type matteColorSpaceStub struct {
+	components int
+	rgba       color.RGBA
+}
+
+func (s matteColorSpaceStub) Type() colorspace.ColorSpaceType {
+	return colorspace.ColorSpaceCalRGB
+}
+
+func (s matteColorSpaceStub) Name() string {
+	return "CalRGB"
+}
+
+func (s matteColorSpaceStub) ConvertToRGBA([]float64) color.RGBA {
+	return s.rgba
+}
+
+func (s matteColorSpaceStub) GetNumComponents() int {
+	return s.components
 }
 
 // Test evaluate nil/non-stream content objects
@@ -4798,6 +5150,33 @@ func TestCurrentShadingBBoxWithClipPath(t *testing.T) {
 	bbox, ok = e.currentShadingBBox()
 	assert.True(t, ok)
 	assert.Equal(t, [4]float64{10, 10, 50, 50}, bbox)
+}
+
+func TestCurrentShadingBBoxForDirectShIgnoresCurrentPath(t *testing.T) {
+	e := NewEvaluator(nil)
+	e.SetCanvas(newRecordingCanvas())
+	path := NewPath()
+	path.AddElement(&MoveTo{X: 10, Y: 10})
+	path.AddElement(&LineTo{X: 20, Y: 10})
+	path.AddElement(&LineTo{X: 20, Y: 20})
+	path.AddElement(&Close{})
+	e.graphics.path = path
+
+	shading := entity.NewShading(entity.ShadingAxial, "DeviceRGB")
+	bbox, ok := e.currentShadingBBoxForShading(shading)
+	require.True(t, ok)
+	assert.Equal(t, [4]float64{0, 0, 128, 64}, bbox)
+}
+
+func TestCurrentShadingBBoxForDirectShUsesTransformedBBox(t *testing.T) {
+	e := NewEvaluator(nil)
+	e.graphics.transform = [6]float64{2, 0, 0, 3, 5, 7}
+	shading := entity.NewShading(entity.ShadingAxial, "DeviceRGB")
+	shading.SetBBox([4]float64{1, 2, 4, 6})
+
+	bbox, ok := e.currentShadingBBoxForShading(shading)
+	require.True(t, ok)
+	assert.Equal(t, [4]float64{7, 13, 13, 25}, bbox)
 }
 
 // Test renderTextString empty / nil font
@@ -6236,7 +6615,7 @@ func TestNormalizeBaseFontNameCoverage(t *testing.T) {
 		expected string
 	}{
 		{"ABCDEF+Times-Roman", "Times-Roman"},
-		{"TimesNewRomanPSMT", "TimesNewRomanPSMT"},
+		{"TimesNewRomanPSMT", "Times-Roman"},
 		{"", ""},
 		{"Helvetica-Bold", "Helvetica-Bold"},
 		{"NimbusRomNo9L-Regu", "Times-Roman"},
@@ -6246,15 +6625,19 @@ func TestNormalizeBaseFontNameCoverage(t *testing.T) {
 		{"NimbusRomNo9L-Regu-Slant_167", "Times-Italic"},
 		{"Helvetica", "Helvetica"},
 		{"Arial", "Helvetica"},
+		{"ArialMT", "Helvetica"},
 		{"YuMincho-Regular", "Helvetica"},
 		{"NimbusSanL-Bold", "Helvetica-Bold"},
 		{"Arial,Bold", "Helvetica-Bold"},
+		{"Arial-BoldMT", "Helvetica-Bold"},
 		{"Calibri-Bold", "Helvetica-Bold"},
 		{"Helvetica-Oblique", "Helvetica-Oblique"},
 		{"Arial,Italic", "Helvetica-Oblique"},
+		{"Arial-ItalicMT", "Helvetica-Oblique"},
 		{"Calibri-Italic", "Helvetica-Oblique"},
 		{"Helvetica-BoldOblique", "Helvetica-BoldOblique"},
 		{"Arial,BoldItalic", "Helvetica-BoldOblique"},
+		{"Arial-BoldItalicMT", "Helvetica-BoldOblique"},
 		{"Calibri-BoldItalic", "Helvetica-BoldOblique"},
 		{"CMRTesting", "Times-Roman"},
 		{"CMMITesting", "Times-Italic"},

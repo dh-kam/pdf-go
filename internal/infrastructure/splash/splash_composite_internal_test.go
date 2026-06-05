@@ -22,7 +22,7 @@ func runBlend(f BlendFunc, src, dst Color, mode ColorMode) Color {
 // PDF spec 11.3.5.2 reference values, computed by hand:
 //   Cs = 128 (0.502), Cb = 64 (0.251)
 //   Multiply  = (128*64)/255 = 32
-//   Screen    = 64 + 128 - Div255(8192) = 192 - 32 = 160
+//   Screen    = 64 + 128 - (8192/255) = 192 - 32 = 160
 //   Overlay   = HardLight(Cs=64, Cb=128) — Cb<=127 path: 2*64*128/255 -> 64
 //               (note: our Overlay swaps src/dst — Cs(src)=128, Cb(dst)=64,
 //                so cb<=127 → 2*128*64/255 = 64)
@@ -30,11 +30,11 @@ func runBlend(f BlendFunc, src, dst Color, mode ColorMode) Color {
 //   Lighten   = max(128,64) = 128
 //   ColorDodge: cs=128, cs<255 → (64*255)/(255-128) = (64*255)/127 = 128
 //   ColorBurn:  cs=128, cs!=0 → 255 - min(255, (255-64)*255/128) = 255 - min(255,(191*255)/128) = 255 - min(255, 380) = 255 - 255 = 0
-//   HardLight: cs=128 (>127) → 2*128 + 2*64 - 2*128*64/255 - 255 = 256 + 128 - 64 - 255 = 65
+//   HardLight: cs=128 (>127) → 255 - 2*((255-64)*(255-128))/255 = 65
 //   SoftLight: cs=128 -> 0.502 > 0.5; cb=0.251 > 0.25 → d = sqrt(0.251) ≈ 0.5010
 //              out = 0.251 + (2*0.502 - 1) * (0.5010 - 0.251) = 0.251 + 0.004*0.250 = 0.252  ≈ 64
 //   Difference: |128-64| = 64
-//   Exclusion:  128 + 64 - 2*Div255(128*64) = 192 - 64 = 128
+//   Exclusion:  128 + 64 - (2*128*64)/255 = 192 - 64 = 128
 
 func TestBlendSeparablePointSample(t *testing.T) {
 	src := rgb(128, 128, 128)
@@ -61,6 +61,27 @@ func TestBlendSeparablePointSample(t *testing.T) {
 		if got[0] != c.want || got[1] != c.want || got[2] != c.want {
 			t.Errorf("%s: got %v, want all=%d", c.name, got[:3], c.want)
 		}
+	}
+}
+
+func TestBlendSeparablePopplerTruncatesDivideBy255(t *testing.T) {
+	// Poppler SplashOutputDev.cc uses truncating integer /255 in these blend
+	// functions, not Splash's rounded div255 helper.
+	out := runBlend(BlendOverlay, rgb(1, 1, 1), rgb(192, 192, 192), ModeRGB8)
+	if out[0] != 130 || out[1] != 130 || out[2] != 130 {
+		t.Fatalf("Overlay truncating /255 sample = %v, want all=130", out[:3])
+	}
+	out = runBlend(BlendHardLight, rgb(192, 192, 192), rgb(1, 1, 1), ModeRGB8)
+	if out[0] != 130 || out[1] != 130 || out[2] != 130 {
+		t.Fatalf("HardLight truncating /255 sample = %v, want all=130", out[:3])
+	}
+	out = runBlend(BlendScreen, rgb(1, 1, 1), rgb(128, 128, 128), ModeRGB8)
+	if out[0] != 129 || out[1] != 129 || out[2] != 129 {
+		t.Fatalf("Screen truncating /255 sample = %v, want all=129", out[:3])
+	}
+	out = runBlend(BlendExclusion, rgb(1, 1, 1), rgb(128, 128, 128), ModeRGB8)
+	if out[0] != 128 || out[1] != 128 || out[2] != 128 {
+		t.Fatalf("Exclusion truncating /255 sample = %v, want all=128", out[:3])
 	}
 }
 
@@ -158,11 +179,9 @@ func TestBlendDifferenceCommutative(t *testing.T) {
 // -------------------- HardLight at 50% --------------------
 //
 // PDF spec: HardLight(Cs=0x80, Cb) — boundary case. With cs=128 (>127) the
-// "Screen" branch fires: 2*128 + 2*Cb - Div255(2*128*Cb) - 255
-//                      = 256 + 2*Cb - Div255(256*Cb) - 255
-//                      = 1 + 2*Cb - Div255(256*Cb)
-// For Cb=0: 1+0-0 = 1 (NOT exactly 0 due to boundary).
-// For Cb=255: 1 + 510 - Div255(65280) = 511 - 256 = 255.
+// "Screen" branch fires: 255 - 2*((255-Cb)*(255-128))/255.
+// For Cb=0: 255 - 2*(255*127)/255 = 1.
+// For Cb=255: 255 - 0 = 255.
 // We assert HardLight(0x80, x) is monotonic in x and reaches 255 at x=255.
 
 func TestBlendHardLightAt128(t *testing.T) {

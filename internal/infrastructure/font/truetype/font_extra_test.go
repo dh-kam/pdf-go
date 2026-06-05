@@ -208,6 +208,14 @@ func TestFontScaleAndConvertHelpers(t *testing.T) {
 	require.NotNil(t, entityPath)
 	require.Len(t, entityPath.Commands, 4)
 	assert.Equal(t, [4]float64{2, -16, 14, -4}, entityPath.Bounds)
+	curve, ok := entityPath.Commands[2].(*entity.PathCurveTo)
+	require.True(t, ok)
+	assert.InDelta(t, 26.0/3.0, curve.X1, 1e-9)
+	assert.InDelta(t, -32.0/3.0, curve.Y1, 1e-9)
+	assert.InDelta(t, 34.0/3.0, curve.X2, 1e-9)
+	assert.InDelta(t, -40.0/3.0, curve.Y2, 1e-9)
+	assert.Equal(t, 14.0, curve.X3)
+	assert.Equal(t, -16.0, curve.Y3)
 
 	var _ entity.PathCommand = entityPath.Commands[0]
 	assert.Nil(t, font.convertToEntityPath(nil))

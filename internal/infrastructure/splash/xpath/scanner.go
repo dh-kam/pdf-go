@@ -23,6 +23,7 @@ type Scanner struct {
 	xMinFP, yMinFP   float64
 	xMaxFP, yMaxFP   float64
 	partialClip      bool
+	yFloorSnapEps    float64
 	allIntersections [][]intersect
 }
 
@@ -37,9 +38,14 @@ type ScanIterator struct {
 
 // NewScanner builds a scanner from a sorted XPath (SplashXPathScanner ctor, SplashXPathScanner.cc:42-113).
 func NewScanner(x *XPath, eo bool, xMinA, yMinA, xMaxA, yMaxA int) *Scanner {
+	return newScanner(x, eo, xMinA, yMinA, xMaxA, yMaxA, 0)
+}
+
+func newScanner(x *XPath, eo bool, xMinA, yMinA, xMaxA, yMaxA int, yFloorSnapEps float64) *Scanner {
 	s := &Scanner{
-		xPath: x,
-		eo:    eo,
+		xPath:         x,
+		eo:            eo,
+		yFloorSnapEps: yFloorSnapEps,
 	}
 	// bbox sentinels (SplashXPathScanner.cc:52-53) — empty path yields yMin>yMax
 	// so computeIntersections returns immediately at :234.
@@ -92,8 +98,8 @@ func NewScanner(x *XPath, eo bool, xMinA, yMinA, xMaxA, yMaxA int) *Scanner {
 		s.yMinFP, s.yMaxFP = yMinFP, yMaxFP
 		s.xMin = splashFloor(xMinFP)
 		s.xMax = splashFloor(xMaxFP)
-		s.yMin = splashFloor(yMinFP)
-		s.yMax = splashFloor(yMaxFP)
+		s.yMin = s.floorY(yMinFP)
+		s.yMax = s.floorY(yMaxFP)
 		// clipYMin/clipYMax adjust (SplashXPathScanner.cc:102-109).
 		if yMinA > s.yMin {
 			s.yMin = yMinA
@@ -131,17 +137,18 @@ func (s *Scanner) computeIntersections() {
 		switch {
 		case seg.Flags&XPathHoriz != 0:
 			// horizontal — count=0 hard-coded (SplashXPathScanner.cc:250-256).
-			y := splashFloor(seg.Y0)
+			y := s.floorY(seg.Y0)
 			if y >= s.yMin && y <= s.yMax {
 				s.addIntersection(segYMin, segYMax, y, splashFloor(seg.X0), splashFloor(seg.X1), 0)
+				s.traceAddIntersection(i, "horiz", seg, segYMin, segYMax, y, splashFloor(seg.X0), splashFloor(seg.X1), 0)
 			}
 		case seg.Flags&XPathVert != 0:
 			// vertical (SplashXPathScanner.cc:257-272).
-			y0 := splashFloor(segYMin)
+			y0 := s.floorY(segYMin)
 			if y0 < s.yMin {
 				y0 = s.yMin
 			}
-			y1 := splashFloor(segYMax)
+			y1 := s.floorY(segYMax)
 			if y1 > s.yMax {
 				y1 = s.yMax
 			}
@@ -152,6 +159,7 @@ func (s *Scanner) computeIntersections() {
 			}
 			for y := y0; y <= y1; y++ {
 				s.addIntersection(segYMin, segYMax, y, x, x, count)
+				s.traceAddIntersection(i, "vert", seg, segYMin, segYMax, y, x, x, count)
 			}
 		default:
 			// slope edge (SplashXPathScanner.cc:273-318).
@@ -161,11 +169,11 @@ func (s *Scanner) computeIntersections() {
 			} else {
 				segXMin, segXMax = seg.X1, seg.X0
 			}
-			y0 := splashFloor(segYMin)
+			y0 := s.floorY(segYMin)
 			if y0 < s.yMin {
 				y0 = s.yMin
 			}
-			y1 := splashFloor(segYMax)
+			y1 := s.floorY(segYMax)
 			if y1 > s.yMax {
 				y1 = s.yMax
 			}
@@ -174,8 +182,9 @@ func (s *Scanner) computeIntersections() {
 				count = 1
 			}
 			// xbase = x0 - y0_seg * dxdy → x at y=0 (SplashXPathScanner.cc:292).
-			xbase := seg.X0 - seg.Y0*seg.DXDY
-			xx0 := xbase + float64(y0)*seg.DXDY
+			dxdy := seg.DXDY
+			xbase := seg.X0 - seg.Y0*dxdy
+			xx0 := xbase + float64(y0)*dxdy
 			if xx0 < segXMin {
 				xx0 = segXMin
 			} else if xx0 > segXMax {
@@ -183,7 +192,7 @@ func (s *Scanner) computeIntersections() {
 			}
 			x0 := splashFloor(xx0)
 			for y := y0; y <= y1; y++ {
-				xx1 := xbase + float64(y+1)*seg.DXDY
+				xx1 := xbase + float64(y+1)*dxdy
 				if xx1 < segXMin {
 					xx1 = segXMin
 				} else if xx1 > segXMax {
@@ -191,18 +200,35 @@ func (s *Scanner) computeIntersections() {
 				}
 				x1 := splashFloor(xx1)
 				s.addIntersection(segYMin, segYMax, y, x0, x1, count)
+				s.traceAddIntersection(i, "slope", seg, segYMin, segYMax, y, x0, x1, count)
 				xx0 = xx1
 				x0 = x1
 			}
 		}
 	}
-	// per-row sort by x0 (SplashXPathScanner.cc:320-322).
+	// Per-row sort by x0 (SplashXPathScanner.cc:320-322). Poppler uses
+	// std::sort, so keep the historical stable order by default while allowing
+	// exact-parity probes for equal-x0 intersection ordering.
+	unstableSort := os.Getenv("PDF_DEBUG_SPLASH_SCANNER_UNSTABLE_SORT") == "1"
 	for i := range s.allIntersections {
 		line := s.allIntersections[i]
-		sort.SliceStable(line, func(a, b int) bool {
-			return line[a].X0 < line[b].X0
-		})
+		less := func(a, b int) bool { return line[a].X0 < line[b].X0 }
+		if unstableSort {
+			sort.Slice(line, less)
+		} else {
+			sort.SliceStable(line, less)
+		}
 	}
+}
+
+func (s *Scanner) floorY(y float64) int {
+	if s.yFloorSnapEps > 0 {
+		nearest := math.Round(y)
+		if math.Abs(y-nearest) <= s.yFloorSnapEps {
+			return int(nearest)
+		}
+	}
+	return splashFloor(y)
 }
 
 // addIntersection mirrors SplashXPathScanner::addIntersection.
@@ -220,6 +246,38 @@ func (s *Scanner) addIntersection(segYMin, segYMax float64, y, x0, x1, count int
 		ent.Count = 0
 	}
 	s.allIntersections[y-s.yMin] = append(s.allIntersections[y-s.yMin], ent)
+}
+
+func (s *Scanner) traceAddIntersection(segIndex int, kind string, seg *XPathSeg, segYMin, segYMax float64, y, x0, x1, count int) {
+	if os.Getenv("PDF_DEBUG_SPLASH_SCANNER_ADD_TRACE") == "" {
+		return
+	}
+	if seg == nil {
+		return
+	}
+	lo, hi := x0, x1
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	for _, target := range parseClipAABufTraceTargets() {
+		ty0 := target.y * aaSize
+		ty1 := ty0 + aaSize - 1
+		if y < ty0 || y > ty1 {
+			continue
+		}
+		tx0 := target.x * aaSize
+		tx1 := tx0 + aaSize - 1
+		if hi < tx0-aaSize*2 || lo > tx1+aaSize*2 {
+			continue
+		}
+		entCount := 0
+		if segYMin <= float64(y) && float64(y) < segYMax {
+			entCount = count
+		}
+		fmt.Fprintf(os.Stderr, "SPLASH_SCANNER_ADD_TRACE seg=%d kind=%s y=%d x0=%d x1=%d stored=(%d,%d) count=%d entCount=%d seg=(%.17g,%.17g)->(%.17g,%.17g) dxdy=%.17g flags=0x%02x segY=(%.17g,%.17g)\n",
+			segIndex, kind, y, x0, x1, lo, hi, count, entCount,
+			seg.X0, seg.Y0, seg.X1, seg.Y1, seg.DXDY, seg.Flags, segYMin, segYMax)
+	}
 }
 
 // BBox returns the path bounding box in integer coords (SplashXPathScanner.h:62-68).
@@ -661,7 +719,7 @@ func (s *Scanner) ClipAALine(y int, aaBuf []byte, xMin, xMax int) {
 						a = width
 					}
 					if xx < a {
-						clearBitsRange(aaBuf, rowOff, xx, a)
+						xx = clearBitsRangePopplerClipGap(aaBuf, rowOff, xx, a)
 					}
 					// Advance xx past span [xx0, xx1] → next gap starts at xx1+1.
 					b := xx1 + 1 - subOriginBit
@@ -677,7 +735,7 @@ func (s *Scanner) ClipAALine(y int, aaBuf []byte, xMin, xMax int) {
 			xx = 0
 		}
 		if xx < width {
-			clearBitsRange(aaBuf, rowOff, xx, width)
+			xx = clearBitsRangePopplerClip(aaBuf, rowOff, xx, width)
 		}
 		if trace {
 			fmt.Fprintf(os.Stderr, "SPLASH_SCANNER_CLIP_TRACE yy=%d phase=end x=%d y=%d shape=%d finalXX=%d\n",
@@ -705,6 +763,8 @@ func (s *Scanner) ClipAALineFullWidth(y int, aaBuf []byte, x0, x1, bitmapWidth i
 		return
 	}
 	rowSize := (width + 7) >> 3
+	traceX, trace := scannerClipFullWidthTraceTarget(y, bitmapWidth)
+	traceCell := traceX * aaSize
 	yyMin, yyMax := 0, aaSize-1
 	if s.yMin > s.yMax || s.allIntersections == nil {
 		for yy := 0; yy < aaSize; yy++ {
@@ -725,10 +785,23 @@ func (s *Scanner) ClipAALineFullWidth(y int, aaBuf []byte, x0, x1, bitmapWidth i
 		if limit > width {
 			limit = width
 		}
+		if trace {
+			fmt.Fprintf(os.Stderr, "SPLASH_SCANNER_CLIP_FULL_TRACE yy=%d phase=start x=%d y=%d shape=%d xx=%d limit=%d x0=%d x1=%d yyMin=%d yyMax=%d scannerY=(%d,%d) eo=%t\n",
+				yy, traceX, y, countFullWidthAABufPixel(aaBuf, rowSize, traceX), xx, limit, x0, x1, yyMin, yyMax, s.yMin, s.yMax, s.eo)
+		}
 		if yy >= yyMin && yy <= yyMax {
 			idx := aaSize*y + yy - s.yMin
 			if idx >= 0 && idx < len(s.allIntersections) {
 				line := s.allIntersections[idx]
+				if trace {
+					fmt.Fprintf(os.Stderr, "SPLASH_SCANNER_CLIP_FULL_TRACE yy=%d lineSize=%d intersectionIndex=%d\n", yy, len(line), idx)
+					for traceIdx, ent := range line {
+						if ent.X1 >= traceCell-aaSize*2 && ent.X0 <= traceCell+aaSize*3 {
+							fmt.Fprintf(os.Stderr, "SPLASH_SCANNER_CLIP_FULL_TRACE yy=%d entry=%d x0=%d x1=%d count=%d\n",
+								yy, traceIdx, ent.X0, ent.X1, ent.Count)
+						}
+					}
+				}
 				interIdx, interCount := 0, 0
 				for interIdx < len(line) && xx < limit {
 					xx0 := line[interIdx].X0
@@ -755,11 +828,19 @@ func (s *Scanner) ClipAALineFullWidth(y int, aaBuf []byte, x0, x1, bitmapWidth i
 					if xx0 > width {
 						xx0 = width
 					}
+					if trace && xx0 > traceCell && xx < traceCell+aaSize {
+						fmt.Fprintf(os.Stderr, "SPLASH_SCANNER_CLIP_FULL_TRACE yy=%d gap=[%d,%d) clearsTarget=true beforeShape=%d\n",
+							yy, xx, xx0, countFullWidthAABufPixel(aaBuf, rowSize, traceX))
+					}
 					if xx < xx0 {
 						// Poppler uses a slightly different partial-byte mask for
 						// the gap before a covered span than for the trailing gap
 						// below (SplashXPathScanner.cc:470-489).
-						clearBitsRangePopplerClipGap(aaBuf, rowOff, xx, xx0)
+						xx = clearBitsRangePopplerClipGap(aaBuf, rowOff, xx, xx0)
+					}
+					if trace && xx0 > traceCell && xx < traceCell+aaSize {
+						fmt.Fprintf(os.Stderr, "SPLASH_SCANNER_CLIP_FULL_TRACE yy=%d gap=[%d,%d) afterShape=%d\n",
+							yy, xx, xx0, countFullWidthAABufPixel(aaBuf, rowSize, traceX))
 					}
 					if xx1 >= xx {
 						xx = xx1 + 1
@@ -770,10 +851,30 @@ func (s *Scanner) ClipAALineFullWidth(y int, aaBuf []byte, x0, x1, bitmapWidth i
 		if xx < 0 {
 			xx = 0
 		}
+		if trace && limit > traceCell && xx < traceCell+aaSize {
+			fmt.Fprintf(os.Stderr, "SPLASH_SCANNER_CLIP_FULL_TRACE yy=%d tail=[%d,%d) clearsTarget=true beforeShape=%d\n",
+				yy, xx, limit, countFullWidthAABufPixel(aaBuf, rowSize, traceX))
+		}
 		if xx < limit {
-			clearBitsRangePopplerClip(aaBuf, rowOff, xx, limit)
+			xx = clearBitsRangePopplerClip(aaBuf, rowOff, xx, limit)
+		}
+		if trace {
+			fmt.Fprintf(os.Stderr, "SPLASH_SCANNER_CLIP_FULL_TRACE yy=%d phase=end x=%d y=%d shape=%d finalXX=%d\n",
+				yy, traceX, y, countFullWidthAABufPixel(aaBuf, rowSize, traceX), xx)
 		}
 	}
+}
+
+func scannerClipFullWidthTraceTarget(y, bitmapWidth int) (int, bool) {
+	if os.Getenv("PDF_DEBUG_SPLASH_SCANNER_CLIP_FULL_TRACE") == "" {
+		return 0, false
+	}
+	for _, target := range parseClipAABufTraceTargets() {
+		if target.y == y && target.x >= 0 && target.x < bitmapWidth {
+			return target.x, true
+		}
+	}
+	return 0, false
 }
 
 // setBitsRange OR-sets aaBuf bits in [a, b) (sub-cell indices local to the
@@ -843,18 +944,18 @@ func clearBitsRange(aaBuf []byte, rowOff, a, b int) {
 	}
 }
 
-func clearBitsRangePopplerClip(aaBuf []byte, rowOff, a, b int) {
+func clearBitsRangePopplerClip(aaBuf []byte, rowOff, a, b int) int {
 	if a >= b {
-		return
+		return a
 	}
 	if a < 0 {
 		a = 0
 	}
+	xx := a
 	byteIdx := rowOff + (a >> 3)
 	if byteIdx >= len(aaBuf) {
-		return
+		return xx
 	}
-	xx := a
 	if xx&7 != 0 {
 		mask := byte((int(0xff00) >> (xx & 7)) & 0xff)
 		if (xx &^ 7) == (b &^ 7) {
@@ -872,20 +973,21 @@ func clearBitsRangePopplerClip(aaBuf []byte, rowOff, a, b int) {
 	if xx < b && byteIdx < len(aaBuf) {
 		aaBuf[byteIdx] &= byte(0xff >> (b & 7))
 	}
+	return xx
 }
 
-func clearBitsRangePopplerClipGap(aaBuf []byte, rowOff, a, b int) {
+func clearBitsRangePopplerClipGap(aaBuf []byte, rowOff, a, b int) int {
 	if a >= b {
-		return
+		return a
 	}
 	if a < 0 {
 		a = 0
 	}
+	xx := a
 	byteIdx := rowOff + (a >> 3)
 	if byteIdx >= len(aaBuf) {
-		return
+		return xx
 	}
-	xx := a
 	if xx&7 != 0 {
 		mask := byte((int(0xff00) >> (xx & 7)) & 0xff)
 		if (xx &^ 7) == (b &^ 7) {
@@ -903,4 +1005,5 @@ func clearBitsRangePopplerClipGap(aaBuf []byte, rowOff, a, b int) {
 	if xx < b && byteIdx < len(aaBuf) {
 		aaBuf[byteIdx] &= byte(0xff >> (b & 7))
 	}
+	return xx
 }

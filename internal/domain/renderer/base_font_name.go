@@ -23,16 +23,34 @@ func normalizeBaseFontName(name string) string {
 		return "Times-Italic"
 	case "NimbusRomNo9L-MediItal":
 		return "Times-BoldItalic"
-	case "Helvetica", "Arial", "YuMincho-Regular":
+	case "Helvetica", "Arial", "ArialMT", "YuMincho-Regular":
 		return "Helvetica"
 	case "NimbusSanL-Bold":
 		return "Helvetica-Bold"
-	case "Helvetica-Bold", "Arial,Bold", "Calibri-Bold":
+	case "Helvetica-Bold", "Arial,Bold", "Arial-Bold", "Arial-BoldMT", "Calibri-Bold":
 		return "Helvetica-Bold"
-	case "Helvetica-Oblique", "Arial,Italic", "Calibri-Italic":
+	case "Helvetica-Oblique", "Helvetica-Italic", "Arial,Italic", "Arial-Italic", "Arial-ItalicMT", "Calibri-Italic":
 		return "Helvetica-Oblique"
-	case "Helvetica-BoldOblique", "Arial,BoldItalic", "Calibri-BoldItalic":
+	case "Helvetica-BoldOblique", "Helvetica-BoldItalic", "Arial,BoldItalic", "Arial-BoldItalic", "Arial-BoldItalicMT", "Calibri-BoldItalic":
 		return "Helvetica-BoldOblique"
+	case "CourierNew", "CourierNewPSMT":
+		return "Courier"
+	case "CourierNew,Bold", "CourierNew-Bold", "CourierNewPS-BoldMT":
+		return "Courier-Bold"
+	case "CourierNew,Italic", "CourierNew-Italic", "CourierNewPS-ItalicMT":
+		return "Courier-Oblique"
+	case "CourierNew,BoldItalic", "CourierNew-BoldItalic", "CourierNewPS-BoldItalicMT":
+		return "Courier-BoldOblique"
+	case "SymbolMT", "SymbolMT,Bold", "SymbolMT,BoldItalic", "SymbolMT,Italic":
+		return "Symbol"
+	case "TimesNewRoman", "TimesNewRomanPS", "TimesNewRomanPSMT":
+		return "Times-Roman"
+	case "TimesNewRoman,Bold", "TimesNewRoman-Bold", "TimesNewRomanPS-Bold", "TimesNewRomanPS-BoldMT", "TimesNewRomanPSMT,Bold":
+		return "Times-Bold"
+	case "TimesNewRoman,Italic", "TimesNewRoman-Italic", "TimesNewRomanPS-Italic", "TimesNewRomanPS-ItalicMT", "TimesNewRomanPSMT,Italic":
+		return "Times-Italic"
+	case "TimesNewRoman,BoldItalic", "TimesNewRoman-BoldItalic", "TimesNewRomanPS-BoldItalic", "TimesNewRomanPS-BoldItalicMT", "TimesNewRomanPSMT,BoldItalic":
+		return "Times-BoldItalic"
 	}
 
 	switch {

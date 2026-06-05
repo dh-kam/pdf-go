@@ -34,6 +34,8 @@ type AxialShader struct {
 	// Poppler's SplashUnivariatePattern stores the inverse CTM and applies it
 	// per sample before solving the axial parameter.
 	Transform func(x, y float64) (float64, float64)
+	// DebugName is emitted only by explicit trace gates.
+	DebugName string
 
 	// Pre-computed axis vector and inverse length-squared.
 	dx, dy     float64
@@ -117,8 +119,8 @@ func (s *AxialShader) GetColor(x, y int, c *Color) bool {
 	funcT := s.T0 + t*(s.T1-s.T0)
 	*c = s.Func(funcT)
 	if shouldTraceAxialPixel(x, y) {
-		fmt.Fprintf(os.Stderr, "SPLASH_AXIAL_PIXEL_TRACE x=%d y=%d fx=%.12f fy=%.12f s=%.12f t=%.12f color=(%d,%d,%d)\n",
-			x, y, fx, fy, t, funcT, c[0], c[1], c[2])
+		fmt.Fprintf(os.Stderr, "SPLASH_AXIAL_PIXEL_TRACE name=%s x=%d y=%d fx=%.12f fy=%.12f s=%.12f t=%.12f color=(%d,%d,%d)\n",
+			s.DebugName, x, y, fx, fy, t, funcT, c[0], c[1], c[2])
 	}
 	return true
 }

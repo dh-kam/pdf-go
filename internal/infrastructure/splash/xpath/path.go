@@ -1,6 +1,9 @@
 package xpath
 
-import "errors"
+import (
+	"errors"
+	"math"
+)
 
 // Path flag constants mirror SplashPath.h:39-52.
 const (
@@ -203,6 +206,66 @@ func (p *Path) Offset(dx, dy float64) {
 		p.pts[i].X += dx
 		p.pts[i].Y += dy
 	}
+}
+
+// WithIntegralSubpathYMinNudgedDown returns a copy with closed subpath y-min
+// boundary ties moved one floating-point step below the scanner floor boundary.
+func (p *Path) WithIntegralSubpathYMinNudgedDown() *Path {
+	if p == nil || len(p.pts) == 0 {
+		return p
+	}
+	var out *Path
+	for start := 0; start < len(p.pts); {
+		end := start
+		for end+1 < len(p.pts) && p.flags[end]&pathLast == 0 {
+			end++
+		}
+		if subpathIsClosed(p, start, end) {
+			yMin := p.pts[start].Y
+			for i := start + 1; i <= end; i++ {
+				if p.pts[i].Y < yMin {
+					yMin = p.pts[i].Y
+				}
+			}
+			if nudged, ok := integralBoundaryNudgeDown(yMin); ok {
+				if out == nil {
+					out = p.Clone()
+				}
+				for i := start; i <= end; i++ {
+					if p.pts[i].Y == yMin {
+						out.pts[i].Y = nudged
+					}
+				}
+			}
+		}
+		start = end + 1
+	}
+	if out != nil {
+		return out
+	}
+	return p
+}
+
+func subpathIsClosed(p *Path, start, end int) bool {
+	if p == nil || start < 0 || end < start || end >= len(p.flags) {
+		return false
+	}
+	return p.flags[start]&pathClosed != 0 || p.flags[end]&pathClosed != 0
+}
+
+func integralBoundaryNudgeDown(value float64) (float64, bool) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, false
+	}
+	rounded := math.Round(value)
+	if math.Abs(value-rounded) > 1e-9 {
+		return 0, false
+	}
+	nudged := math.Nextafter(rounded, math.Inf(-1))
+	if nudged == value {
+		return 0, false
+	}
+	return nudged, true
 }
 
 // GetCurPt reports the current point (SplashPath::getCurPt, SplashPath.cc:222-230).

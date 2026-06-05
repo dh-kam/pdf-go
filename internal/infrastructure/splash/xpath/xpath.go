@@ -34,12 +34,12 @@ type XPath struct {
 
 // xpathAdjust mirrors SplashXPathAdjust (SplashXPath.cc:42-49).
 type xpathAdjust struct {
-	firstPt, lastPt   int
-	vert              bool
-	x0a, x0b          float64
-	xma, xmb          float64
-	x1a, x1b          float64
-	x0, x1, xm        float64
+	firstPt, lastPt int
+	vert            bool
+	x0a, x0b        float64
+	xma, xmb        float64
+	x1a, x1b        float64
+	x0, x1, xm      float64
 }
 
 // splashFloor copies SplashMath.h:80-86 (portable branch) — truncates toward -inf.

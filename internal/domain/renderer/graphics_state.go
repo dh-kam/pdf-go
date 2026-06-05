@@ -1,6 +1,7 @@
 package renderer
 
 import (
+	"github.com/dh-kam/pdf-go/internal/domain/colorspace"
 	"github.com/dh-kam/pdf-go/internal/domain/entity"
 	"github.com/dh-kam/pdf-go/internal/domain/graphics"
 )
@@ -17,6 +18,7 @@ func NewGraphicsState() *GraphicsState {
 		lineWidth:       1.0,
 		fillAlpha:       1.0,
 		strokeAlpha:     1.0,
+		blendMode:       "Normal",
 		transferActive:  false,
 		fillColor:       &ColorSpace{Color: &Color{Hex: "000000"}},
 		strokeColor:     &ColorSpace{Color: &Color{Hex: "000000"}},
@@ -28,6 +30,7 @@ func NewGraphicsState() *GraphicsState {
 		fontSize:        12.0,
 		currentState:    graphics.NewState(),
 		path:            NewPath(),
+		rawPath:         NewPath(),
 		clipMode:        ClipNonZeroWinding,
 		pendingClip:     false,
 		pendingClipMode: ClipNonZeroWinding,
@@ -44,10 +47,13 @@ type GraphicsState struct {
 	strokePattern        entity.Pattern
 	fillCS               string
 	strokeCS             string
+	fillParsedCS         colorspace.ColorSpace
+	strokeParsedCS       colorspace.ColorSpace
 	fillPatternBaseCS    string
 	strokePatternBaseCS  string
 	currentState         *graphics.State
 	path                 *Path
+	rawPath              *Path
 	pathClip             *Path
 	textMatrix           [6]float64
 	textLine             [6]float64
@@ -61,6 +67,8 @@ type GraphicsState struct {
 	baseTransform        [6]float64
 	fillAlpha            float64
 	strokeAlpha          float64
+	blendMode            string
+	alphaIsShape         bool
 	transferRed          [256]uint8
 	transferGreen        [256]uint8
 	transferBlue         [256]uint8

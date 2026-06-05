@@ -107,9 +107,9 @@ var (
 
 	// sRGB D65 XYZ to RGB conversion matrix
 	srgbD65XYZToRGBMatrix = [9]float64{
-		3.2404542, -1.5371385, -0.4985314,
-		-0.9692660, 1.8760108, 0.0415560,
-		0.0556434, -0.2040259, 1.0572252,
+		3.240449, -1.537136, -0.498531,
+		-0.969265, 1.876011, 0.041556,
+		0.055643, -0.204026, 1.057229,
 	}
 
 	flatWhitePoint = [3]float64{1, 1, 1}
@@ -169,10 +169,10 @@ func (cs *CalRGB) ConvertToRGBA(values []float64) color.RGBA {
 		return color.RGBA{0, 0, 0, 255}
 	}
 
-	// Clamp input values to [0, 1]
-	A := clamp01(values[0])
-	B := clamp01(values[1])
-	C := clamp01(values[2])
+	// Poppler stores color components as fixed-point GfxColorComp values.
+	A := popplerDblToColToDbl(values[0])
+	B := popplerDblToColToDbl(values[1])
+	C := popplerDblToColToDbl(values[2])
 
 	// Apply gamma correction
 	var AGR, BGG, CGB float64
@@ -192,34 +192,46 @@ func (cs *CalRGB) ConvertToRGBA(values []float64) color.RGBA {
 		CGB = math.Pow(C, cs.gamma[2])
 	}
 
-	// Convert to XYZ using matrix
-	X := cs.matrix[0]*AGR + cs.matrix[1]*BGG + cs.matrix[2]*CGB
-	Y := cs.matrix[3]*AGR + cs.matrix[4]*BGG + cs.matrix[5]*CGB
-	Z := cs.matrix[6]*AGR + cs.matrix[7]*BGG + cs.matrix[8]*CGB
+	// Poppler applies the CalRGB Matrix in PDF column order.
+	X := cs.matrix[0]*AGR + cs.matrix[3]*BGG + cs.matrix[6]*CGB
+	Y := cs.matrix[1]*AGR + cs.matrix[4]*BGG + cs.matrix[7]*CGB
+	Z := cs.matrix[2]*AGR + cs.matrix[5]*BGG + cs.matrix[8]*CGB
 
-	// Normalize whitePoint to flat
-	XYZ := [3]float64{X, Y, Z}
-	XYZFlat := cs.normalizeWhitePointToFlat(cs.whitePoint, XYZ)
-
-	// Compensate blackPoint
-	XYZBlack := cs.compensateBlackPoint(cs.blackPoint, XYZFlat)
-
-	// Normalize to D65
-	XYZD65 := cs.normalizeWhitePointToD65(flatWhitePoint, XYZBlack)
+	XYZD65 := bradfordTransformToD65([3]float64{X, Y, Z}, cs.whitePoint)
 
 	// Convert XYZ to sRGB
 	SRGB := matrixProduct(srgbD65XYZToRGBMatrix, XYZD65)
 
-	// Apply sRGB transfer function and convert to [0, 255]
-	r := srgbTransferFunction(SRGB[0]) * 255
-	g := srgbTransferFunction(SRGB[1]) * 255
-	b := srgbTransferFunction(SRGB[2]) * 255
-
 	return color.RGBA{
-		R: uint8(math.Round(clamp(r, 0, 255))),
-		G: uint8(math.Round(clamp(g, 0, 255))),
-		B: uint8(math.Round(clamp(b, 0, 255))),
+		R: popplerDblToColToByte(srgbTransferFunction(clamp01(SRGB[0]))),
+		G: popplerDblToColToByte(srgbTransferFunction(clamp01(SRGB[1]))),
+		B: popplerDblToColToByte(srgbTransferFunction(clamp01(SRGB[2]))),
 		A: 255,
+	}
+}
+
+func bradfordTransformToD65(xyz [3]float64, sourceWhitePoint [3]float64) [3]float64 {
+	const (
+		d65X = 0.9505
+		d65Y = 1.0
+		d65Z = 1.0890
+	)
+	if sourceWhitePoint[0] == d65X && sourceWhitePoint[1] == d65Y && sourceWhitePoint[2] == d65Z {
+		return xyz
+	}
+
+	rho := 0.8951000*xyz[0] + 0.2664000*xyz[1] - 0.1614000*xyz[2]
+	gamma := -0.7502000*xyz[0] + 1.7135000*xyz[1] + 0.0367000*xyz[2]
+	beta := 0.0389000*xyz[0] - 0.0685000*xyz[1] + 1.0296000*xyz[2]
+
+	rho /= 0.8951000*sourceWhitePoint[0] + 0.2664000*sourceWhitePoint[1] - 0.1614000*sourceWhitePoint[2]
+	gamma /= -0.7502000*sourceWhitePoint[0] + 1.7135000*sourceWhitePoint[1] + 0.0367000*sourceWhitePoint[2]
+	beta /= 0.0389000*sourceWhitePoint[0] - 0.0685000*sourceWhitePoint[1] + 1.0296000*sourceWhitePoint[2]
+
+	return [3]float64{
+		0.92918329*rho - 0.15299782*gamma + 0.17428453*beta,
+		0.40698452*rho + 0.53931108*gamma + 0.05370440*beta,
+		-0.00802913*rho + 0.04166125*gamma + 1.05519788*beta,
 	}
 }
 
@@ -257,11 +269,8 @@ func toD65(sourceWhitePoint, lms [3]float64) [3]float64 {
 
 // srgbTransferFunction applies sRGB gamma correction
 func srgbTransferFunction(color float64) float64 {
-	if color <= 0.0031308 {
-		return clamp01(12.92 * color)
-	}
-	if color >= 0.99554525 {
-		return 1.0
+	if color <= 0.03928/12.92321 {
+		return clamp01(12.92321 * color)
 	}
 	return clamp01((1.0+0.055)*math.Pow(color, 1.0/2.4) - 0.055)
 }

@@ -11,6 +11,7 @@ import (
 	ftraster "github.com/dh-kam/freetype-go/raster"
 	ftsfnt "github.com/dh-kam/freetype-go/sfnt"
 	fttype1 "github.com/dh-kam/freetype-go/type1"
+	"github.com/dh-kam/pdf-go/internal/domain/entity"
 )
 
 func useFreeTypeGoAdapter() bool {
@@ -80,14 +81,145 @@ func renderGlyphBitmapByIndexFreeTypeGo(fontData []byte, glyphIndex uint32, size
 	return copyFreeTypeGoGrayBitmap(bitmap), bitmap.GetWidth(), bitmap.GetRows(), bitmap.GetLeft(), bitmap.GetTop(), true, nil
 }
 
+func renderGlyphPathByIndexFreeTypeGo(fontData []byte, glyphIndex uint32, sizePt float64, matrix [4]float64) (*entity.GlyphPath, bool, error) {
+	if !useFreeTypeGoAdapter() {
+		return nil, false, nil
+	}
+	ppem, rasterMatrix := popplerSFNTBitmapMatrix(sizePt, matrix, 72)
+	sizePx := int(ppem >> 6)
+	if sizePx <= 0 {
+		return nil, true, fmt.Errorf("invalid glyph ppem")
+	}
+	face, err := loadFreeTypeGoFace(fontData)
+	if err != nil {
+		return nil, false, nil
+	}
+	if err := face.SetPixelSizes(0, sizePx); err != nil {
+		return nil, true, err
+	}
+	slot, err := face.LoadGlyph(int(glyphIndex), ftapi.LoadNoBitmap|ftapi.LoadNoHinting)
+	if err != nil {
+		return nil, true, err
+	}
+	outline := cloneFreeTypeGoOutline(slot.GetOutline())
+	if outline == nil || len(outline.Points) == 0 {
+		return nil, true, nil
+	}
+	var path *entity.GlyphPath
+	if os.Getenv("PDF_DEBUG_FTGO_PATH_FIXED_TRANSFORM") == "1" {
+		transformFreeTypeGoOutline(outline, rasterMatrix, 0, 0, true)
+		path = freeTypeGoOutlineToGlyphPath(outline)
+	} else {
+		path = freeTypeGoOutlineToPopplerTextGlyphPath(outline, rasterMatrix)
+	}
+	if path == nil || len(path.Commands) == 0 {
+		return nil, true, nil
+	}
+	debugDumpFreeTypeGoGlyphPath(glyphIndex, path)
+	return path, true, nil
+}
+
+func renderGlyphPathByIndexTextMatrixFreeTypeGo(fontData []byte, glyphIndex uint32, sizePt float64, matrix [4]float64) (*entity.GlyphPath, bool, error) {
+	if !useFreeTypeGoAdapter() {
+		return nil, false, nil
+	}
+	ppem, rasterMatrix := popplerSFNTBitmapMatrix(sizePt, matrix, 72)
+	sizePx := int(ppem >> 6)
+	if sizePx <= 0 {
+		return nil, true, fmt.Errorf("invalid glyph ppem")
+	}
+	textScale := sizePt / float64(sizePx)
+	if textScale <= 0 {
+		return nil, true, fmt.Errorf("invalid glyph text scale")
+	}
+	face, err := loadFreeTypeGoFace(fontData)
+	if err != nil {
+		return nil, false, nil
+	}
+	if err := face.SetPixelSizes(0, sizePx); err != nil {
+		return nil, true, err
+	}
+	slot, err := face.LoadGlyph(int(glyphIndex), ftapi.LoadNoBitmap|ftapi.LoadNoHinting)
+	if err != nil {
+		return nil, true, err
+	}
+	outline := cloneFreeTypeGoOutline(slot.GetOutline())
+	if outline == nil || len(outline.Points) == 0 {
+		return nil, true, nil
+	}
+	path := freeTypeGoOutlineToPopplerTextGlyphPathWithScale(outline, rasterMatrix, textScale)
+	if path == nil || len(path.Commands) == 0 {
+		return nil, true, nil
+	}
+	debugDumpFreeTypeGoGlyphPath(glyphIndex, path)
+	return path, true, nil
+}
+
+func debugDumpFreeTypeGoGlyphPath(glyphIndex uint32, path *entity.GlyphPath) {
+	filter := os.Getenv("PDF_DEBUG_FTGO_PATH_DUMP_GLYPH")
+	if filter == "" || path == nil {
+		return
+	}
+	if filter != "*" && filter != fmt.Sprintf("%d", glyphIndex) {
+		return
+	}
+	for i, cmd := range path.Commands {
+		switch v := cmd.(type) {
+		case *entity.PathMoveTo:
+			fmt.Fprintf(os.Stderr, "FTGO_PATH_DUMP glyph=%d index=%d op=M x=%.17g y=%.17g\n", glyphIndex, i, v.X, v.Y)
+		case *entity.PathLineTo:
+			fmt.Fprintf(os.Stderr, "FTGO_PATH_DUMP glyph=%d index=%d op=L x=%.17g y=%.17g\n", glyphIndex, i, v.X, v.Y)
+		case *entity.PathCurveTo:
+			fmt.Fprintf(os.Stderr, "FTGO_PATH_DUMP glyph=%d index=%d op=C x1=%.17g y1=%.17g x2=%.17g y2=%.17g x3=%.17g y3=%.17g\n",
+				glyphIndex, i, v.X1, v.Y1, v.X2, v.Y2, v.X3, v.Y3)
+		case *entity.PathClose:
+			fmt.Fprintf(os.Stderr, "FTGO_PATH_DUMP glyph=%d index=%d op=Z\n", glyphIndex, i)
+		}
+	}
+}
+
+func freeTypeGoOutlineToPopplerTextGlyphPath(outline *ftcore.Outline, matrix [4]float64) *entity.GlyphPath {
+	scale := freeTypeGoOutlinePopplerScale(matrix)
+	if scale <= 0 {
+		return nil
+	}
+	return freeTypeGoOutlineToPopplerTextGlyphPathWithScale(outline, matrix, scale)
+}
+
+func freeTypeGoOutlineToPopplerTextGlyphPathWithScale(outline *ftcore.Outline, matrix [4]float64, pathScale float64) *entity.GlyphPath {
+	scale := math.Hypot(matrix[2], matrix[3])
+	if scale <= 0 {
+		scale = math.Hypot(matrix[0], matrix[1])
+	}
+	if scale <= 0 {
+		return nil
+	}
+	unitMatrix := [4]float64{
+		matrix[0] / scale,
+		matrix[1] / scale,
+		matrix[2] / scale,
+		matrix[3] / scale,
+	}
+	transformFreeTypeGoOutline(outline, unitMatrix, 0, 0, false)
+	return freeTypeGoOutlineToGlyphPathWithScale(outline, pathScale)
+}
+
+func freeTypeGoOutlinePopplerScale(matrix [4]float64) float64 {
+	scale := math.Hypot(matrix[2], matrix[3])
+	if scale <= 0 {
+		scale = math.Hypot(matrix[0], matrix[1])
+	}
+	return scale
+}
+
 func useFreeTypeGoFillRule(face ftapi.Face) bool {
-	if _, ok := face.(*fttype1.Face); ok {
-		return true
-	}
-	if sfntFace, ok := face.(interface{ UsesCFFOutlines() bool }); ok {
-		return sfntFace.UsesCFFOutlines()
-	}
-	return false
+	// Poppler's SplashFTFont renders all FreeType outlines through ftgrays'
+	// default non-zero fill rule. That rule quantizes negative coverage with
+	// `coverage = ~coverage`, which differs by one alpha level from taking the
+	// absolute area before shifting. Use the FreeType-compatible rule for
+	// TrueType as well as Type1/CFF outlines.
+	_ = face
+	return true
 }
 
 func getGlyphIndexByCharCodeFreeTypeGo(fontData []byte, charCode uint32) (uint32, bool, bool) {
@@ -111,6 +243,10 @@ type freeTypeGoGlyphNameIndexer interface {
 
 type freeTypeGoGlyphNameByCharCoder interface {
 	GetGlyphNameByCharCode(charCode uint32) (string, bool)
+}
+
+type freeTypeGoCIDToGIDMapper interface {
+	CIDToGIDMap() (map[uint32]uint32, bool)
 }
 
 type freeTypeGoFaceBBoxProvider interface {
@@ -153,6 +289,22 @@ func getGlyphNameByCharCodeFreeTypeGo(fontData []byte, charCode uint32) (string,
 		return "", false, true
 	}
 	return name, true, true
+}
+
+func getCIDToGIDMapFreeTypeGo(fontData []byte) (map[uint32]uint32, bool, bool) {
+	if !useFreeTypeGoAdapter() {
+		return nil, false, false
+	}
+	face, err := loadFreeTypeGoFace(fontData)
+	if err != nil {
+		return nil, false, false
+	}
+	mapper, ok := face.(freeTypeGoCIDToGIDMapper)
+	if !ok {
+		return nil, false, false
+	}
+	cidToGID, ok := mapper.CIDToGIDMap()
+	return cidToGID, ok, true
 }
 
 func getFaceBoundingBoxFreeTypeGo(fontData []byte) (float64, float64, float64, float64, uint16, bool, bool) {
@@ -208,6 +360,7 @@ func cloneFreeTypeGoOutline(outline ftapi.Outline) *ftcore.Outline {
 		Points:   append([]ftapi.Vector(nil), points...),
 		Tags:     append([]byte(nil), tags...),
 		Contours: append([]int(nil), contours...),
+		Flags:    ftcore.OutlineFlags(outline),
 	}
 }
 
@@ -266,4 +419,176 @@ func copyFreeTypeGoGrayBitmap(bitmap ftapi.Bitmap) []byte {
 		copy(out[dstOff:dstOff+n], src[srcOff:srcOff+n])
 	}
 	return out
+}
+
+func freeTypeGoOutlineToGlyphPath(outline *ftcore.Outline) *entity.GlyphPath {
+	return freeTypeGoOutlineToGlyphPathWithPoint(outline, func(point ftapi.Vector) (float64, float64) {
+		return float64(point.X) / 64.0, -float64(point.Y) / 64.0
+	})
+}
+
+func freeTypeGoOutlineToGlyphPathWithScale(outline *ftcore.Outline, scale float64) *entity.GlyphPath {
+	return freeTypeGoOutlineToGlyphPathWithPoint(outline, func(point ftapi.Vector) (float64, float64) {
+		return float64(point.X) * scale / 64.0, -float64(point.Y) * scale / 64.0
+	})
+}
+
+func freeTypeGoOutlineToGlyphPathWithMatrix(outline *ftcore.Outline, matrix [4]float64) *entity.GlyphPath {
+	return freeTypeGoOutlineToGlyphPathWithPoint(outline, func(point ftapi.Vector) (float64, float64) {
+		x := float64(point.X) / 64.0
+		y := float64(point.Y) / 64.0
+		return x*matrix[0] + y*matrix[2], -(x*matrix[1] + y*matrix[3])
+	})
+}
+
+func freeTypeGoOutlineToGlyphPathWithPoint(outline *ftcore.Outline, point func(ftapi.Vector) (float64, float64)) *entity.GlyphPath {
+	if outline == nil || len(outline.Points) == 0 {
+		return nil
+	}
+	points := outline.Points
+	tags := outline.Tags
+	contours := outline.Contours
+	if len(tags) < len(points) {
+		return nil
+	}
+	if point == nil {
+		return nil
+	}
+	pointAt := func(i int) (float64, float64) {
+		return point(points[i])
+	}
+	midpoint := func(a, b ftapi.Vector) (float64, float64) {
+		// FT_Outline_Decompose computes virtual conic on-points in 26.6
+		// integer space before callbacks see scaled coordinates.
+		return point(ftapi.Vector{X: (a.X + b.X) / 2, Y: (a.Y + b.Y) / 2})
+	}
+	path := &entity.GlyphPath{
+		Commands: make([]entity.PathCommand, 0, len(points)+len(contours)),
+		Bounds:   [4]float64{0, 0, 0, 0},
+	}
+	minX, minY := math.MaxFloat64, math.MaxFloat64
+	maxX, maxY := -math.MaxFloat64, -math.MaxFloat64
+	hasPoint := false
+	updateBounds := func(x, y float64) {
+		if x < minX {
+			minX = x
+		}
+		if x > maxX {
+			maxX = x
+		}
+		if y < minY {
+			minY = y
+		}
+		if y > maxY {
+			maxY = y
+		}
+		hasPoint = true
+	}
+	moveTo := func(x, y float64) {
+		path.Commands = append(path.Commands, &entity.PathMoveTo{X: x, Y: y})
+		updateBounds(x, y)
+	}
+	lineTo := func(x, y float64) {
+		path.Commands = append(path.Commands, &entity.PathLineTo{X: x, Y: y})
+		updateBounds(x, y)
+	}
+	curveTo := func(x1, y1, x2, y2, x3, y3 float64) {
+		path.Commands = append(path.Commands, &entity.PathCurveTo{X1: x1, Y1: y1, X2: x2, Y2: y2, X3: x3, Y3: y3})
+		updateBounds(x1, y1)
+		updateBounds(x2, y2)
+		updateBounds(x3, y3)
+	}
+	quadTo := func(cx0, cy0 *float64, ctrlX, ctrlY, endX, endY float64) {
+		c1x := (*cx0 + 2*ctrlX) / 3
+		c1y := (*cy0 + 2*ctrlY) / 3
+		c2x := (2*ctrlX + endX) / 3
+		c2y := (2*ctrlY + endY) / 3
+		curveTo(c1x, c1y, c2x, c2y, endX, endY)
+		*cx0, *cy0 = endX, endY
+	}
+	tagKind := func(i int) byte {
+		return tags[i] & 0x03
+	}
+	const (
+		conicTag = byte(0)
+		onTag    = byte(1)
+		cubicTag = byte(2)
+	)
+	start := 0
+	for _, end := range contours {
+		if end < start || end >= len(points) {
+			start = end + 1
+			continue
+		}
+		firstX, firstY := pointAt(start)
+		lastX, lastY := pointAt(end)
+		var curX, curY, contourStartX, contourStartY float64
+		i := start
+		switch {
+		case tagKind(start) == onTag:
+			moveTo(firstX, firstY)
+			curX, curY = firstX, firstY
+			contourStartX, contourStartY = firstX, firstY
+			i = start + 1
+		case tagKind(end) == onTag:
+			moveTo(lastX, lastY)
+			curX, curY = lastX, lastY
+			contourStartX, contourStartY = lastX, lastY
+		default:
+			midX, midY := midpoint(points[start], points[end])
+			moveTo(midX, midY)
+			curX, curY = midX, midY
+			contourStartX, contourStartY = midX, midY
+		}
+		for i <= end {
+			switch tagKind(i) {
+			case onTag:
+				x, y := pointAt(i)
+				lineTo(x, y)
+				curX, curY = x, y
+				i++
+			case conicTag:
+				ctrlX, ctrlY := pointAt(i)
+				if i == end {
+					quadTo(&curX, &curY, ctrlX, ctrlY, contourStartX, contourStartY)
+					i++
+					continue
+				}
+				switch tagKind(i + 1) {
+				case onTag:
+					nextX, nextY := pointAt(i + 1)
+					quadTo(&curX, &curY, ctrlX, ctrlY, nextX, nextY)
+					i += 2
+				case conicTag:
+					midX, midY := midpoint(points[i], points[i+1])
+					quadTo(&curX, &curY, ctrlX, ctrlY, midX, midY)
+					i++
+				default:
+					lineTo(ctrlX, ctrlY)
+					curX, curY = ctrlX, ctrlY
+					i++
+				}
+			case cubicTag:
+				if i+2 > end {
+					i = end + 1
+					continue
+				}
+				c1x, c1y := pointAt(i)
+				c2x, c2y := pointAt(i + 1)
+				endX, endY := pointAt(i + 2)
+				curveTo(c1x, c1y, c2x, c2y, endX, endY)
+				curX, curY = endX, endY
+				i += 3
+			default:
+				i++
+			}
+		}
+		path.Commands = append(path.Commands, &entity.PathClose{})
+		start = end + 1
+	}
+	if !hasPoint {
+		return nil
+	}
+	path.Bounds = [4]float64{minX, minY, maxX, maxY}
+	return path
 }

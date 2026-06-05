@@ -122,6 +122,13 @@ func TestDeviceCMYK_ConvertToRGBA(t *testing.T) {
 	}
 }
 
+func TestPopplerDblToByteTruncateMatchesPopplerHelper(t *testing.T) {
+	assert.Equal(t, uint8(0), popplerDblToByteTruncate(0))
+	assert.Equal(t, uint8(127), popplerDblToByteTruncate(0.5))
+	assert.Equal(t, uint8(254), popplerDblToByteTruncate(0.999999))
+	assert.Equal(t, uint8(255), popplerDblToByteTruncate(1))
+}
+
 func TestColorSpaceType_String(t *testing.T) {
 	tests := []struct {
 		expected string
@@ -166,6 +173,18 @@ func TestConvertComponentToByte_PopplerFixedPointQuantization(t *testing.T) {
 			assert.Equal(t, tt.expected, ConvertComponentToByte(tt.input))
 		})
 	}
+}
+
+func TestSeparationAndDeviceNQuantizeTintInputsLikePoppler(t *testing.T) {
+	sepFunc := &recordingTintFunction{outputs: []float64{0}}
+	sep := NewSeparationColorSpace("Spot", NewDeviceGray(), sepFunc)
+	sep.ConvertToRGBA([]float64{0.1})
+	assert.Equal(t, []float64{popplerDblToColToDbl(0.1)}, sepFunc.lastInputs)
+
+	devNFunc := &recordingTintFunction{outputs: []float64{0, 0, 0}}
+	devN := NewDeviceNColorSpace([]string{"SpotA", "SpotB"}, NewDeviceRGB(), devNFunc)
+	devN.ConvertToRGBA([]float64{0.1, 0.7})
+	assert.Equal(t, []float64{popplerDblToColToDbl(0.1), popplerDblToColToDbl(0.7)}, devNFunc.lastInputs)
 }
 
 func TestParseFunctionFromObject_PostScriptType4Stream(t *testing.T) {
@@ -219,6 +238,32 @@ func TestParseFunctionFromObject_PostScriptType4DictFallback(t *testing.T) {
 		return
 	}
 	assert.Equal(t, 0.75, out[0])
+}
+
+type recordingTintFunction struct {
+	lastInputs []float64
+	outputs    []float64
+}
+
+func (f *recordingTintFunction) Evaluate(inputs []float64) ([]float64, error) {
+	f.lastInputs = append([]float64(nil), inputs...)
+	return append([]float64(nil), f.outputs...), nil
+}
+
+func (f *recordingTintFunction) GetInputSize() int {
+	return 1
+}
+
+func (f *recordingTintFunction) GetOutputSize() int {
+	return len(f.outputs)
+}
+
+func (f *recordingTintFunction) GetDomain() [][2]float64 {
+	return nil
+}
+
+func (f *recordingTintFunction) GetRange() [][2]float64 {
+	return nil
 }
 
 func abs(x int) int {

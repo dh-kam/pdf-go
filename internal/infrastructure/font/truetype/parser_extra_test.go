@@ -325,6 +325,36 @@ func TestParseHmtxNamePostOS2AndFontMethods(t *testing.T) {
 		assert.Equal(t, uint16(5), font.OS2.Version)
 	}
 
+	{
+		os2Data := make([]byte, 96)
+		binary.BigEndian.PutUint16(os2Data[0:2], 3)
+		binary.BigEndian.PutUint16(os2Data[2:4], uint16(904))
+		binary.BigEndian.PutUint16(os2Data[4:6], 400)
+		binary.BigEndian.PutUint16(os2Data[6:8], 5)
+		binary.BigEndian.PutUint16(os2Data[8:10], 4)
+		binary.BigEndian.PutUint32(os2Data[42:46], 0x12345678)
+		copy(os2Data[58:62], []byte("ADBE"))
+		binary.BigEndian.PutUint16(os2Data[62:64], 0x0040)
+		binary.BigEndian.PutUint16(os2Data[64:66], 32)
+		binary.BigEndian.PutUint16(os2Data[66:68], 255)
+		binary.BigEndian.PutUint16(os2Data[74:76], 1854)
+		binary.BigEndian.PutUint16(os2Data[76:78], 434)
+
+		err := font.parseOS2Table(bytes.NewReader(os2Data), TableEntry{Length: uint32(len(os2Data))})
+		require.NoError(t, err)
+		require.NotNil(t, font.OS2)
+		assert.Equal(t, uint16(3), font.OS2.Version)
+		assert.Equal(t, int16(904), font.OS2.XAvgCharWidth)
+		assert.Equal(t, uint16(400), font.OS2.WeightClass)
+		assert.Equal(t, uint16(4), font.OS2.FsType)
+		assert.Equal(t, uint32(0x12345678), font.OS2.UnicodeRange1[0])
+		assert.Equal(t, [4]uint8{'A', 'D', 'B', 'E'}, font.OS2.VendorID)
+		assert.Equal(t, uint16(32), font.OS2.FirstCharIndex)
+		assert.Equal(t, uint16(255), font.OS2.LastCharIndex)
+		assert.Equal(t, uint16(1854), font.OS2.WinAscent)
+		assert.Equal(t, uint16(434), font.OS2.WinDescent)
+	}
+
 	assert.Equal(t, uint16(2048), font.UnitsPerEm())
 
 	empty := &FontFile{}

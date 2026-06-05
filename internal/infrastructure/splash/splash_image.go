@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 
 	"github.com/dh-kam/pdf-go/internal/infrastructure/splash/xpath"
 )
@@ -62,6 +63,19 @@ func (s *Splash) DrawImageImpl(src ImageSource, w, h int, mat [6]float64, interp
 }
 
 func (s *Splash) drawImageImpl(src ImageSource, w, h int, mat [6]float64, interpolate bool, sourceAlpha bool) error {
+	return s.drawImageImplWithPostTransform(src, w, h, mat, interpolate, sourceAlpha, nil)
+}
+
+type postScaleRGBTransform func(r, g, b byte) (byte, byte, byte)
+
+func (s *Splash) drawImageImplWithPostTransform(
+	src ImageSource,
+	w, h int,
+	mat [6]float64,
+	interpolate bool,
+	sourceAlpha bool,
+	postTransform postScaleRGBTransform,
+) error {
 	if s.bitmap == nil || s.bitmap.data == nil {
 		return ErrBadArg
 	}
@@ -102,11 +116,13 @@ func (s *Splash) drawImageImpl(src ImageSource, w, h int, mat [6]float64, interp
 		if err != nil {
 			return err
 		}
+		s.applyPostScaleRGBTransform(scaled, postTransform)
 		return s.blitImage(scaled, x0, y0, clipRes)
 	}
 
 	// scaling plus vertical flip (Splash.cc:3581).
 	if mat[0] > 0 && minorAxisZero && mat[3] < 0 {
+		forcePopplerScaleThenFlip := s.forceScaleThenFlip || os.Getenv("PDF_DEBUG_SPLASH_DISABLE_TOPDOWN_VFLIP_SCALE") == "1"
 		// Integer-aligned 2× downscale fastpath (2026-04-27, Path A).
 		// When both axes are exact 2× integer downscales at integer device
 		// origins (e.g. 150 DPI on a 3.84pt page → 16-pixel image scaled to
@@ -117,7 +133,7 @@ func (s *Splash) drawImageImpl(src ImageSource, w, h int, mat [6]float64, interp
 		// popplerSourceRange1D): j=0 alone, j=half alone, last 2 src rows
 		// unused. Mirror that here for the integer-aligned 2× case to fix
 		// 007-imagemagick at 150 DPI from 75% → ~100% similarity.
-		if isIntegerAligned2xDownscale(mat, w, h) {
+		if !forcePopplerScaleThenFlip && isIntegerAligned2xDownscale(mat, w, h) {
 			dstW := w / 2
 			dstH := h / 2
 			x0 := int(math.Round(mat[4]))
@@ -126,7 +142,7 @@ func (s *Splash) drawImageImpl(src ImageSource, w, h int, mat [6]float64, interp
 			if clipRes == xpath.ClipAllOutside {
 				return nil
 			}
-			return s.drawIntegerAligned2xDownscaleVFlip(src, w, h, dstW, dstH, x0, y0, clipRes, sourceAlpha)
+			return s.drawIntegerAligned2xDownscaleVFlip(src, w, h, dstW, dstH, x0, y0, clipRes, sourceAlpha, postTransform)
 		}
 		x0 := imgCoordMungeLower(mat[4])
 		y0 := imgCoordMungeLower(mat[3] + mat[5])
@@ -166,7 +182,7 @@ func (s *Splash) drawImageImpl(src ImageSource, w, h int, mat [6]float64, interp
 		// post-vertFlip — produces the same end-to-end orientation but with
 		// the bilinear blend distributed top-to-bottom matching pdftoppm.
 		// Memory bilinear_yflip_2026_04_27.
-		if dstW >= w && dstH >= h && isImageInterpolationRequired(w, h, dstW, dstH, interpolate) {
+		if !forcePopplerScaleThenFlip && dstW >= w && dstH >= h && isImageInterpolationRequired(w, h, dstW, dstH, interpolate) {
 			scaled := NewBitmap(dstW, dstH, s.bitmap.mode, sourceAlpha)
 			if scaled.data == nil {
 				return ErrZeroImage
@@ -179,9 +195,10 @@ func (s *Splash) drawImageImpl(src ImageSource, w, h int, mat [6]float64, interp
 			if err := s.scaleImageYupXupBilinear(topDownSrc, w, h, dstW, dstH, scaled); err != nil {
 				return err
 			}
+			s.applyPostScaleRGBTransform(scaled, postTransform)
 			return s.blitImage(scaled, x0, y0, clipRes)
 		}
-		if dstW >= w && dstH >= h {
+		if !forcePopplerScaleThenFlip && dstW >= w && dstH >= h {
 			scaled := NewBitmap(dstW, dstH, s.bitmap.mode, sourceAlpha)
 			if scaled.data == nil {
 				return ErrZeroImage
@@ -192,13 +209,15 @@ func (s *Splash) drawImageImpl(src ImageSource, w, h int, mat [6]float64, interp
 			if err := s.scaleImageYupXup(topDownSrc, w, h, dstW, dstH, scaled); err != nil {
 				return err
 			}
+			s.applyPostScaleRGBTransform(scaled, postTransform)
 			return s.blitImage(scaled, x0, y0, clipRes)
 		}
 		// The backend ImageSource already presents regular PDF images in
 		// top-down display order. For Y-down downscales, scaling that stream
 		// directly matches Poppler's row grouping; scaling then vert-flipping
 		// shifts high-resolution Flate images such as GeoTopo p31.
-		if (s.downscaleVFlipTopDown || !sourceAlpha) && dstW < w && dstH < h {
+		disableTopDownDownscale := os.Getenv("PDF_DEBUG_SPLASH_DISABLE_TOPDOWN_DOWNSCALE") == "1"
+		if !forcePopplerScaleThenFlip && (s.downscaleVFlipTopDown || (!sourceAlpha && !disableTopDownDownscale)) && dstW < w && dstH < h {
 			scaled := NewBitmap(dstW, dstH, s.bitmap.mode, sourceAlpha)
 			if scaled.data == nil {
 				return ErrZeroImage
@@ -209,18 +228,20 @@ func (s *Splash) drawImageImpl(src ImageSource, w, h int, mat [6]float64, interp
 			if err := s.scaleImageYdownXdown(topDownSrc, w, h, dstW, dstH, scaled); err != nil {
 				return err
 			}
+			s.applyPostScaleRGBTransform(scaled, postTransform)
 			return s.blitImage(scaled, x0, y0, clipRes)
 		}
 		scaled, err := s.scaleImageWithSourceAlpha(src, w, h, dstW, dstH, interpolate, sourceAlpha)
 		if err != nil {
 			return err
 		}
+		s.applyPostScaleRGBTransform(scaled, postTransform)
 		vertFlipBitmap(scaled, nComps)
 		return s.blitImage(scaled, x0, y0, clipRes)
 	}
 
 	// general affine (Splash.cc:3623).
-	return s.arbitraryTransformImage(src, w, h, mat, interpolate, sourceAlpha)
+	return s.arbitraryTransformImage(src, w, h, mat, interpolate, sourceAlpha, postTransform)
 }
 
 // isIntegerAligned2xDownscale reports whether the supplied image-placement
@@ -272,7 +293,11 @@ func isNearlyIntegerCoord(v float64) bool {
 // pair, we read closure rows in REVERSE (closure[srcH-1] first, closure[0]
 // last) so the iteration sees stdlib top-to-bottom.
 func (s *Splash) drawIntegerAligned2xDownscaleVFlip(
-	src ImageSource, srcW, srcH, dstW, dstH, dstX, dstY int, clipRes xpath.ClipResult, sourceAlpha bool,
+	src ImageSource,
+	srcW, srcH, dstW, dstH, dstX, dstY int,
+	clipRes xpath.ClipResult,
+	sourceAlpha bool,
+	postTransform postScaleRGBTransform,
 ) error {
 	nComps := nCompsForMode(s.bitmap.mode)
 	hasAlpha := sourceAlpha
@@ -344,6 +369,7 @@ func (s *Splash) drawIntegerAligned2xDownscaleVFlip(
 		}
 	}
 
+	s.applyPostScaleRGBTransform(scaled, postTransform)
 	return s.blitImage(scaled, dstX, dstY, clipRes)
 }
 
@@ -456,6 +482,7 @@ func (s *Splash) scaleImageYdownXdown(src ImageSource, srcW, srcH, dstW, dstH in
 		} else {
 			yStep = yp
 		}
+		srcY0 := rowIdx
 
 		for j := range pixBuf {
 			pixBuf[j] = 0
@@ -497,6 +524,7 @@ func (s *Splash) scaleImageYdownXdown(src ImageSource, srcW, srcH, dstW, dstH in
 				xStep = xp
 				d = d0
 			}
+			srcX0 := xx / nComps
 
 			var pix [splashMaxColorComps]uint32
 			for i := 0; i < xStep; i++ {
@@ -505,8 +533,17 @@ func (s *Splash) scaleImageYdownXdown(src ImageSource, srcW, srcH, dstW, dstH in
 				}
 				xx += nComps
 			}
+			rawPix := pix
 			for c := 0; c < nComps; c++ {
 				pix[c] = (pix[c] * d) >> 23
+			}
+			if s.shouldTraceImageScalePixel(x, y) {
+				fmt.Fprintf(os.Stderr,
+					"SPLASH_SCALE_TRACE op=scaleImageYdownXdown dst=(%d,%d) srcX=[%d,%d] srcY=[%d,%d] src=%dx%d dstSize=%dx%d step=(%d,%d) bresenham=(xp=%d xq=%d yp=%d yq=%d xt=%d yt=%d d=%d) raw=(%d,%d,%d) out=(%d,%d,%d)%s\n",
+					x, y, srcX0, srcX0+xStep-1, srcY0, srcY0+yStep-1,
+					srcW, srcH, dstW, dstH, xStep, yStep, xp, xq, yp, yq, xt, yt, d,
+					rawPix[0], rawPix[1], rawPix[2], pix[0], pix[1], pix[2],
+					imageTraceContextForSplash(s))
 			}
 			storeScaledPixel(dest.data, &destOff, dest.mode, pix[:])
 
@@ -965,6 +1002,32 @@ func vertFlipBitmap(b *Bitmap, nComps int) {
 	}
 }
 
+func (s *Splash) applyPostScaleRGBTransform(bitmap *Bitmap, transform postScaleRGBTransform) {
+	if transform == nil || bitmap == nil || bitmap.data == nil {
+		return
+	}
+	switch bitmap.mode {
+	case ModeRGB8:
+		for i := 0; i+2 < len(bitmap.data); i += 3 {
+			bitmap.data[i], bitmap.data[i+1], bitmap.data[i+2] = transform(bitmap.data[i], bitmap.data[i+1], bitmap.data[i+2])
+		}
+	case ModeBGR8:
+		for i := 0; i+2 < len(bitmap.data); i += 3 {
+			r, g, b := transform(bitmap.data[i+2], bitmap.data[i+1], bitmap.data[i])
+			bitmap.data[i] = b
+			bitmap.data[i+1] = g
+			bitmap.data[i+2] = r
+		}
+	case ModeXBGR8:
+		for i := 0; i+3 < len(bitmap.data); i += 4 {
+			r, g, b := transform(bitmap.data[i+2], bitmap.data[i+1], bitmap.data[i])
+			bitmap.data[i] = b
+			bitmap.data[i+1] = g
+			bitmap.data[i+2] = r
+		}
+	}
+}
+
 // blitImage writes scaled onto the main bitmap with optional clip (Splash.cc:4880).
 func (s *Splash) blitImage(scaled *Bitmap, xDest, yDest int, clipRes xpath.ClipResult) error {
 	if scaled == nil || scaled.data == nil {
@@ -1042,7 +1105,9 @@ func (s *Splash) blitImage(scaled *Bitmap, xDest, yDest int, clipRes xpath.ClipR
 				if hasAlpha {
 					shape = scaled.alpha[aOff]
 					p.shape = shape
-					unpremultiplyImageColor(&c, scaled.mode, shape)
+					if shouldUnpremultiplyImageColor() {
+						unpremultiplyImageColor(&c, scaled.mode, shape)
+					}
 					aOff++
 				}
 				dx := xDest + x
@@ -1107,6 +1172,8 @@ func (s *Splash) blitImageClippedAA(scaled *Bitmap, xSrc, ySrc, xDest, yDest, w,
 	hasAlpha := scaled.alpha != nil
 	var p pipe
 	s.pipeInit(&p, xDest, yDest, nil, &Color{}, alphaIn, true, false)
+	spanGate := os.Getenv("PDF_DEBUG_SPLASH_IMAGE_CLIP_SPAN_GATE") == "1"
+	fullWidthClip := os.Getenv("PDF_DEBUG_SPLASH_IMAGE_CLIP_FULLWIDTH") == "1"
 
 	rowSize := (s.bitmap.width*splashAASize + 7) >> 3
 	aaLen := rowSize * splashAASize
@@ -1122,7 +1189,11 @@ func (s *Splash) blitImageClippedAA(scaled *Bitmap, xSrc, ySrc, xDest, yDest, w,
 		for i := 0; i < aaLen; i++ {
 			s.aaBuf[i] = 0xff
 		}
-		clip.ClipAALine(dy, s.aaBuf, 0, s.bitmap.width-1)
+		if fullWidthClip {
+			_, _ = clip.ClipAALineFullWidth(dy, s.aaBuf, 0, s.bitmap.width-1, s.bitmap.width)
+		} else {
+			clip.ClipAALine(dy, s.aaBuf, 0, s.bitmap.width-1)
+		}
 
 		srcOff := ((ySrc+y)*scaled.width + xSrc) * bpp
 		alphaOff := (ySrc+y)*scaled.width + xSrc
@@ -1133,18 +1204,34 @@ func (s *Splash) blitImageClippedAA(scaled *Bitmap, xSrc, ySrc, xDest, yDest, w,
 				alphaOff++
 				continue
 			}
-			t := s.aaCoverageAt(dx, rowSize)
-			if t == 0 {
-				srcOff += bpp
-				alphaOff++
-				continue
+			t := -1
+			if spanGate {
+				switch clip.TestSpan(dx, dx, dy) {
+				case xpath.ClipAllOutside:
+					srcOff += bpp
+					alphaOff++
+					continue
+				case xpath.ClipAllInside:
+					t = splashAASize * splashAASize
+				}
+			}
+						if t < 0 {
+							t = s.aaCoverageAt(dx, rowSize)
+						}
+						t = adjustClippedImageLowAACoverageForDebug(t)
+						if t == 0 {
+							srcOff += bpp
+							alphaOff++
+							continue
 			}
 			var c Color
 			readScaledPixel(scaled.data, srcOff, scaled.mode, &c)
 			shape := byte(255)
 			if hasAlpha {
 				shape = scaled.alpha[alphaOff]
-				unpremultiplyImageColor(&c, scaled.mode, shape)
+				if shouldUnpremultiplyImageColor() {
+					unpremultiplyImageColor(&c, scaled.mode, shape)
+				}
 			}
 			shape = byte(Div255(int(s.aaGamma[t]) * int(shape)))
 			if shape != 0 {
@@ -1164,6 +1251,16 @@ func (s *Splash) blitImageClippedAA(scaled *Bitmap, xSrc, ySrc, xDest, yDest, w,
 		}
 	}
 	return nil
+}
+
+func adjustClippedImageLowAACoverageForDebug(t int) int {
+	if os.Getenv("PDF_DEBUG_SPLASH_IMAGE_CLIP_T2_TO_T1") != "1" {
+		return t
+	}
+	if t == 2 {
+		return 1
+	}
+	return t
 }
 
 func (s *Splash) blitImageClippedNoAA(scaled *Bitmap, xSrc, ySrc, xDest, yDest, w, h int) error {
@@ -1197,7 +1294,9 @@ func (s *Splash) blitImageClippedNoAA(scaled *Bitmap, xSrc, ySrc, xDest, yDest, 
 			if hasAlpha {
 				shape = scaled.alpha[alphaOff]
 				p.shape = shape
-				unpremultiplyImageColor(&c, scaled.mode, shape)
+				if shouldUnpremultiplyImageColor() {
+					unpremultiplyImageColor(&c, scaled.mode, shape)
+				}
 			}
 			p.cSrc = c
 			s.pipeSetXY(&p, dx, dy)
@@ -1234,11 +1333,10 @@ func (s *Splash) aaCoverageAt(x, rowSize int) int {
 	return t
 }
 
-// unpremultiplyImageColor converts Go image.Image RGBA() premultiplied samples
-// back to the straight source-color samples Splash expects alongside srcAlpha
-// shape (Splash.cc blitImage -> pipe.shape). Without this, soft-mask/color-key
-// image paths darken partially transparent pixels by applying alpha to color and
-// then again in the pipe.
+// unpremultiplyImageColor is kept as an opt-in diagnostic for legacy callers
+// that feed premultiplied color samples into ImageSource. The PDF image path
+// mirrors Poppler's maskedImageSrc contract: color samples are already straight
+// source colors, and source alpha is carried separately as pipe.shape.
 func unpremultiplyImageColor(c *Color, mode ColorMode, alpha byte) {
 	if alpha == 0 || alpha == 255 {
 		return
@@ -1251,6 +1349,10 @@ func unpremultiplyImageColor(c *Color, mode ColorMode, alpha byte) {
 		c[1] = unpremultiplyByte(c[1], alpha)
 		c[2] = unpremultiplyByte(c[2], alpha)
 	}
+}
+
+func shouldUnpremultiplyImageColor() bool {
+	return os.Getenv("PDF_SPLASH_IMAGE_ENABLE_ALPHA_UNPREMULTIPLY") == "1"
 }
 
 func unpremultiplyByte(v byte, alpha byte) byte {
@@ -1294,7 +1396,14 @@ func readScaledPixel(data []byte, off int, mode ColorMode, c *Color) {
 
 // arbitraryTransformImage rasterises a non-axis-aligned image via Poppler's
 // three-section quadrilateral scan (Splash.cc:3750-4074).
-func (s *Splash) arbitraryTransformImage(src ImageSource, srcW, srcH int, mat [6]float64, interpolate bool, sourceAlpha bool) error {
+func (s *Splash) arbitraryTransformImage(
+	src ImageSource,
+	srcW, srcH int,
+	mat [6]float64,
+	interpolate bool,
+	sourceAlpha bool,
+	postTransform postScaleRGBTransform,
+) error {
 	// four target-quad vertices (Splash.cc:3645-3652).
 	vx := [4]float64{mat[4], mat[2] + mat[4], mat[0] + mat[2] + mat[4], mat[0] + mat[4]}
 	vy := [4]float64{mat[5], mat[3] + mat[5], mat[1] + mat[3] + mat[5], mat[1] + mat[5]}
@@ -1318,7 +1427,7 @@ func (s *Splash) arbitraryTransformImage(src ImageSource, srcW, srcH int, mat [6
 			yMax = t
 		}
 	}
-	clipRes := s.testRect(xMin, yMin, xMax-1, yMax-1)
+	clipRes := s.testRect(xMin, yMin, xMax, yMax)
 	if clipRes == xpath.ClipAllOutside {
 		return nil
 	}
@@ -1398,6 +1507,7 @@ func (s *Splash) arbitraryTransformImage(src ImageSource, srcW, srcH int, mat [6
 	if err != nil {
 		return err
 	}
+	s.applyPostScaleRGBTransform(scaled, postTransform)
 
 	// compute inverse of the post-scale 2x2.
 	r00 := mat[0] / float64(scaledW)
@@ -1554,7 +1664,7 @@ func (s *Splash) arbitraryTransformImage(src ImageSource, srcW, srcH int, mat [6
 					for k := 0; k < aaLen; k++ {
 						s.aaBuf[k] = 0xff
 					}
-					clip.ClipAALine(y, s.aaBuf, 0, s.bitmap.width-1)
+					clip.ClipAALineFullWidth(y, s.aaBuf, 0, s.bitmap.width-1, s.bitmap.width)
 					aaReady = true
 				}
 			}
@@ -1582,7 +1692,9 @@ func (s *Splash) arbitraryTransformImage(src ImageSource, srcW, srcH int, mat [6
 				shape := byte(255)
 				if hasAlpha {
 					shape = scaled.alpha[yy*scaledW+xx]
-					unpremultiplyImageColor(&c, scaled.mode, shape)
+					if shouldUnpremultiplyImageColor() {
+						unpremultiplyImageColor(&c, scaled.mode, shape)
+					}
 				}
 				if s.vectorAA && clipRes2 != xpath.ClipAllInside {
 					if !aaReady {
@@ -1616,6 +1728,7 @@ func (s *Splash) arbitraryTransformImage(src ImageSource, srcW, srcH int, mat [6
 }
 
 var imageTracePixels = parseSplashTracePixels(os.Getenv("PDF_DEBUG_SPLASH_IMAGE_TRACE"))
+var imageScaleTracePixels = parseSplashTracePixels(os.Getenv("PDF_DEBUG_SPLASH_SCALE_TRACE"))
 
 func shouldTraceImagePixel(x, y int) bool {
 	for _, pixel := range imageTracePixels {
@@ -1626,6 +1739,29 @@ func shouldTraceImagePixel(x, y int) bool {
 	return false
 }
 
+func (s *Splash) shouldTraceImageScalePixel(x, y int) bool {
+	if len(imageScaleTracePixels) == 0 {
+		return false
+	}
+	filter := os.Getenv("PDF_DEBUG_SPLASH_SCALE_TRACE_CONTEXT")
+	if filter != "" && (s == nil || !strings.Contains(s.debugPaintContext, filter)) {
+		return false
+	}
+	for _, pixel := range imageScaleTracePixels {
+		if pixel.x == x && pixel.y == y {
+			return true
+		}
+	}
+	return false
+}
+
+func imageTraceContextForSplash(s *Splash) string {
+	if s == nil || s.debugPaintContext == "" {
+		return ""
+	}
+	return fmt.Sprintf(" ctx=%q", s.debugPaintContext)
+}
+
 func traceImagePixelBefore(p *pipe, op string, x, y, srcX, srcY int, c Color, shape byte) {
 	if p.colorBytesPerPixel < 3 || p.destOff+2 >= len(p.destRow) {
 		return
@@ -1634,9 +1770,10 @@ func traceImagePixelBefore(p *pipe, op string, x, y, srcX, srcY int, c Color, sh
 	if p.aDestRow != nil && p.aDestOff < len(p.aDestRow) {
 		aDest = p.aDestRow[p.aDestOff]
 	}
-	fmt.Fprintf(os.Stderr, "SPLASH_IMAGE_TRACE before op=%s x=%d y=%d srcXY=(%d,%d) src=(%d,%d,%d) shape=%d dst=(%d,%d,%d) aDest=%d\n",
+	fmt.Fprintf(os.Stderr, "SPLASH_IMAGE_TRACE before op=%s x=%d y=%d srcXY=(%d,%d) src=(%d,%d,%d) shape=%d dst=(%d,%d,%d) aDest=%d%s\n",
 		op, x, y, srcX, srcY, c[0], c[1], c[2], shape,
-		p.destRow[p.destOff], p.destRow[p.destOff+1], p.destRow[p.destOff+2], aDest)
+		p.destRow[p.destOff], p.destRow[p.destOff+1], p.destRow[p.destOff+2], aDest,
+		imageTraceContext(p))
 }
 
 func traceImagePixelAfter(p *pipe, op string, x, y int) {
@@ -1651,6 +1788,14 @@ func traceImagePixelAfter(p *pipe, op string, x, y int) {
 			aDest = p.aDestRow[aOff]
 		}
 	}
-	fmt.Fprintf(os.Stderr, "SPLASH_IMAGE_TRACE after op=%s x=%d y=%d dst=(%d,%d,%d) aDest=%d\n",
-		op, x, y, p.destRow[off], p.destRow[off+1], p.destRow[off+2], aDest)
+	fmt.Fprintf(os.Stderr, "SPLASH_IMAGE_TRACE after op=%s x=%d y=%d dst=(%d,%d,%d) aDest=%d%s\n",
+		op, x, y, p.destRow[off], p.destRow[off+1], p.destRow[off+2], aDest,
+		imageTraceContext(p))
+}
+
+func imageTraceContext(p *pipe) string {
+	if p == nil || p.s == nil || p.s.debugPaintContext == "" {
+		return ""
+	}
+	return fmt.Sprintf(" ctx=%q", p.s.debugPaintContext)
 }

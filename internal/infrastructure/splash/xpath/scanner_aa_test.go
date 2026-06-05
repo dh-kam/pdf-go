@@ -60,6 +60,80 @@ func fillAll(aaBuf []byte) {
 	}
 }
 
+func TestClearBitsRangePopplerClipGapReturnsAdvancedCursor(t *testing.T) {
+	aaBuf := []byte{0xff}
+
+	got := clearBitsRangePopplerClipGap(aaBuf, 0, 1, 4)
+	if got != 8 {
+		t.Fatalf("advanced cursor = %d, want 8", got)
+	}
+	if aaBuf[0] != 0x8f {
+		t.Fatalf("byte = 0x%02x, want Poppler gap mask 0x8f", aaBuf[0])
+	}
+}
+
+func TestClearBitsRangePopplerClipReturnsFinalPartialStartCursor(t *testing.T) {
+	aaBuf := []byte{0xff, 0xff}
+
+	got := clearBitsRangePopplerClip(aaBuf, 0, 8, 15)
+	if got != 8 {
+		t.Fatalf("advanced cursor = %d, want 8", got)
+	}
+	if aaBuf[1] != 0x01 {
+		t.Fatalf("byte 1 = 0x%02x, want Poppler trailing mask 0x01", aaBuf[1])
+	}
+}
+
+func TestClipAALinePartialGapCursorPreservesSameByteTail(t *testing.T) {
+	s := scannerWithPartialByteGapForTests()
+	rowSize := 1
+	aaBuf := make([]byte, rowSize*aaSize)
+	fillAll(aaBuf)
+
+	s.ClipAALine(0, aaBuf, 0, 1)
+
+	for yy := 0; yy < aaSize; yy++ {
+		if got := aaBuf[yy*rowSize]; got != 0x8f {
+			t.Fatalf("sub-row %d byte = 0x%02x, want Poppler cursor-preserved 0x8f", yy, got)
+		}
+	}
+}
+
+func TestClipAALineFullWidthPartialGapCursorPreservesSameByteTail(t *testing.T) {
+	s := scannerWithPartialByteGapForTests()
+	rowSize := 1
+	aaBuf := make([]byte, rowSize*aaSize)
+	fillAll(aaBuf)
+
+	s.ClipAALineFullWidth(0, aaBuf, 0, 1, 2)
+
+	for yy := 0; yy < aaSize; yy++ {
+		if got := aaBuf[yy*rowSize]; got != 0x8f {
+			t.Fatalf("sub-row %d byte = 0x%02x, want Poppler cursor-preserved 0x8f", yy, got)
+		}
+	}
+}
+
+func scannerWithPartialByteGapForTests() *Scanner {
+	lines := make([][]intersect, aaSize)
+	for yy := range lines {
+		lines[yy] = []intersect{
+			{X0: 0, X1: 0, Count: -1},
+			{X0: 0, X1: 0, Count: 1},
+			{X0: 4, X1: 4, Count: -1},
+			{X0: 6, X1: 6, Count: 1},
+		}
+	}
+	return &Scanner{
+		eo:               false,
+		xMin:             0,
+		yMin:             0,
+		xMax:             7,
+		yMax:             aaSize - 1,
+		allIntersections: lines,
+	}
+}
+
 func TestClipAALineMasksRectBounds(t *testing.T) {
 	c := NewClip(0, 0, 15, 15, true)
 	if err := c.ClipToRect(2.5, 0, 5.25, 10); err != nil {

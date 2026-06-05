@@ -29,6 +29,19 @@ func readPixel(bm *Bitmap, x, y int) (byte, byte, byte) {
 	return bm.data[off], bm.data[off+1], bm.data[off+2]
 }
 
+func pathHasPoint(p *xpath.Path, x, y float64) bool {
+	if p == nil {
+		return false
+	}
+	for i := 0; i < p.Length(); i++ {
+		pt, _ := p.Point(i)
+		if math.Abs(pt.X-x) <= 1e-9 && math.Abs(pt.Y-y) <= 1e-9 {
+			return true
+		}
+	}
+	return false
+}
+
 // TestStrokeNarrowVerticalLine verifies a 1-pixel vertical stroke from
 // (10,0) to (10,100) lights only column 10.
 func TestStrokeNarrowVerticalLine(t *testing.T) {
@@ -363,6 +376,43 @@ func TestMakeStrokePathMiterJoin(t *testing.T) {
 	// Sanity: total points should be at least 4 (quad1) + 4 (quad2) + 3 (join) = 11.
 	if got := out.Length(); got < 8 {
 		t.Fatalf("miter stroke path too short: %d", got)
+	}
+}
+
+func TestMakeStrokePathPopplerWalkerSkipsDuplicateJoinPoints(t *testing.T) {
+	s := newTestSplashRGB(t, 64, 64)
+	s.state.lineCap = int(LineCapButt)
+	s.state.lineJoin = int(LineJoinMiter)
+	s.state.miterLimit = 10
+
+	p := xpath.NewPath()
+	_ = p.MoveTo(0, 0)
+	_ = p.LineTo(10, 0)
+	_ = p.LineTo(10, 0)
+	_ = p.LineTo(10, 10)
+
+	out := s.makeStrokePath(p, 4, false, false)
+	if !pathHasPoint(out, 12, -2) {
+		t.Fatalf("Poppler walker did not emit miter join across duplicate point")
+	}
+}
+
+func TestMakeStrokePathPopplerWalkerCanBeDisabled(t *testing.T) {
+	t.Setenv("PDF_DEBUG_SPLASH_DISABLE_POPPLER_STROKE_WALKER", "1")
+	s := newTestSplashRGB(t, 64, 64)
+	s.state.lineCap = int(LineCapButt)
+	s.state.lineJoin = int(LineJoinMiter)
+	s.state.miterLimit = 10
+
+	p := xpath.NewPath()
+	_ = p.MoveTo(0, 0)
+	_ = p.LineTo(10, 0)
+	_ = p.LineTo(10, 0)
+	_ = p.LineTo(10, 10)
+
+	out := s.makeStrokePath(p, 4, false, false)
+	if pathHasPoint(out, 12, -2) {
+		t.Fatalf("disabled Poppler walker still emitted duplicate-run miter join")
 	}
 }
 

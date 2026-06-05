@@ -5,8 +5,8 @@ go 1.25.10
 require (
 	github.com/ajroetker/go-jpeg2000 v0.0.1
 	github.com/andybalholm/brotli v1.2.1
-	github.com/dh-kam/djpeg-go v0.0.0-20260510140137-bc12c348d8cb
-	github.com/dh-kam/freetype-go v0.0.0-20260519170628-79d7316ba3e1
+	github.com/dh-kam/djpeg-go v0.0.0-20260602185927-4cb3753736a3
+	github.com/dh-kam/freetype-go v0.1.1
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1

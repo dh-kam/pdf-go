@@ -4520,9 +4520,7 @@ func (c *ImageCanvas) DrawTilingPattern(pattern *entity.TilingPattern, bbox [4]f
 
 		cellEval := renderer.NewEvaluator(&patternXRef{})
 		cellEval.SetCanvas(cellCanvas)
-		if resources != nil {
-			cellEval.SetResources(resources)
-		}
+		setTilingPatternEvaluatorResources(cellEval, pattern, resources)
 		if pattern.IsUncolored() {
 			cellEval.SetFillColor(c.fillColor)
 			cellEval.SetStrokeColor(c.fillColor)
@@ -4620,11 +4618,9 @@ func (c *ImageCanvas) drawTilingPatternByTileReplay(
 			tileCanvas.height = c.height
 			tileCanvas.pageYOriginPx = yOrigin
 
-			tileEval := renderer.NewEvaluator(&patternXRef{})
+			tileEval := renderer.NewEvaluator(patternCellXRef(pattern))
 			tileEval.SetCanvas(tileCanvas)
-			if resources != nil {
-				tileEval.SetResources(resources)
-			}
+			setTilingPatternEvaluatorResources(tileEval, pattern, resources)
 			if pattern.IsUncolored() {
 				tileEval.SetFillColor(c.fillColor)
 				tileEval.SetStrokeColor(c.fillColor)
@@ -4639,6 +4635,21 @@ func (c *ImageCanvas) drawTilingPatternByTileReplay(
 	}
 
 	return nil
+}
+
+func setTilingPatternEvaluatorResources(eval *renderer.Evaluator, pattern *entity.TilingPattern, resources *entity.Dict) {
+	if eval == nil {
+		return
+	}
+	if pattern != nil {
+		if stack := pattern.GetResourceStack(); len(stack) > 0 {
+			eval.SetResourceStack(stack)
+			return
+		}
+	}
+	if resources != nil {
+		eval.SetResources(resources)
+	}
 }
 
 // DrawShadingPattern draws a shading pattern (gradient) to fill the specified bounding box.
@@ -5626,6 +5637,13 @@ type patternXRef struct{}
 // Fetch is an exported API.
 func (p *patternXRef) Fetch(ref entity.Ref) (entity.Object, error) {
 	return nil, fmt.Errorf("patterns do not support indirect references")
+}
+
+func patternCellXRef(pattern *entity.TilingPattern) entity.XRef {
+	if pattern != nil && pattern.XRef() != nil {
+		return pattern.XRef()
+	}
+	return &patternXRef{}
 }
 
 // GetNumObjects returns the requested value.

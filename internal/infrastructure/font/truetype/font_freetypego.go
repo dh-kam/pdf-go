@@ -52,6 +52,24 @@ func (f *Font) RenderGlyphBitmapMatrixPhased(glyph uint32, sizePt float64, matri
 	return ftcgo.RenderGlyphBitmapByIndexMatrixPhased(f.data, glyph, sizePt, matrix, phaseX, phaseY)
 }
 
+// RenderGlyphPathMatrix renders a glyph outline with Poppler's FreeType
+// pixel-size and transform normalization.
+func (f *Font) RenderGlyphPathMatrix(glyph uint32, sizePt float64, matrix [4]float64) (*entity.GlyphPath, error) {
+	if !freeTypeGoBitmapAdapterEnabled() || len(f.data) == 0 || !ftcgo.IsAvailable() {
+		return nil, fmt.Errorf("truetype: pure Go FreeType adapter not available for matrix path rendering")
+	}
+	return ftcgo.RenderGlyphPathByIndexMatrix(f.data, glyph, sizePt, matrix)
+}
+
+// RenderGlyphPathTextMatrix renders a glyph outline in Poppler callback text
+// coordinates so Splash can apply the final device matrix during path setup.
+func (f *Font) RenderGlyphPathTextMatrix(glyph uint32, sizePt float64, matrix [4]float64) (*entity.GlyphPath, error) {
+	if !freeTypeGoBitmapAdapterEnabled() || len(f.data) == 0 || !ftcgo.IsAvailable() {
+		return nil, fmt.Errorf("truetype: pure Go FreeType adapter not available for text-matrix path rendering")
+	}
+	return ftcgo.RenderGlyphPathByIndexTextMatrix(f.data, glyph, sizePt, matrix)
+}
+
 func freeTypeGoBitmapAdapterEnabled() bool {
 	switch os.Getenv("PDF_FREETYPE_GO") {
 	case "0", "false", "FALSE", "no", "NO", "off", "OFF":

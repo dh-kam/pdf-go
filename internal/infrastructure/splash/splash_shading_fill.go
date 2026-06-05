@@ -1,6 +1,11 @@
 package splash
 
-import "github.com/dh-kam/pdf-go/internal/infrastructure/splash/xpath"
+import (
+	"fmt"
+	"os"
+
+	"github.com/dh-kam/pdf-go/internal/infrastructure/splash/xpath"
+)
 
 // shadedFill mirrors Poppler's Splash::shadedFill driver for shading patterns.
 func (s *Splash) shadedFill(p *xpath.Path, hasBBox bool, pat Pattern, clipToStrokePath bool) error {
@@ -72,31 +77,58 @@ func (s *Splash) shadedFillAARows(pipe *pipe, scanner *xpath.Scanner, clip *xpat
 	}
 	for y := yMinI; y <= yMaxI; y++ {
 		x0, x1 := scanner.RenderAALineFullWidth(y, s.aaBuf, s.bitmap.width)
+		clipHasPath := false
 		if clipRes != xpath.ClipAllInside {
-			clip.ClipAALineFullWidth(y, s.aaBuf, x0, x1, s.bitmap.width)
+			x0, x1 = clip.ClipAALineFullWidth(y, s.aaBuf, x0, x1, s.bitmap.width)
+			clipHasPath = clip != nil && clip.HasPathClip()
 		}
-		s.correctShadedFillAALineEdges(pat, hasBBox, x0, x1, y, yMinI, yMaxI, rowSize)
+		traceShadedFillAARow("before-edge-correction", x0, x1, y, clipHasPath, hasBBox)
+		s.correctShadedFillAALineEdges(pat, hasBBox, clipHasPath, x0, x1, y, yMinI, yMaxI, rowSize)
 		s.runAALineFullWidth(pipe, x0, x1, y, rowSize)
 	}
 }
 
-func (s *Splash) correctShadedFillAALineEdges(pat Pattern, hasBBox bool, x0, x1, y, yMinI, yMaxI, rowSize int) {
-	if hasBBox || pat == nil || y <= yMinI || y >= yMaxI {
+func (s *Splash) correctShadedFillAALineEdges(pat Pattern, hasBBox, clipHasPath bool, x0, x1, y, yMinI, yMaxI, rowSize int) {
+	if disableShadedFillAALineEdgeCorrection() || hasBBox || pat == nil || y <= yMinI || y >= yMaxI {
+		return
+	}
+	if clipHasPath && skipShadedFillPathClipEdgeCorrection() {
+		return
+	}
+	if skipper, ok := pat.(interface{ SkipShadedFillEdgeCorrection() bool }); ok && skipper.SkipShadedFillEdgeCorrection() {
 		return
 	}
 	s.correctShadedFillAALineEdge(pat, x0, y, rowSize, true)
 	s.correctShadedFillAALineEdge(pat, x1, y, rowSize, false)
 }
 
+func disableShadedFillAALineEdgeCorrection() bool {
+	return os.Getenv("PDF_DEBUG_SPLASH_DISABLE_SHADED_FILL_EDGE_CORRECTION") == "1"
+}
+
+func skipShadedFillPathClipEdgeCorrection() bool {
+	return os.Getenv("PDF_SPLASH_SHADED_FILL_SKIP_PATH_CLIP_EDGE_CORRECTION") == "1"
+}
+
 func (s *Splash) correctShadedFillAALineEdge(pat Pattern, x, y, rowSize int, left bool) {
 	if s.bitmap == nil || x < 0 || x >= s.bitmap.width || rowSize <= 0 {
 		return
 	}
+	trace := shouldTraceShadedFillEdge(x, y)
+	testX := x + 1
 	if left {
-		if !pat.TestPosition(x-1, y) {
+		testX = x - 1
+	}
+	inside := pat.TestPosition(testX, y)
+	if trace {
+		fmt.Fprintf(os.Stderr, "SPLASH_SHADED_EDGE_TRACE phase=test x=%d y=%d left=%t testX=%d inside=%t rowSize=%d\n",
+			x, y, left, testX, inside, rowSize)
+	}
+	if left {
+		if !inside {
 			return
 		}
-	} else if !pat.TestPosition(x+1, y) {
+	} else if !inside {
 		return
 	}
 
@@ -110,14 +142,24 @@ func (s *Splash) correctShadedFillAALineEdge(pat Pattern, x, y, rowSize int, lef
 	n1 := shadingFillNibble(s.aaBuf[byteIdx+rowSize], x)
 	n2 := shadingFillNibble(s.aaBuf[byteIdx+2*rowSize], x)
 	n3 := shadingFillNibble(s.aaBuf[byteIdx+3*rowSize], x)
+	if trace {
+		fmt.Fprintf(os.Stderr, "SPLASH_SHADED_EDGE_TRACE phase=nibbles x=%d y=%d left=%t byteIdx=%d n=(%02x,%02x,%02x,%02x)\n",
+			x, y, left, byteIdx, n0, n1, n2, n3)
+	}
 	if n0 != n1 || n1 != n2 || n2 != n3 {
 		return
 	}
 	if left {
 		if n0&0x03 != 0x03 {
+			if trace {
+				fmt.Fprintf(os.Stderr, "SPLASH_SHADED_EDGE_TRACE phase=skip-left-mask x=%d y=%d n=%02x\n", x, y, n0)
+			}
 			return
 		}
 	} else if n0&0x0c != 0x0c {
+		if trace {
+			fmt.Fprintf(os.Stderr, "SPLASH_SHADED_EDGE_TRACE phase=skip-right-mask x=%d y=%d n=%02x\n", x, y, n0)
+		}
 		return
 	}
 
@@ -129,6 +171,9 @@ func (s *Splash) correctShadedFillAALineEdge(pat Pattern, x, y, rowSize int, lef
 	s.aaBuf[byteIdx+rowSize] |= mask
 	s.aaBuf[byteIdx+2*rowSize] |= mask
 	s.aaBuf[byteIdx+3*rowSize] |= mask
+	if trace {
+		fmt.Fprintf(os.Stderr, "SPLASH_SHADED_EDGE_TRACE phase=apply x=%d y=%d left=%t mask=%02x\n", x, y, left, mask)
+	}
 }
 
 func shadingFillNibble(b byte, x int) byte {
@@ -136,4 +181,25 @@ func shadingFillNibble(b byte, x int) byte {
 		return b & 0x0f
 	}
 	return b >> 4
+}
+
+var shadedEdgeTracePixels = parseSplashTracePixels(os.Getenv("PDF_DEBUG_SPLASH_SHADED_EDGE_TRACE"))
+
+func shouldTraceShadedFillEdge(x, y int) bool {
+	for _, pixel := range shadedEdgeTracePixels {
+		if pixel.x == x && pixel.y == y {
+			return true
+		}
+	}
+	return false
+}
+
+func traceShadedFillAARow(phase string, x0, x1, y int, clipHasPath, hasBBox bool) {
+	for _, pixel := range shadedEdgeTracePixels {
+		if pixel.y != y || (pixel.x != x0 && pixel.x != x1) {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "SPLASH_SHADED_EDGE_TRACE phase=%s x=%d y=%d x0=%d x1=%d clipHasPath=%t hasBBox=%t\n",
+			phase, pixel.x, y, x0, x1, clipHasPath, hasBBox)
+	}
 }

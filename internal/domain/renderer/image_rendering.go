@@ -9,9 +9,11 @@ import (
 	stdimage "image"
 	"image/color"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 
+	"github.com/dh-kam/pdf-go/internal/domain/colorspace"
 	"github.com/dh-kam/pdf-go/internal/domain/entity"
 	"github.com/dh-kam/pdf-go/internal/domain/errors"
 	domainimage "github.com/dh-kam/pdf-go/internal/domain/image"
@@ -89,11 +91,15 @@ func (e *Evaluator) evaluateImageXObject(xobj *entity.Stream, name entity.Name) 
 		iccComponents = e.resolveICCBasedComponentCount(colorSpaceObj)
 	}
 
-	// Get bits per component.
-	bpc := getImageBitsPerComponent(dict.Get(entity.Name("BitsPerComponent")))
-
 	// Resolve color space for raw image decoding.
-	imageMask := isImageMaskDictValue(dict.Get(entity.Name("ImageMask")))
+	imageMask := isImageMaskDict(dict)
+	// Poppler treats a missing ImageMask BPC as 1, and accepts the inline-style
+	// /BPC alias as a fallback (Gfx.cc image bit-depth parsing).
+	bpcObj := dict.GetTry(entity.Name("BitsPerComponent"), entity.Name("BPC"))
+	bpc := getImageBitsPerComponent(bpcObj)
+	if imageMask && bpcObj == nil {
+		bpc = 1
+	}
 	if shouldSkipAllImagesForDebug() {
 		return nil
 	}
@@ -120,7 +126,19 @@ func (e *Evaluator) evaluateImageXObject(xobj *entity.Stream, name entity.Name) 
 	// Resolve color space for raw image decoding.
 	colorSpace, ok := e.resolveImageColorSpace(colorSpaceObj)
 	if !ok {
+		if debugImageDecodeErrors() {
+			fmt.Fprintf(os.Stderr, "PDF_IMAGE_SKIP name=%s reason=colorspace raw_cs=%T:%v filter=%v w=%.0f h=%.0f bpc=%d data=%d\n",
+				name, colorSpaceObj, colorSpaceObj, filterObj, width, height, bpc, len(data))
+		}
 		// Unsupported color space: skip image rendering for now.
+		return nil
+	}
+	colorMapper, ok := e.resolveImageColorMapper(colorSpace, colorSpaceObj)
+	if !ok {
+		if debugImageDecodeErrors() {
+			fmt.Fprintf(os.Stderr, "PDF_IMAGE_SKIP name=%s reason=colorspace_mapper cs=%s raw_cs=%T:%v filter=%v w=%.0f h=%.0f bpc=%d data=%d\n",
+				name, colorSpace, colorSpaceObj, colorSpaceObj, filterObj, width, height, bpc, len(data))
+		}
 		return nil
 	}
 
@@ -129,6 +147,10 @@ func (e *Evaluator) evaluateImageXObject(xobj *entity.Stream, name entity.Name) 
 	if colorSpace == "Indexed" {
 		base, lookup, indexedOK := e.resolveIndexedColorSpace(colorSpaceObj, 0)
 		if !indexedOK {
+			if debugImageDecodeErrors() {
+				fmt.Fprintf(os.Stderr, "PDF_IMAGE_SKIP name=%s reason=indexed raw_cs=%T:%v filter=%v w=%.0f h=%.0f bpc=%d data=%d\n",
+					name, colorSpaceObj, colorSpaceObj, filterObj, width, height, bpc, len(data))
+			}
 			return nil
 		}
 		indexedBase = base
@@ -139,10 +161,31 @@ func (e *Evaluator) evaluateImageXObject(xobj *entity.Stream, name entity.Name) 
 	if e.canvas != nil {
 		decode := e.resolveImageDecodeArray(dict.Get(entity.Name("Decode")))
 		interpolate, interpolateExplicit := resolveImageInterpolateOption(dict.Get(entity.Name("Interpolate")), false)
-		mask := e.resolveSoftMask(dict.Get(entity.Name("SMask")))
+		smaskObj := dict.Get(entity.Name("SMask"))
+		softMask := e.resolveSoftMaskDetails(smaskObj)
+		mask := softMask.mask
+		maskMatte := softMask.matte
+		explicitMask := false
+		maskInterpolate := false
+		if mask != nil {
+			maskInterpolate = e.resolveImageMaskInterpolate(smaskObj)
+		}
 		if mask == nil {
-			// Explicit image mask can be provided in /Mask as an image stream.
-			mask = e.resolveSoftMask(dict.Get(entity.Name("Mask")))
+			maskObj := dict.Get(entity.Name("Mask"))
+			if explicit := e.resolveExplicitImageMask(maskObj); explicit != nil {
+				mask = explicit
+				explicitMask = true
+				maskInterpolate = e.resolveImageMaskInterpolate(maskObj)
+				maskMatte = nil
+			} else {
+				// A /Mask image stream without ImageMask follows Poppler's soft-mask image path.
+				softMask = e.resolveSoftMaskDetails(maskObj)
+				mask = softMask.mask
+				maskMatte = softMask.matte
+				if mask != nil {
+					maskInterpolate = e.resolveImageMaskInterpolate(maskObj)
+				}
+			}
 		}
 		colorKeyMask := e.resolveColorKeyMask(dict.Get(entity.Name("Mask")), colorSpace)
 		if mask != nil {
@@ -154,6 +197,7 @@ func (e *Evaluator) evaluateImageXObject(xobj *entity.Stream, name entity.Name) 
 			width,
 			height,
 			colorSpace,
+			colorMapper,
 			sourceICCBased,
 			iccProfile,
 			iccComponents,
@@ -165,6 +209,9 @@ func (e *Evaluator) evaluateImageXObject(xobj *entity.Stream, name entity.Name) 
 			e.resolveImageDecodeParms(dict.Get(entity.Name("DecodeParms")), encodedPrefixLen),
 			decode,
 			mask,
+			maskMatte,
+			explicitMask,
+			maskInterpolate,
 			colorKeyMask,
 			interpolate,
 			interpolateExplicit,
@@ -215,6 +262,14 @@ func isImageMaskDictValue(obj entity.Object) bool {
 	default:
 		return false
 	}
+}
+
+func isImageMaskDict(dict *entity.Dict) bool {
+	if dict == nil {
+		return false
+	}
+	return isImageMaskDictValue(dict.Get(entity.Name("ImageMask"))) ||
+		isImageMaskDictValue(dict.Get(entity.Name("IM")))
 }
 
 func resolveImageMaskPaintBit(decode []float64) bool {
@@ -306,6 +361,7 @@ func (e *Evaluator) renderImageToCanvas(
 	data []byte,
 	width, height float64,
 	colorSpace string,
+	colorMapper colorspace.ColorSpace,
 	sourceICCBased bool,
 	iccProfile []byte,
 	iccComponents int,
@@ -317,6 +373,9 @@ func (e *Evaluator) renderImageToCanvas(
 	decodeParms map[string]interface{},
 	decode []float64,
 	mask domainimage.ImageMask,
+	maskMatte []float64,
+	explicitMask bool,
+	maskInterpolate bool,
 	colorKeyMask *image.ColorKeyMask,
 	interpolate bool,
 	interpolateExplicit bool,
@@ -359,6 +418,7 @@ func (e *Evaluator) renderImageToCanvas(
 		Height:           int(height),
 		BitsPerComponent: int(bpc),
 		ColorSpace:       domainimage.ColorSpace(colorSpace),
+		ColorMapper:      colorMapper,
 		CMYKConversionMode: e.resolveImageCMYKConversionMode(
 			colorSpace,
 			indexedBase,
@@ -389,6 +449,10 @@ func (e *Evaluator) renderImageToCanvas(
 	decoder := image.NewDecoder()
 	decodedImg, err := decoder.Decode(imgData)
 	if err != nil {
+		if debugImageDecodeErrors() {
+			fmt.Fprintf(os.Stderr, "PDF_IMAGE_DECODE_ERROR cs=%s indexed_base=%s filter=%s source_filter=%s w=%d h=%d bpc=%d data=%d lookup=%d decode=%v decode_parms=%v err=%v\n",
+				colorSpace, indexedBase, filter, sourceFilter, imgData.Width, imgData.Height, imgData.BitsPerComponent, len(data), len(indexedLookup), decode, decodeParms, err)
+		}
 		// If decoding fails, fall back to placeholder
 		e.renderPlaceholderImage(width, height)
 		return
@@ -397,13 +461,28 @@ func (e *Evaluator) renderImageToCanvas(
 	// Convert decoded domain image to std image for canvas drawing.
 	img := decodedImg.Image()
 	if img == nil {
+		if debugImageDecodeErrors() {
+			fmt.Fprintf(os.Stderr, "PDF_IMAGE_DECODE_ERROR cs=%s indexed_base=%s filter=%s w=%d h=%d bpc=%d data=%d err=nil-image\n",
+				colorSpace, indexedBase, filter, imgData.Width, imgData.Height, imgData.BitsPerComponent, len(data))
+		}
 		e.renderPlaceholderImage(width, height)
 		return
 	}
 	softMask := domainimage.ImageMask(nil)
+	explicitImageMask := false
 	if decodedImg.HasMask() {
 		softMask = decodedImg.Mask()
-		if _, ok := e.canvas.(softMaskedImageDrawer); !ok {
+		explicitImageMask = explicitMask
+		if !explicitImageMask && len(maskMatte) > 0 {
+			img = applySoftMaskMatteUnblend(img, softMask, maskMatte, colorSpace, colorMapper)
+		}
+		if explicitImageMask {
+			if _, ok := e.canvas.(sourceAlphaImageDrawer); !ok {
+				img = image.ApplyMask(img, softMask)
+				softMask = nil
+				explicitImageMask = false
+			}
+		} else if _, ok := e.canvas.(softMaskedImageDrawer); !ok {
 			img = image.ApplyMask(img, softMask)
 			softMask = nil
 		}
@@ -490,16 +569,29 @@ func (e *Evaluator) renderImageToCanvas(
 
 	// Draw the image to the canvas
 	if softMask != nil {
-		err = e.drawSoftMaskedImageUsingCurrentTransform(
-			img,
-			softMask,
-			imageCTM,
-			effectiveInterpolate,
-			sampler,
-			phaseX,
-			phaseY,
-			imgData.ImageEdgeMode,
-		)
+		if explicitImageMask && canApplyExplicitImageMaskAtSourceResolution(img, softMask) {
+			err = e.drawSourceAlphaImageUsingCurrentTransform(
+				applyExplicitImageMaskToImage(img, softMask),
+				imageCTM,
+				effectiveInterpolate,
+				sampler,
+				phaseX,
+				phaseY,
+				imgData.ImageEdgeMode,
+			)
+		} else {
+			err = e.drawSoftMaskedImageUsingCurrentTransform(
+				img,
+				softMask,
+				imageCTM,
+				effectiveInterpolate,
+				maskInterpolate,
+				sampler,
+				phaseX,
+				phaseY,
+				imgData.ImageEdgeMode,
+			)
+		}
 	} else {
 		err = e.drawImageUsingCurrentTransform(
 			img,
@@ -512,9 +604,143 @@ func (e *Evaluator) renderImageToCanvas(
 		)
 	}
 	if err != nil {
+		if debugImageDecodeErrors() {
+			fmt.Fprintf(os.Stderr, "PDF_IMAGE_DRAW_ERROR cs=%s indexed_base=%s filter=%s source_filter=%s w=%d h=%d bpc=%d img=%dx%d ctm=%v err=%v\n",
+				colorSpace, indexedBase, filter, sourceFilter, imgData.Width, imgData.Height, imgData.BitsPerComponent, srcWidth, srcHeight, imageCTM, err)
+		}
 		// Fallback to placeholder if drawing fails
 		e.renderPlaceholderImage(width, height)
 	}
+}
+
+func debugImageDecodeErrors() bool {
+	return os.Getenv("PDF_DEBUG_IMAGE_DECODE_ERRORS") == "1"
+}
+
+func canApplyExplicitImageMaskAtSourceResolution(img stdimage.Image, mask domainimage.ImageMask) bool {
+	if img == nil || mask == nil || mask.Image() == nil {
+		return false
+	}
+	imgBounds := img.Bounds()
+	maskBounds := mask.Image().Bounds()
+	return maskBounds.Dx() > 0 &&
+		maskBounds.Dy() > 0 &&
+		maskBounds.Dx() <= imgBounds.Dx() &&
+		maskBounds.Dy() <= imgBounds.Dy()
+}
+
+func applyExplicitImageMaskToImage(img stdimage.Image, mask domainimage.ImageMask) stdimage.Image {
+	if img == nil || mask == nil || mask.Image() == nil {
+		return img
+	}
+	srcBounds := img.Bounds()
+	maskImg := mask.Image()
+	maskBounds := maskImg.Bounds()
+	srcW, srcH := srcBounds.Dx(), srcBounds.Dy()
+	maskW, maskH := maskBounds.Dx(), maskBounds.Dy()
+	if srcW <= 0 || srcH <= 0 || maskW <= 0 || maskH <= 0 {
+		return img
+	}
+
+	out := stdimage.NewNRGBA(srcBounds)
+	inverted := mask.IsInverted()
+	for y := srcBounds.Min.Y; y < srcBounds.Max.Y; y++ {
+		my := maskBounds.Min.Y + (y-srcBounds.Min.Y)*maskH/srcH
+		for x := srcBounds.Min.X; x < srcBounds.Max.X; x++ {
+			mx := maskBounds.Min.X + (x-srcBounds.Min.X)*maskW/srcW
+			alpha := color.GrayModel.Convert(maskImg.At(mx, my)).(color.Gray).Y
+			if inverted {
+				alpha = 0xFF - alpha
+			}
+			r16, g16, b16, a16 := img.At(x, y).RGBA()
+			baseAlpha := uint8(a16 >> 8)
+			finalAlpha := uint8((uint16(baseAlpha)*uint16(alpha) + 127) / 255)
+			out.SetNRGBA(x, y, color.NRGBA{
+				R: uint8(r16 >> 8),
+				G: uint8(g16 >> 8),
+				B: uint8(b16 >> 8),
+				A: finalAlpha,
+			})
+		}
+	}
+	return out
+}
+
+func applySoftMaskMatteUnblend(img stdimage.Image, mask domainimage.ImageMask, matte []float64, colorSpace string, colorMapper colorspace.ColorSpace) stdimage.Image {
+	if img == nil || mask == nil || mask.Image() == nil || len(matte) == 0 {
+		return img
+	}
+	imgBounds := img.Bounds()
+	maskImg := mask.Image()
+	maskBounds := maskImg.Bounds()
+	if imgBounds.Dx() != maskBounds.Dx() || imgBounds.Dy() != maskBounds.Dy() {
+		return img
+	}
+	matteRGB, ok := softMaskMatteRGB(matte, colorSpace, colorMapper)
+	if !ok {
+		return img
+	}
+
+	out := stdimage.NewRGBA(imgBounds)
+	for y := imgBounds.Min.Y; y < imgBounds.Max.Y; y++ {
+		my := maskBounds.Min.Y + (y - imgBounds.Min.Y)
+		for x := imgBounds.Min.X; x < imgBounds.Max.X; x++ {
+			mx := maskBounds.Min.X + (x - imgBounds.Min.X)
+			alpha := color.GrayModel.Convert(maskImg.At(mx, my)).(color.Gray).Y
+			r16, g16, b16, a16 := img.At(x, y).RGBA()
+			out.SetRGBA(x, y, color.RGBA{
+				R: unblendMatteComponent(uint8(r16>>8), matteRGB[0], alpha),
+				G: unblendMatteComponent(uint8(g16>>8), matteRGB[1], alpha),
+				B: unblendMatteComponent(uint8(b16>>8), matteRGB[2], alpha),
+				A: uint8(a16 >> 8),
+			})
+		}
+	}
+	return out
+}
+
+func softMaskMatteRGB(matte []float64, colorSpace string, colorMapper colorspace.ColorSpace) ([3]uint8, bool) {
+	if colorMapper != nil && len(matte) == colorMapper.GetNumComponents() {
+		rgba := colorMapper.ConvertToRGBA(matte)
+		return [3]uint8{rgba.R, rgba.G, rgba.B}, true
+	}
+	switch colorSpace {
+	case "DeviceGray":
+		if len(matte) != 1 {
+			return [3]uint8{}, false
+		}
+		v := matteComponentByte(matte[0])
+		return [3]uint8{v, v, v}, true
+	case "DeviceRGB":
+		if len(matte) != 3 {
+			return [3]uint8{}, false
+		}
+		return [3]uint8{
+			matteComponentByte(matte[0]),
+			matteComponentByte(matte[1]),
+			matteComponentByte(matte[2]),
+		}, true
+	default:
+		return [3]uint8{}, false
+	}
+}
+
+func matteComponentByte(v float64) uint8 {
+	return uint8(math.Round(clamp(v, 0, 1) * 255))
+}
+
+func unblendMatteComponent(src uint8, matte uint8, alpha uint8) uint8 {
+	if alpha == 0 {
+		return matte
+	}
+	value := int(matte) + (int(src)-int(matte))*255/int(alpha)
+	if value < 0 {
+		return 0
+	}
+	if value > 255 {
+		return 255
+	}
+	return uint8(value)
 }
 
 func (e *Evaluator) renderImageMaskToCanvas(
@@ -546,9 +772,16 @@ func (e *Evaluator) renderImageMaskToCanvas(
 		return nil
 	}
 
+	imageCTM := e.currentImageTransform()
 	if maskAlphaMode == imageMaskAlphaOpaque &&
-		e.canFillImageMaskViaClip(intWidth, intHeight, e.currentImageTransform()) {
-		return e.fillImageMaskWithCurrentClip(intWidth, intHeight, e.currentImageTransform())
+		e.canFillImageMaskViaClip(intWidth, intHeight, imageCTM) {
+		return e.fillImageMaskWithCurrentClip(intWidth, intHeight, imageCTM)
+	}
+
+	if os.Getenv("GO_PDF_ENABLE_SPLASH_IMAGE_MASK_DIRECT") == "1" {
+		if drawer, ok := e.canvas.(imageMaskCanvas); ok {
+			return e.drawImageMaskUsingCurrentTransform(drawer, mask, imageCTM)
+		}
 	}
 
 	fill := colorFromGraphicsState(e.graphics.fillColor, e.graphics.fillAlpha)
@@ -571,7 +804,6 @@ func (e *Evaluator) renderImageMaskToCanvas(
 		return nil
 	}
 
-	imageCTM := e.currentImageTransform()
 	srcBounds := img.Bounds()
 	srcWidth := srcBounds.Dx()
 	srcHeight := srcBounds.Dy()
@@ -902,9 +1134,36 @@ type softMaskedImageDrawer interface {
 	) error
 }
 
-func (e *Evaluator) drawSoftMaskedImageUsingCurrentTransform(
+type imageMaskCanvas interface {
+	DrawImageMask(
+		mask domainimage.ImageMask,
+		x, y, w, h float64,
+	) error
+}
+
+type softMaskedImageDrawerWithMaskInterpolation interface {
+	DrawImageWithSoftMaskAndMaskInterpolate(
+		img stdimage.Image,
+		mask domainimage.ImageMask,
+		x, y, w, h float64,
+		interpolate bool,
+		maskInterpolate bool,
+		sampler string,
+		phaseX, phaseY float64,
+		edgeMode string,
+	) error
+}
+
+type sourceAlphaImageDrawer interface {
+	DrawImageWithSourceAlpha(
+		img stdimage.Image,
+		x, y, w, h float64,
+		interpolate bool,
+	) error
+}
+
+func (e *Evaluator) drawSourceAlphaImageUsingCurrentTransform(
 	img stdimage.Image,
-	mask domainimage.ImageMask,
 	imageCTM [6]float64,
 	interpolate bool,
 	sampler string,
@@ -912,6 +1171,59 @@ func (e *Evaluator) drawSoftMaskedImageUsingCurrentTransform(
 	phaseY float64,
 	imageEdgeMode string,
 ) error {
+	drawer, ok := e.canvas.(sourceAlphaImageDrawer)
+	if !ok {
+		return e.drawImageUsingCurrentTransform(img, imageCTM, interpolate, sampler, phaseX, phaseY, imageEdgeMode)
+	}
+
+	e.canvas.Save()
+	e.canvas.Transform(imageCTM)
+	defer e.canvas.Restore()
+	return drawer.DrawImageWithSourceAlpha(img, 0, 0, 1, 1, interpolate)
+}
+
+func (e *Evaluator) drawImageMaskUsingCurrentTransform(
+	drawer imageMaskCanvas,
+	mask domainimage.ImageMask,
+	imageCTM [6]float64,
+) error {
+	e.canvas.Save()
+	e.canvas.Transform(imageCTM)
+	defer e.canvas.Restore()
+	return drawer.DrawImageMask(mask, 0, 0, 1, 1)
+}
+
+func (e *Evaluator) drawSoftMaskedImageUsingCurrentTransform(
+	img stdimage.Image,
+	mask domainimage.ImageMask,
+	imageCTM [6]float64,
+	interpolate bool,
+	maskInterpolate bool,
+	sampler string,
+	phaseX float64,
+	phaseY float64,
+	imageEdgeMode string,
+) error {
+	if drawer, ok := e.canvas.(softMaskedImageDrawerWithMaskInterpolation); ok {
+		e.canvas.Save()
+		e.canvas.Transform(imageCTM)
+		defer e.canvas.Restore()
+		return drawer.DrawImageWithSoftMaskAndMaskInterpolate(
+			img,
+			mask,
+			0,
+			0,
+			1,
+			1,
+			interpolate,
+			maskInterpolate,
+			sampler,
+			phaseX,
+			phaseY,
+			imageEdgeMode,
+		)
+	}
+
 	drawer, ok := e.canvas.(softMaskedImageDrawer)
 	if !ok {
 		return fmt.Errorf("canvas does not support soft masked images")

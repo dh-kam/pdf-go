@@ -16,7 +16,9 @@ func (defaultFontCandidateResolver) ResolveCandidate(e *Evaluator, dict *entity.
 	switch subtype {
 	case "Type1":
 		return e.resolveType1FontCandidate(baseFont, embeddedFontData, embeddedErr)
-	case "TrueType", "CIDFontType0", "CIDFontType2":
+	case "CIDFontType0":
+		return e.newEmbeddedCIDFontType0Candidate(embeddedFontData, embeddedErr)
+	case "TrueType", "CIDFontType2":
 		return e.newEmbeddedTrueTypeFont(embeddedFontData, embeddedErr)
 	case "Type0":
 		return e.resolveType0FontCandidate(dict, baseFont)
@@ -77,6 +79,9 @@ func (e *Evaluator) resolveType0FontCandidate(dict *entity.Dict, baseFont string
 	// For CIDFontType2 descendants with Identity CIDToGIDMap, wrap in cidIdentityFont
 	// so text is processed as 2-byte CIDs and char codes map directly to glyph IDs.
 	subtypeName := nameValueForEncoding(descendantDict.Get(entity.Name("Subtype")))
+	if subtypeName == "CIDFontType0" {
+		font = e.wrapCIDFontType0CWithCIDToGIDMap(font)
+	}
 	if subtypeName == "CIDFontType2" {
 		cidToGID := descendantDict.Get(entity.Name("CIDToGIDMap"))
 		isIdentity := cidToGID == nil
@@ -85,11 +90,115 @@ func (e *Evaluator) resolveType0FontCandidate(dict *entity.Dict, baseFont string
 		}
 		if isIdentity && font != nil && !font.IsCIDFont() {
 			toUnicode := e.parseType0ToUnicodeMap(dict)
-			font = &cidIdentityFont{base: font, toUnicode: toUnicode}
+			embeddedFontData, embeddedErr := e.getEmbeddedFontData(descendantDict)
+			preferToUnicodeCMap := shouldUseToUnicodeCMapForCIDIdentity(
+				baseFont,
+				toUnicode,
+				embeddedFontData,
+				embeddedErr,
+			)
+			font = &cidIdentityFont{
+				base:                font,
+				toUnicode:           toUnicode,
+				preferToUnicodeCMap: preferToUnicodeCMap,
+			}
+			// Poppler's GfxCIDFont keeps /W and /DW advances keyed by CID.
+			// Apply metrics after the Identity wrapper so CharCodeToGlyph uses
+			// the same CID key, not the embedded TrueType cmap glyph key.
+			font = e.applyFontMetricsFromDict(descendantDict, font)
 		}
 	}
 
 	return font
+}
+
+func shouldUseToUnicodeCMapForCIDIdentity(baseFont string, toUnicode map[uint32]rune, embeddedFontData []byte, embeddedErr error) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PDF_DEBUG_CID_IDENTITY_TOUNICODE_CMAP"))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	case "auto":
+		return shouldAutoUseToUnicodeCMapForCIDIdentity(baseFont, toUnicode, embeddedFontData, embeddedErr)
+	default:
+		return shouldAutoUseToUnicodeCMapForCIDIdentity(baseFont, toUnicode, embeddedFontData, embeddedErr)
+	}
+}
+
+func shouldAutoUseToUnicodeCMapForCIDIdentity(baseFont string, toUnicode map[uint32]rune, embeddedFontData []byte, embeddedErr error) bool {
+	if len(toUnicode) == 0 || !isLatinCIDIdentityFallbackFont(baseFont) || !isSimpleLatinToUnicodeMap(toUnicode) {
+		return false
+	}
+	if embeddedErr != nil || len(embeddedFontData) == 0 {
+		return true
+	}
+	_, err := truetype.NewFontFromBytes(embeddedFontData)
+	return err != nil
+}
+
+func isLatinCIDIdentityFallbackFont(baseFont string) bool {
+	switch strings.TrimSpace(stripSubsetPrefix(baseFont)) {
+	case "ArialMT", "Arial", "Helvetica", "HelveticaNeue", "Times-Roman", "Courier":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSimpleLatinToUnicodeMap(toUnicode map[uint32]rune) bool {
+	if len(toUnicode) == 0 {
+		return false
+	}
+	for _, r := range toUnicode {
+		switch {
+		case r >= 0x20 && r <= 0x7e:
+			continue
+		case r >= 0xa0 && r <= 0xff:
+			continue
+		case r == 0x2022 || r == 0x2013 || r == 0x2014:
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func (e *Evaluator) wrapCIDFontType0CWithCIDToGIDMap(font entity.Font) entity.Font {
+	if font == nil {
+		return font
+	}
+	if font.IsCIDFont() {
+		return font
+	}
+	if !shouldEnableCIDFontType0CCIDToGIDMapDebug() {
+		return &cidDirectFont{base: font}
+	}
+	mapper, ok := font.(cidToGIDMapFont)
+	if !ok {
+		return &cidDirectFont{base: font}
+	}
+	cidToGID, ok := mapper.CIDToGIDMap()
+	if !ok || len(cidToGID) == 0 {
+		return &cidDirectFont{base: font}
+	}
+	return &cidToGIDMappedFont{
+		base:     font,
+		cidToGID: cidToGID,
+	}
+}
+
+func shouldEnableCIDFontType0CCIDToGIDMapDebug() bool {
+	// Poppler SplashOutputDev loads raw CIDFontType0/CIDFontType0C descendants
+	// through loadCIDFont without passing a codeToGID map. Keep the reversed CFF
+	// charset mapping as a diagnostic opt-in because OpenType CFF and TrueType
+	// descendants use separate mapping paths.
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PDF_DEBUG_CIDTYPE0C_CIDTOGID_MAP"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func (e *Evaluator) resolveFirstDescendantFontDict(dict *entity.Dict) (*entity.Dict, bool) {
@@ -310,6 +419,18 @@ func (e *Evaluator) newEmbeddedType1Font(fontData []byte, fontErr error) entity.
 		return cffFont
 	}
 	return nil
+}
+
+func (e *Evaluator) newEmbeddedCIDFontType0Candidate(fontData []byte, fontErr error) entity.Font {
+	if fontErr != nil {
+		return nil
+	}
+	if looksLikeCFFEmbeddedFont(fontData) {
+		if cffFont, cffErr := cff.NewFont(fontData); cffErr == nil {
+			return e.wrapCIDFontType0CWithCIDToGIDMap(cffFont)
+		}
+	}
+	return e.newEmbeddedTrueTypeFont(fontData, fontErr)
 }
 
 func looksLikeCFFEmbeddedFont(fontData []byte) bool {

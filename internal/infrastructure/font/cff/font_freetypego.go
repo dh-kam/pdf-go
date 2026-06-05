@@ -36,6 +36,14 @@ func (f *Font) EncodingName(code byte) string {
 	return name
 }
 
+// CIDToGIDMap returns a Poppler-style CID-to-GID map for CID-keyed CFF fonts.
+func (f *Font) CIDToGIDMap() (map[uint32]uint32, bool) {
+	if !freeTypeGoAdapterEnabled() || len(f.data) == 0 || !freetype.IsAvailable() {
+		return nil, false
+	}
+	return freetype.GetCIDToGIDMap(f.data)
+}
+
 // CharCodeToGlyph maps char codes through the pure Go FreeType adapter when possible.
 func (f *Font) CharCodeToGlyph(code uint32) (uint32, error) {
 	if freeTypeGoAdapterEnabled() && len(f.data) > 0 && freetype.IsAvailable() {
@@ -87,6 +95,24 @@ func (f *Font) RenderGlyphBitmapMatrixPhased(glyph uint32, sizePt float64, matri
 		return nil, 0, 0, 0, 0, fmt.Errorf("cff: pure Go FreeType adapter not available for matrix rendering")
 	}
 	return freetype.RenderGlyphBitmapByIndexMatrixPhased(f.data, glyph, sizePt, matrix, phaseX, phaseY)
+}
+
+// RenderGlyphPathMatrix renders a CFF glyph outline through the same pure Go
+// FreeType matrix path used by Poppler SplashFTFont::getGlyphPath.
+func (f *Font) RenderGlyphPathMatrix(glyph uint32, sizePt float64, matrix [4]float64) (*entity.GlyphPath, error) {
+	if !freeTypeGoAdapterEnabled() || len(f.data) == 0 || !freetype.IsAvailable() {
+		return nil, fmt.Errorf("cff: pure Go FreeType adapter not available for matrix path rendering")
+	}
+	return freetype.RenderGlyphPathByIndexMatrix(f.data, glyph, sizePt, matrix)
+}
+
+// RenderGlyphPathTextMatrix renders a CFF glyph outline in Poppler callback text
+// coordinates so Splash can apply the final device matrix during path setup.
+func (f *Font) RenderGlyphPathTextMatrix(glyph uint32, sizePt float64, matrix [4]float64) (*entity.GlyphPath, error) {
+	if !freeTypeGoAdapterEnabled() || len(f.data) == 0 || !freetype.IsAvailable() {
+		return nil, fmt.Errorf("cff: pure Go FreeType adapter not available for text-matrix path rendering")
+	}
+	return freetype.RenderGlyphPathByIndexTextMatrix(f.data, glyph, sizePt, matrix)
 }
 
 func freeTypeGoAdapterEnabled() bool {

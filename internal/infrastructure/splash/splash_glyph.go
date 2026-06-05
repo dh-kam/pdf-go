@@ -5,6 +5,8 @@ import (
 	"image"
 	"math"
 	"os"
+	"strconv"
+	"strings"
 
 	"golang.org/x/image/vector"
 
@@ -82,7 +84,7 @@ func fillGlyph2(s *Splash, x0, y0 int, g *GlyphBitmap) {
 					s.pipeIncX(&p)
 					continue
 				}
-				alpha := g.Data[rowBase+xx]
+				alpha := adjustGlyphAlpha(g.Data[rowBase+xx])
 				if alpha != 0 {
 					dstX := xStart + xx
 					if shouldTraceGlyphPixel(dstX, dstY) {
@@ -147,6 +149,7 @@ func glyphPixelOutsideClip(clip *xpath.Clip, x, y int) bool {
 }
 
 var glyphTracePixels = parseSplashTracePixels(os.Getenv("PDF_DEBUG_SPLASH_GLYPH_TRACE"))
+var glyphAlphaBias = parseGlyphAlphaBias(os.Getenv("PDF_DEBUG_SPLASH_GLYPH_ALPHA_BIAS"))
 
 func shouldTraceGlyphPixel(x, y int) bool {
 	for _, pixel := range glyphTracePixels {
@@ -155,6 +158,38 @@ func shouldTraceGlyphPixel(x, y int) bool {
 		}
 	}
 	return false
+}
+
+func parseGlyphAlphaBias(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0
+	}
+	if v < -255 {
+		return -255
+	}
+	if v > 255 {
+		return 255
+	}
+	return v
+}
+
+func adjustGlyphAlpha(alpha byte) byte {
+	if glyphAlphaBias == 0 || alpha == 0 {
+		return alpha
+	}
+	v := int(alpha) + glyphAlphaBias
+	if v <= 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return byte(v)
 }
 
 func traceGlyphPixelBefore(p *pipe, x, y, glyphX, glyphY int, alpha byte, g *GlyphBitmap, xStart, yStart int) {

@@ -58,6 +58,32 @@ func TestSampledFunctionEvaluate_DecodeMapping(t *testing.T) {
 	assert.InDelta(t, 15, out[0], 1e-6)
 }
 
+func TestSampledFunctionEvaluate_DoesNotDoubleEndpointSamples(t *testing.T) {
+	fn := &SampledFunction{
+		Domain:      [][2]float64{{0, 1}},
+		RangeVal:    [][2]float64{{0, 1}, {0, 1}, {0, 1}},
+		Size:        []int{2},
+		Samples:     []float64{0.25, 0.5, 0.75, 0.1, 0.2, 0.3},
+		Encode:      [][2]float64{{0, 1}},
+		Decode:      [][2]float64{{0, 1}, {0, 1}, {0, 1}},
+		Interpolate: true,
+	}
+
+	start, err := fn.Evaluate([]float64{0})
+	require.NoError(t, err)
+	require.Len(t, start, 3)
+	assert.InDelta(t, 0.25, start[0], 1e-6)
+	assert.InDelta(t, 0.5, start[1], 1e-6)
+	assert.InDelta(t, 0.75, start[2], 1e-6)
+
+	end, err := fn.Evaluate([]float64{1})
+	require.NoError(t, err)
+	require.Len(t, end, 3)
+	assert.InDelta(t, 0.1, end[0], 1e-6)
+	assert.InDelta(t, 0.2, end[1], 1e-6)
+	assert.InDelta(t, 0.3, end[2], 1e-6)
+}
+
 func TestSampledFunctionEvaluate_ValidateSampleLength(t *testing.T) {
 	fn := &SampledFunction{
 		Domain:      [][2]float64{{0, 1}},

@@ -167,6 +167,23 @@ func (f *Font) convertToEntityPath(path *GlyphPath) *entity.GlyphPath {
 
 	// Find actual bounds
 	var minX, minY, maxX, maxY float64 = 1e100, 1e100, -1e100, -1e100
+	var currentX, currentY, startX, startY float64
+	var hasCurrent bool
+
+	includePoint := func(x, y float64) {
+		if x < minX {
+			minX = x
+		}
+		if x > maxX {
+			maxX = x
+		}
+		if y < minY {
+			minY = y
+		}
+		if y > maxY {
+			maxY = y
+		}
+	}
 
 	for _, elem := range path.Elements() {
 		switch elem.Op {
@@ -174,57 +191,43 @@ func (f *Font) convertToEntityPath(path *GlyphPath) *entity.GlyphPath {
 			// Negate Y: TrueType uses y-up, entity.GlyphPath uses y-down (like Type1 generatePath).
 			cmd := &entity.PathMoveTo{X: elem.X, Y: -elem.Y}
 			entityPath.Commands = append(entityPath.Commands, cmd)
-			if elem.X < minX {
-				minX = elem.X
-			}
-			if elem.X > maxX {
-				maxX = elem.X
-			}
-			if -elem.Y < minY {
-				minY = -elem.Y
-			}
-			if -elem.Y > maxY {
-				maxY = -elem.Y
-			}
+			currentX, currentY = elem.X, -elem.Y
+			startX, startY = currentX, currentY
+			hasCurrent = true
+			includePoint(currentX, currentY)
 
 		case opLineTo:
 			cmd := &entity.PathLineTo{X: elem.X, Y: -elem.Y}
 			entityPath.Commands = append(entityPath.Commands, cmd)
-			if elem.X < minX {
-				minX = elem.X
-			}
-			if elem.X > maxX {
-				maxX = elem.X
-			}
-			if -elem.Y < minY {
-				minY = -elem.Y
-			}
-			if -elem.Y > maxY {
-				maxY = -elem.Y
-			}
+			currentX, currentY = elem.X, -elem.Y
+			hasCurrent = true
+			includePoint(currentX, currentY)
 
 		case opQuadTo:
-			cmd := &entity.PathCurveTo{X1: elem.CX, Y1: -elem.CY, X2: elem.CX, Y2: -elem.CY, X3: elem.X, Y3: -elem.Y}
-			entityPath.Commands = append(entityPath.Commands, cmd)
-			// Update bounds for all points
-			for _, pt := range []struct{ X, Y float64 }{{elem.CX, -elem.CY}, {elem.X, -elem.Y}} {
-				if pt.X < minX {
-					minX = pt.X
-				}
-				if pt.X > maxX {
-					maxX = pt.X
-				}
-				if pt.Y < minY {
-					minY = pt.Y
-				}
-				if pt.Y > maxY {
-					maxY = pt.Y
-				}
+			if !hasCurrent {
+				currentX, currentY = 0, 0
 			}
+			controlX, controlY := elem.CX, -elem.CY
+			endX, endY := elem.X, -elem.Y
+			// Poppler's SplashFTFont converts TrueType conic curves to cubic
+			// Béziers using (p0 + 2*pc)/3 and (2*pc + p3)/3.
+			c1x := (currentX + 2*controlX) / 3
+			c1y := (currentY + 2*controlY) / 3
+			c2x := (2*controlX + endX) / 3
+			c2y := (2*controlY + endY) / 3
+			cmd := &entity.PathCurveTo{X1: c1x, Y1: c1y, X2: c2x, Y2: c2y, X3: endX, Y3: endY}
+			entityPath.Commands = append(entityPath.Commands, cmd)
+			includePoint(c1x, c1y)
+			includePoint(c2x, c2y)
+			includePoint(endX, endY)
+			currentX, currentY = endX, endY
+			hasCurrent = true
 
 		case opClosePath:
 			cmd := &entity.PathClose{}
 			entityPath.Commands = append(entityPath.Commands, cmd)
+			currentX, currentY = startX, startY
+			hasCurrent = false
 		}
 	}
 

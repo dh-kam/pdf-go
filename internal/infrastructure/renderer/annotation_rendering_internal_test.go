@@ -111,3 +111,27 @@ func TestAnnotationTextNoteAppearanceStreamUsesPopplerFormBBox(t *testing.T) {
 	assert.NotNil(t, dict.Get(entity.Name("Resources")))
 	assert.Contains(t, string(stream.RawBytes()), "1.00000 0.50196 0.00000 rg")
 }
+
+func TestAnnotationBorderWidthHonorsBSBeforeBorder(t *testing.T) {
+	dict := entity.NewDict()
+	bs := entity.NewDict()
+	bs.Set(entity.Name("W"), entity.NewInteger(0))
+	dict.Set(entity.Name("BS"), bs)
+	dict.Set(entity.Name("Border"), entity.NewArray(
+		entity.NewInteger(0),
+		entity.NewInteger(0),
+		entity.NewInteger(3),
+	))
+
+	assert.Equal(t, 0.0, annotationBorderWidth(dict))
+
+	dict = entity.NewDict()
+	dict.Set(entity.Name("Border"), entity.NewArray(
+		entity.NewInteger(0),
+		entity.NewInteger(0),
+		entity.NewReal(2.5),
+	))
+
+	assert.Equal(t, 2.5, annotationBorderWidth(dict))
+	assert.Equal(t, 1.0, annotationBorderWidth(entity.NewDict()))
+}

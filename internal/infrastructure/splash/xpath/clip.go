@@ -348,6 +348,13 @@ func (c *Clip) HasPathClip() bool {
 // scanners/eo arrays. flags grows in lockstep, holding splashClipEO|0 per
 // SplashClip.cc:210.
 func (c *Clip) ClipToPath(path *Path, matrix [6]float64, flatness float64, eo bool) error {
+	return c.ClipToPathWithYFloorSnapEps(path, matrix, flatness, eo, clipScannerYFloorSnapEps())
+}
+
+// ClipToPathWithYFloorSnapEps is the ClipToPath implementation with an explicit
+// clip-scanner y-boundary snap epsilon. Passing 0 mirrors Poppler's raw floor()
+// path for fill/clip AA consistency when the same geometry was already painted.
+func (c *Clip) ClipToPathWithYFloorSnapEps(path *Path, matrix [6]float64, flatness float64, eo bool, yFloorSnapEps float64) error {
 	xPath := NewXPath(path, matrix, flatness, true)
 
 	// Empty path collapses the clip (SplashClip.cc:188-192).
@@ -363,9 +370,6 @@ func (c *Clip) ClipToPath(path *Path, matrix [6]float64, flatness float64, eo bo
 	// faithfulness rule in the task brief and SP3 §6a.
 	if xPath.Length() == 4 && isAxisAlignedRect(xPath) {
 		return c.ClipToRect(xPath.Segs[0].X0, xPath.Segs[0].Y0, xPath.Segs[2].X0, xPath.Segs[2].Y0)
-	}
-	if !c.hasPathBounds {
-		c.intersectPathBounds(xPath)
 	}
 
 	// General path: sort + (optional) aaScale + emplace scanner.
@@ -383,9 +387,9 @@ func (c *Clip) ClipToPath(path *Path, matrix [6]float64, flatness float64, eo bo
 		yMaxAA = c.yMax
 	}
 
-	// Scanner.NewScanner is provided by Dev1 (Phase 2). When that lands the
-	// signature is NewScanner(x *XPath, eo bool, xMin, yMin, xMax, yMax int).
-	scanner := NewScanner(xPath, eo, c.xMin, yMinAA, c.xMax, yMaxAA)
+	// Clip scanners receive a tiny y-floor snap so matrix roundoff at exact
+	// horizontal clip boundaries does not leak a subpixel row outside the path.
+	scanner := newScanner(xPath, eo, c.xMin, yMinAA, c.xMax, yMaxAA, yFloorSnapEps)
 
 	// Append parallel entries; flags grows in lockstep per SplashClip.cc:210.
 	c.scanners = append(c.scanners, scanner)
@@ -396,6 +400,21 @@ func (c *Clip) ClipToPath(path *Path, matrix [6]float64, flatness float64, eo bo
 	}
 	c.flags = append(c.flags, flag)
 	return nil
+}
+
+func clipScannerYFloorSnapEps() float64 {
+	if os.Getenv("PDF_DISABLE_SPLASH_CLIP_SCANNER_Y_FLOOR_SNAP") == "1" {
+		return 0
+	}
+	text := os.Getenv("PDF_DEBUG_SPLASH_CLIP_SCANNER_Y_FLOOR_SNAP_EPS")
+	if text == "" {
+		return 1e-9
+	}
+	eps, err := strconv.ParseFloat(text, 64)
+	if err != nil || eps <= 0 {
+		return 1e-9
+	}
+	return eps
 }
 
 func (c *Clip) intersectPathBounds(xPath *XPath) {
@@ -702,14 +721,19 @@ func countClipAABufPixel(aaBuf []byte, rowSize, xMin, x int) int {
 
 // ClipAALineFullWidth intersects a Poppler-style full-width AA buffer with the
 // active clip over the row-local x0/x1 range returned by RenderAALineFullWidth.
-func (c *Clip) ClipAALineFullWidth(y int, aaBuf []byte, x0, x1, bitmapWidth int) {
+//
+// It returns the Poppler-adjusted x0/x1 pair. SplashClip::clipAALine mutates
+// those bounds after applying the rectangular clip, and Splash::shadedFill uses
+// the adjusted values for shaded-fill edge correction.
+func (c *Clip) ClipAALineFullWidth(y int, aaBuf []byte, x0, x1, bitmapWidth int) (int, int) {
 	width := bitmapWidth * aaSize
 	if width <= 0 {
-		return
+		return x0, x1
 	}
 	rowSize := (width + 7) >> 3
 	leftLimit := x0 * aaSize
 	rightLimit := (x1 + 1) * aaSize
+	adjustedX0, adjustedX1 := x0, x1
 	traceTargets := parseClipAABufTraceTargets()
 	trace := os.Getenv("PDF_DEBUG_SPLASH_CLIP_AABUF_TRACE") != "" && len(traceTargets) > 0
 	if trace {
@@ -726,7 +750,7 @@ func (c *Clip) ClipAALineFullWidth(y int, aaBuf []byte, x0, x1, bitmapWidth int)
 		if trace {
 			traceClipAABufTargets("full-empty", -1, c, nil, traceTargets, y, aaBuf, rowSize, 0, bitmapWidth-1)
 		}
-		return
+		return clampFullWidthClipBounds(adjustedX0, adjustedX1, rowSize)
 	}
 
 	left := splashFloor(c.xMinFP * aaSize)
@@ -734,9 +758,8 @@ func (c *Clip) ClipAALineFullWidth(y int, aaBuf []byte, x0, x1, bitmapWidth int)
 		if left > rightLimit {
 			left = rightLimit
 		}
-		for yy := 0; yy < aaSize; yy++ {
-			clearBitsRange(aaBuf, yy*rowSize, leftLimit, left)
-		}
+		clearFullWidthClipLeftPoppler(aaBuf, rowSize, leftLimit, left)
+		adjustedX0 = splashFloor(c.xMinFP)
 	}
 
 	right := splashFloor(c.xMaxFP*aaSize) + 1
@@ -744,9 +767,8 @@ func (c *Clip) ClipAALineFullWidth(y int, aaBuf []byte, x0, x1, bitmapWidth int)
 		if right < leftLimit {
 			right = leftLimit
 		}
-		for yy := 0; yy < aaSize; yy++ {
-			clearBitsRange(aaBuf, yy*rowSize, right, rightLimit)
-		}
+		clearFullWidthClipRightPoppler(aaBuf, rowSize, right, rightLimit)
+		adjustedX1 = splashFloor(c.xMaxFP)
 	}
 	if trace {
 		traceClipAABufTargets("full-after-rect", -1, c, nil, traceTargets, y, aaBuf, rowSize, 0, bitmapWidth-1)
@@ -757,10 +779,97 @@ func (c *Clip) ClipAALineFullWidth(y int, aaBuf []byte, x0, x1, bitmapWidth int)
 			if trace {
 				traceClipAABufTargets("full-before-scanner", i, c, scanner, traceTargets, y, aaBuf, rowSize, 0, bitmapWidth-1)
 			}
-			scanner.ClipAALineFullWidth(y, aaBuf, x0, x1, bitmapWidth)
+			scanner.ClipAALineFullWidth(y, aaBuf, adjustedX0, adjustedX1, bitmapWidth)
 			if trace {
 				traceClipAABufTargets("full-after-scanner", i, c, scanner, traceTargets, y, aaBuf, rowSize, 0, bitmapWidth-1)
 			}
 		}
 	}
+	return clampFullWidthClipBounds(adjustedX0, adjustedX1, rowSize)
+}
+
+func clearFullWidthClipLeftPoppler(aaBuf []byte, rowSize, fromBit, toBit int) {
+	if fromBit >= toBit || rowSize <= 0 {
+		return
+	}
+	if fromBit < 0 {
+		fromBit = 0
+	}
+	toBitLimit := rowSize << 3
+	if toBit > toBitLimit {
+		toBit = toBitLimit
+	}
+	startBit := fromBit &^ 7
+	for yy := 0; yy < aaSize; yy++ {
+		byteIdx := yy*rowSize + (startBit >> 3)
+		xx := startBit
+		for xx+7 < toBit && byteIdx < len(aaBuf) {
+			aaBuf[byteIdx] = 0x00
+			xx += 8
+			byteIdx++
+		}
+		if xx < toBit && byteIdx < len(aaBuf) {
+			aaBuf[byteIdx] &= byte(0xff >> (toBit & 7))
+		}
+	}
+}
+
+func clearFullWidthClipRightPoppler(aaBuf []byte, rowSize, fromBit, toBit int) {
+	if fromBit >= toBit || rowSize <= 0 {
+		return
+	}
+	if fromBit < 0 {
+		fromBit = 0
+	}
+	toBitLimit := rowSize << 3
+	if toBit > toBitLimit {
+		toBit = toBitLimit
+	}
+	for yy := 0; yy < aaSize; yy++ {
+		byteIdx := yy*rowSize + (fromBit >> 3)
+		xx := fromBit
+		if byteIdx >= len(aaBuf) {
+			continue
+		}
+		if xx&7 != 0 {
+			aaBuf[byteIdx] &= byte((int(0xff00) >> (xx & 7)) & 0xff)
+			xx = (xx &^ 7) + 8
+			byteIdx++
+		}
+		for xx < toBit && byteIdx < len(aaBuf) {
+			aaBuf[byteIdx] = 0x00
+			xx += 8
+			byteIdx++
+		}
+	}
+}
+
+func clampFullWidthClipBounds(x0, x1, rowSize int) (int, int) {
+	if x0 > x1 {
+		x0 = x1
+	}
+	if x0 < 0 {
+		x0 = 0
+	}
+	if rowSize <= 0 {
+		return x0, x1
+	}
+	if (x0 >> 1) >= rowSize {
+		old := x0
+		x0 = (rowSize - 1) << 1
+		if old&1 != 0 {
+			x0++
+		}
+	}
+	if x1 < x0 {
+		x1 = x0
+	}
+	if (x1 >> 1) >= rowSize {
+		old := x1
+		x1 = (rowSize - 1) << 1
+		if old&1 != 0 {
+			x1++
+		}
+	}
+	return x0, x1
 }

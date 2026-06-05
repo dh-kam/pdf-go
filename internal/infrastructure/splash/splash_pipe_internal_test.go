@@ -62,6 +62,75 @@ func TestPipeRunSimpleRGB8(t *testing.T) {
 	}
 }
 
+func TestPipeRunSimpleRGB8AppliesTransfer(t *testing.T) {
+	s, _ := New(makeBitmapForTest(1, 1, ModeRGB8), false)
+	red, green, blue, gray := identityTransferTablesForTest()
+	red[10] = 11
+	green[20] = 22
+	blue[30] = 33
+	s.SetTransfer(red, green, blue, gray)
+
+	var p pipe
+	col := Color{10, 20, 30, 0, 0, 0, 0, 0}
+	s.pipeInit(&p, 0, 0, nil, &col, 255, false, false)
+	p.run(&p)
+
+	if got := s.bitmap.data[:3]; got[0] != 11 || got[1] != 22 || got[2] != 33 {
+		t.Fatalf("rgb8 transfer = %v, want [11 22 33]", got)
+	}
+}
+
+func TestPipeRunAARGB8AppliesTransferAfterBlend(t *testing.T) {
+	b := makeBitmapForTest(1, 1, ModeRGB8)
+	b.data[0], b.data[1], b.data[2] = 0, 0, 0
+	b.alpha[0] = 255
+	s, _ := New(b, false)
+	red, green, blue, gray := identityTransferTablesForTest()
+	red[128] = 129
+	green[128] = 130
+	blue[128] = 131
+	s.SetTransfer(red, green, blue, gray)
+
+	var p pipe
+	col := Color{255, 255, 255, 0, 0, 0, 0, 0}
+	s.pipeInit(&p, 0, 0, nil, &col, 255, true, false)
+	p.shape = 128
+	p.run(&p)
+
+	if got := b.data[:3]; got[0] != 129 || got[1] != 130 || got[2] != 131 {
+		t.Fatalf("aa rgb8 transfer = %v, want [129 130 131]", got)
+	}
+}
+
+func TestSplashResetTransferRestoresIdentity(t *testing.T) {
+	s, _ := New(makeBitmapForTest(1, 1, ModeRGB8), false)
+	red, green, blue, gray := identityTransferTablesForTest()
+	red[10] = 99
+	s.SetTransfer(red, green, blue, gray)
+	s.ResetTransfer()
+
+	var p pipe
+	col := Color{10, 20, 30, 0, 0, 0, 0, 0}
+	s.pipeInit(&p, 0, 0, nil, &col, 255, false, false)
+	p.run(&p)
+
+	if got := s.bitmap.data[:3]; got[0] != 10 || got[1] != 20 || got[2] != 30 {
+		t.Fatalf("reset transfer = %v, want [10 20 30]", got)
+	}
+}
+
+func identityTransferTablesForTest() ([256]byte, [256]byte, [256]byte, [256]byte) {
+	var red, green, blue, gray [256]byte
+	for i := 0; i < 256; i++ {
+		v := byte(i)
+		red[i] = v
+		green[i] = v
+		blue[i] = v
+		gray[i] = v
+	}
+	return red, green, blue, gray
+}
+
 func TestPipeRunSimpleMono8(t *testing.T) {
 	s, _ := New(makeBitmapForTest(10, 10, ModeMono8), false)
 	var p pipe

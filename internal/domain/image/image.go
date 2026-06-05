@@ -5,6 +5,7 @@ package image
 
 import (
 	"image"
+	"image/color"
 )
 
 // ColorSpace represents a PDF color space.
@@ -91,6 +92,7 @@ type ImageData struct {
 	Mask               ImageMask
 	DecodeParms        map[string]interface{}
 	IndexedLookup      []byte
+	ColorMapper        ColorMapper
 	ColorSpace         ColorSpace
 	CMYKConversionMode string
 	ImageEdgeMode      string
@@ -103,6 +105,12 @@ type ImageData struct {
 	Width              int
 	Height             int
 	BitsPerComponent   int
+}
+
+// ColorMapper converts decoded color components to RGBA.
+type ColorMapper interface {
+	ConvertToRGBA([]float64) color.RGBA
+	GetNumComponents() int
 }
 
 // Image represents a decoded PDF image.

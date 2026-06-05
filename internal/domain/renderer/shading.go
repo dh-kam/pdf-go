@@ -6,6 +6,8 @@ import (
 	"image/color"
 	"io"
 	"math"
+	"os"
+	"strings"
 
 	"github.com/dh-kam/pdf-go/internal/domain/colorspace"
 	"github.com/dh-kam/pdf-go/internal/domain/entity"
@@ -24,15 +26,19 @@ func (e *Evaluator) paintShading(op Operator) error {
 	if !ok {
 		return errors.Invalid("operator_sh", fmt.Errorf("shading name must be a name"))
 	}
+	e.traceShadingResourceLookup(shadingName)
 
 	// Get the shading pattern from resources
-	if e.resources == nil {
+	if !e.hasResourceFrames() {
 		return nil // No resources, skip
 	}
 
-	shadingObj := e.getResourceEntry(entity.Name("Shading"), shadingName)
+	shadingObj, shadingFrames := e.getResourceEntryWithFrames(entity.Name("Shading"), shadingName)
 	if shadingObj == nil {
 		return nil // Shading not found, skip
+	}
+	if len(shadingFrames) > 0 {
+		defer e.useResourceStack(shadingFrames)()
 	}
 
 	// Parse the shading object, preserving mesh stream payload when present.
@@ -40,34 +46,106 @@ func (e *Evaluator) paintShading(op Operator) error {
 	if err != nil {
 		return errors.Invalid("parse_shading", err)
 	}
+	e.traceSelectedShading(shadingName, shading)
 
 	// Render the shading to canvas if set
 	if e.canvas != nil && shading != nil {
-		return e.renderShading(shading)
+		return e.renderShadingWithName(shading, shadingName.String())
 	}
 
 	return nil
+}
+
+func (e *Evaluator) traceShadingResourceLookup(name entity.Name) {
+	if os.Getenv("PDF_DEBUG_SHADING_RESOURCE_TRACE") == "" {
+		return
+	}
+	path := "page"
+	if len(e.debugPath) > 0 {
+		path = strings.Join(e.debugPath, "/")
+	}
+	frames := e.resourceFramesForLookup()
+	for i, resources := range frames {
+		raw := e.rawResourceCategoryEntry(resources, entity.Name("Shading"), name)
+		if raw == nil {
+			continue
+		}
+		resolved := e.resolveResourceEntryObject(raw, 0)
+		fmt.Fprintf(os.Stderr, "PDF_SHADING_RESOURCE_TRACE path=%s name=%s frame=%d raw=%s resolved=%T\n",
+			path, name.String(), i, describeResourceObject(raw), resolved)
+	}
+}
+
+func (e *Evaluator) rawResourceCategoryEntry(resources *entity.Dict, category entity.Name, name entity.Name) entity.Object {
+	if resources == nil {
+		return nil
+	}
+	categoryObj := e.resolveResourceEntryObject(resources.Get(category), 0)
+	if categoryStream, ok := categoryObj.(*entity.Stream); ok {
+		categoryObj = categoryStream.Dict()
+	}
+	if categoryDict, ok := categoryObj.(*entity.Dict); ok {
+		return categoryDict.Get(name)
+	}
+	return nil
+}
+
+func describeResourceObject(obj entity.Object) string {
+	if obj == nil {
+		return "<nil>"
+	}
+	if ref, ok := obj.(entity.Ref); ok {
+		return ref.String()
+	}
+	return fmt.Sprintf("%T", obj)
+}
+
+func (e *Evaluator) traceSelectedShading(name entity.Name, shading *entity.Shading) {
+	if os.Getenv("PDF_DEBUG_SHADING_RESOURCE_TRACE") == "" || shading == nil {
+		return
+	}
+	path := "page"
+	if len(e.debugPath) > 0 {
+		path = strings.Join(e.debugPath, "/")
+	}
+	fmt.Fprintf(os.Stderr, "PDF_SHADING_SELECTED_TRACE path=%s name=%s type=%d colorSpace=%s coords=%v domain=%v functions=%s\n",
+		path, name.String(), shading.GetShadingType(), shading.GetColorSpace(), shading.GetCoords(), shading.GetDomain(), describeShadingFunctionsForTrace(shading.GetFunctions()))
+}
+
+func describeShadingFunctionsForTrace(functions []entity.Function) string {
+	if len(functions) == 0 {
+		return "[]"
+	}
+	parts := make([]string, 0, len(functions))
+	for i, fn := range functions {
+		parts = append(parts, describeShadingFunctionForTrace(i, fn))
+	}
+	return strings.Join(parts, ";")
+}
+
+func describeShadingFunctionForTrace(index int, fn entity.Function) string {
+	if fn == nil {
+		return fmt.Sprintf("%d:<nil>", index)
+	}
+	out0, err0 := fn.Evaluate([]float64{0})
+	out1, err1 := fn.Evaluate([]float64{1})
+	desc := fmt.Sprintf("%d:%T t0=%v err0=%v t1=%v err1=%v", index, fn, out0, err0, out1, err1)
+	if stitching, ok := fn.(*entity.StitchingFunction); ok {
+		children := make([]string, 0, len(stitching.Functions))
+		for childIndex, child := range stitching.Functions {
+			children = append(children, describeShadingFunctionForTrace(childIndex, child))
+		}
+		desc += fmt.Sprintf(" bounds=%v encode=%v children=[%s]", stitching.Bounds, stitching.Encode, strings.Join(children, "|"))
+	}
+	return desc
 }
 
 // getResourceEntry resolves named entries from a resource category dictionary.
 // It first checks resources like /Font, /XObject, /Shading and then falls back
 // to direct lookup for compatibility.
 func (e *Evaluator) getResourceEntry(category entity.Name, name entity.Name) entity.Object {
-	if e.resources == nil {
-		return nil
-	}
-
-	categoryObj := e.resolveResourceEntryObject(e.resources.Get(category), 0)
-	if categoryStream, ok := categoryObj.(*entity.Stream); ok {
-		categoryObj = categoryStream.Dict()
-	}
-	if categoryDict, ok := categoryObj.(*entity.Dict); ok {
-		if resourceObj := e.resolveResourceEntryObject(categoryDict.Get(name), 0); resourceObj != nil {
-			return resourceObj
-		}
-	}
-
-	return e.resolveResourceEntryObject(e.resources.Get(name), 0)
+	obj, _ := e.getResourceEntryWithFrames(category, name)
+	return obj
 }
 
 func (e *Evaluator) resolveResourceEntryObject(obj entity.Object, depth int) entity.Object {
@@ -109,16 +187,10 @@ func (e *Evaluator) parseShading(dict *entity.Dict) (*entity.Shading, error) {
 		return nil, fmt.Errorf("unsupported ShadingType: %d", shadingType)
 	}
 
-	// Get color space
-	csVal := dict.Get(entity.Name("ColorSpace"))
-	var colorSpace = "DeviceRGB" // Default
-	if csVal != nil {
-		if csName, ok := csVal.(entity.Name); ok {
-			colorSpace = string(csName)
-		}
-	}
+	colorSpace, colorMapper := e.resolveShadingColorSpace(dict.Get(entity.Name("ColorSpace")))
 
 	shading := entity.NewShading(shadingType, colorSpace)
+	shading.SetColorMapper(colorMapper)
 	e.parseShadingCommon(dict, shading)
 
 	// Parse type-specific fields based on shading type
@@ -138,6 +210,35 @@ func (e *Evaluator) parseShading(dict *entity.Dict) (*entity.Shading, error) {
 	default:
 		return shading, nil
 	}
+}
+
+func (e *Evaluator) resolveShadingColorSpace(obj entity.Object) (string, colorspace.ColorSpace) {
+	if obj == nil {
+		return "DeviceRGB", colorspace.NewDeviceRGB()
+	}
+
+	if name, ok := obj.(entity.Name); ok {
+		if e.hasResourceFrames() {
+			if resourceObj := e.getResourceEntry(entity.Name("ColorSpace"), name); resourceObj != nil {
+				if parsed, ok := e.resolveTypedGraphicsColorSpace(resourceObj); ok {
+					return parsed.Type().String(), parsed
+				}
+			}
+		}
+		if parsed, ok := e.resolveTypedGraphicsColorSpace(name); ok {
+			return parsed.Type().String(), parsed
+		}
+		base := normalizeImageColorSpaceName(name.Value())
+		return base, nil
+	}
+
+	if parsed, ok := e.resolveTypedGraphicsColorSpace(obj); ok {
+		return parsed.Type().String(), parsed
+	}
+	if resolved, ok := e.resolveImageColorSpace(obj); ok {
+		return resolved, nil
+	}
+	return "DeviceRGB", colorspace.NewDeviceRGB()
 }
 
 func (e *Evaluator) parseShadingCommon(dict *entity.Dict, shading *entity.Shading) {
@@ -358,6 +459,7 @@ func (e *Evaluator) parseShadingFunctionList(obj entity.Object) ([]entity.Functi
 		return nil, fmt.Errorf("shading function is nil")
 	}
 
+	obj = e.resolveResourceEntryObject(obj, 0)
 	if arr, ok := obj.(*entity.Array); ok {
 		out := make([]entity.Function, 0, arr.Len())
 		for i := 0; i < arr.Len(); i++ {
@@ -381,6 +483,8 @@ func (e *Evaluator) parseShadingFunctionList(obj entity.Object) ([]entity.Functi
 }
 
 func (e *Evaluator) parseShadingFunctionObject(obj entity.Object) (entity.Function, error) {
+	rawObj := obj
+	obj = e.resolveResourceEntryObject(obj, 0)
 	var dict *entity.Dict
 	switch v := obj.(type) {
 	case *entity.Dict:
@@ -399,6 +503,7 @@ func (e *Evaluator) parseShadingFunctionObject(obj entity.Object) (entity.Functi
 	if !ok {
 		return nil, fmt.Errorf("invalid function type")
 	}
+	traceShadingFunctionParse(rawObj, obj, functionType)
 
 	switch functionType {
 	case 0:
@@ -469,6 +574,7 @@ func (e *Evaluator) parseSampledShadingFunction(obj entity.Object, dict *entity.
 	if err != nil {
 		return nil, fmt.Errorf("decode sampled function stream: %w", err)
 	}
+	traceSampledFunctionStream(decodedData, bitsPerSample)
 
 	totalPoints, err := sampledFunctionTotalPoints(fn.Size)
 	if err != nil {
@@ -490,6 +596,36 @@ func (e *Evaluator) parseSampledShadingFunction(obj entity.Object, dict *entity.
 	fn.Samples = samples
 
 	return fn, nil
+}
+
+func traceShadingFunctionParse(rawObj, resolvedObj entity.Object, functionType int) {
+	if os.Getenv("PDF_DEBUG_SHADING_FUNCTION_TRACE") == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "PDF_SHADING_FUNCTION_TRACE raw=%s resolved=%T functionType=%d\n",
+		describeResourceObject(rawObj), resolvedObj, functionType)
+}
+
+func traceSampledFunctionStream(data []byte, bitsPerSample int) {
+	if os.Getenv("PDF_DEBUG_SHADING_FUNCTION_TRACE") == "" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "PDF_SHADING_SAMPLED_STREAM_TRACE bits=%d len=%d first=%s last=%s\n",
+		bitsPerSample, len(data), sampleBytesForTrace(data, true), sampleBytesForTrace(data, false))
+}
+
+func sampleBytesForTrace(data []byte, first bool) string {
+	if len(data) == 0 {
+		return ""
+	}
+	n := len(data)
+	if n > 12 {
+		n = 12
+	}
+	if first {
+		return fmt.Sprintf("% x", data[:n])
+	}
+	return fmt.Sprintf("% x", data[len(data)-n:])
 }
 
 func (e *Evaluator) parseExponentialShadingFunction(dict *entity.Dict) (*entity.ExponentialFunction, error) {
@@ -515,6 +651,13 @@ func (e *Evaluator) parseExponentialShadingFunction(dict *entity.Dict) (*entity.
 		if n, ok := extractFloat(nObj); ok {
 			exp.Exponent = n
 		}
+	}
+	exp.N = len(exp.C0)
+	if len(exp.C1) > exp.N {
+		exp.N = len(exp.C1)
+	}
+	if len(exp.RangeVal) > exp.N {
+		exp.N = len(exp.RangeVal)
 	}
 
 	return exp, nil
@@ -1154,6 +1297,10 @@ func (r *shadingBitReader) alignToByte() {
 
 // renderShading renders a shading pattern to the canvas.
 func (e *Evaluator) renderShading(shading *entity.Shading) error {
+	return e.renderShadingWithName(shading, "")
+}
+
+func (e *Evaluator) renderShadingWithName(shading *entity.Shading, shadingName string) error {
 	bbox, ok := e.currentShadingBBoxForShading(shading)
 	if !ok {
 		return nil
@@ -1163,9 +1310,9 @@ func (e *Evaluator) renderShading(shading *entity.Shading) error {
 	// Prefer the canvas-native shading renderer when available.
 	if e.canvas != nil {
 		e.syncCanvasColors()
-		pattern := entity.NewShadingPattern("", deviceShading)
+		pattern := entity.NewShadingPattern(shadingName, deviceShading)
 		if shading.GetShadingType() == entity.ShadingAxial || shading.GetShadingType() == entity.ShadingRadial {
-			pattern = entity.NewShadingPattern("", shading)
+			pattern = entity.NewShadingPattern(shadingName, shading)
 			pattern.SetMatrix(e.graphics.transform)
 		}
 		if err := e.canvas.DrawShadingPattern(pattern, bbox); err == nil {
@@ -1188,7 +1335,10 @@ func (e *Evaluator) renderShading(shading *entity.Shading) error {
 }
 
 func (e *Evaluator) currentShadingBBoxForShading(shading *entity.Shading) ([4]float64, bool) {
-	if shading != nil && !shading.HasBBox() && e.canvas != nil {
+	if shading != nil && shading.HasBBox() {
+		return e.transformBBoxToDevice(shading.GetBBox())
+	}
+	if e.canvas != nil {
 		type currentClipBBoxCanvas interface {
 			CurrentClipBBox() ([4]float64, bool)
 		}
@@ -1198,7 +1348,18 @@ func (e *Evaluator) currentShadingBBoxForShading(shading *entity.Shading) ([4]fl
 			}
 		}
 	}
-	return e.currentShadingBBox()
+	return e.canvasBoundsBBox()
+}
+
+func (e *Evaluator) canvasBoundsBBox() ([4]float64, bool) {
+	if e.canvas == nil {
+		return [4]float64{}, false
+	}
+	b := e.canvas.Bounds()
+	if b.Dx() <= 0 || b.Dy() <= 0 {
+		return [4]float64{}, false
+	}
+	return [4]float64{float64(b.Min.X), float64(b.Min.Y), float64(b.Max.X), float64(b.Max.Y)}, true
 }
 
 func (e *Evaluator) currentShadingBBox() ([4]float64, bool) {
@@ -1214,15 +1375,40 @@ func (e *Evaluator) currentShadingBBox() ([4]float64, bool) {
 			return [4]float64{xMin, yMin, xMax, yMax}, true
 		}
 	}
+	return e.canvasBoundsBBox()
+}
 
-	if e.canvas == nil {
+func (e *Evaluator) transformBBoxToDevice(bbox [4]float64) ([4]float64, bool) {
+	points := [4][2]float64{
+		{bbox[0], bbox[1]},
+		{bbox[2], bbox[1]},
+		{bbox[2], bbox[3]},
+		{bbox[0], bbox[3]},
+	}
+	var xMin, yMin, xMax, yMax float64
+	for i, point := range points {
+		x, y := e.transformPoint(point[0], point[1])
+		if i == 0 {
+			xMin, yMin, xMax, yMax = x, y, x, y
+			continue
+		}
+		if x < xMin {
+			xMin = x
+		}
+		if y < yMin {
+			yMin = y
+		}
+		if x > xMax {
+			xMax = x
+		}
+		if y > yMax {
+			yMax = y
+		}
+	}
+	if xMax <= xMin || yMax <= yMin {
 		return [4]float64{}, false
 	}
-	b := e.canvas.Bounds()
-	if b.Dx() <= 0 || b.Dy() <= 0 {
-		return [4]float64{}, false
-	}
-	return [4]float64{float64(b.Min.X), float64(b.Min.Y), float64(b.Max.X), float64(b.Max.Y)}, true
+	return [4]float64{xMin, yMin, xMax, yMax}, true
 }
 
 func (e *Evaluator) transformShadingToDevice(shading *entity.Shading) *entity.Shading {

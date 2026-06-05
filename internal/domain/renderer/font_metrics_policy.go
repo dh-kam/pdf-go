@@ -87,9 +87,6 @@ func (e *Evaluator) applySimpleFontWidthsFromDict(dict *entity.Dict, font entity
 func (e *Evaluator) applyCIDFontWidthsFromDict(dict *entity.Dict, font entity.Font) entity.Font {
 	widthsObj := dict.Get(entity.Name("W"))
 	widthsArray, ok := widthsObj.(*entity.Array)
-	if !ok || widthsArray.Len() == 0 {
-		return nil
-	}
 
 	// CIDFont /W widths are PDF text-space widths in 1/1000 em. The rest of
 	// the renderer expects GetGlyphWidth to return font units, so keep the
@@ -99,6 +96,25 @@ func (e *Evaluator) applyCIDFontWidthsFromDict(dict *entity.Dict, font entity.Fo
 		upem = float64(u)
 	}
 	widthScale := upem / 1000.0
+	defaultWidth := 1000.0 * widthScale
+	hasDefaultWidth := false
+	if dwObj, ok := dict.Get(entity.Name("DW")).(*entity.Integer); ok {
+		defaultWidth = float64(dwObj.Value()) * widthScale
+		hasDefaultWidth = true
+	} else if dwObj, ok := dict.Get(entity.Name("DW")).(*entity.Real); ok {
+		defaultWidth = dwObj.Value() * widthScale
+		hasDefaultWidth = true
+	}
+	if !ok || widthsArray.Len() == 0 {
+		if hasDefaultWidth {
+			return &widthMappedFont{
+				base:                        font,
+				defaultWidth:                defaultWidth,
+				forceDefaultWidthForMissing: true,
+			}
+		}
+		return nil
+	}
 
 	codeWidths := map[uint32]float64{}
 	for i := 0; i < widthsArray.Len(); {
@@ -144,11 +160,15 @@ func (e *Evaluator) applyCIDFontWidthsFromDict(dict *entity.Dict, font entity.Fo
 	}
 
 	if len(codeWidths) == 0 {
-		return nil
+		if !hasDefaultWidth {
+			return nil
+		}
 	}
 	return &widthMappedFont{
-		base:   font,
-		widths: codeWidths,
+		base:                        font,
+		widths:                      codeWidths,
+		defaultWidth:                defaultWidth,
+		forceDefaultWidthForMissing: true,
 	}
 }
 

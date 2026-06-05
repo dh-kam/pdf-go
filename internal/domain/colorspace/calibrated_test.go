@@ -178,6 +178,25 @@ func TestCalRGB_ConvertToRGBA(t *testing.T) {
 	}
 }
 
+func TestCalRGB_ConvertToRGBAUsesPDFMatrixOrder(t *testing.T) {
+	whitePoint := [3]float64{1, 1, 1}
+	blackPoint := [3]float64{0, 0, 0}
+	gamma := [3]float64{1, 1, 1}
+	matrix := [9]float64{
+		1, 0, 0,
+		0, 1, 0,
+		1, 1, 1,
+	}
+
+	cs, err := NewCalRGB(whitePoint, blackPoint, gamma, matrix)
+	require.NoError(t, err)
+
+	result := cs.ConvertToRGBA([]float64{0, 0, 1})
+	assert.Greater(t, result.R, uint8(240))
+	assert.Greater(t, result.G, uint8(240))
+	assert.Greater(t, result.B, uint8(240))
+}
+
 func TestSRGBTransferFunction(t *testing.T) {
 	tests := []struct {
 		input     float64
@@ -187,7 +206,7 @@ func TestSRGBTransferFunction(t *testing.T) {
 		{0.0, 0.0, 0.001},
 		{0.0031308, 0.04045, 0.001},
 		{0.5, 0.7353, 0.001},
-		{0.99554525, 1.0, 0.001},
+		{0.99554525, 0.9980392158, 0.001},
 		{1.0, 1.0, 0.001},
 	}
 

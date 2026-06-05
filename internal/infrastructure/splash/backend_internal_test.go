@@ -3,9 +3,11 @@ package splash
 import (
 	"image"
 	"image/color"
+	"math"
 	"testing"
 
 	"github.com/dh-kam/pdf-go/internal/domain/entity"
+	"github.com/dh-kam/pdf-go/internal/domain/renderer"
 	infraimage "github.com/dh-kam/pdf-go/internal/infrastructure/image"
 	"github.com/dh-kam/pdf-go/internal/infrastructure/splash/xpath"
 )
@@ -36,6 +38,15 @@ func readBackendPixel(t *testing.T, c *splashCanvas, x, y int) (byte, byte, byte
 	return data[off], data[off+1], data[off+2]
 }
 
+func assertBBoxEqual(t *testing.T, got, want [4]float64) {
+	t.Helper()
+	for i := range want {
+		if math.Abs(got[i]-want[i]) > 1e-9 {
+			t.Fatalf("bbox[%d] = %.12f, want %.12f; got=%v", i, got[i], want[i], got)
+		}
+	}
+}
+
 func TestSetFillColorSplitsPremultipliedAlpha(t *testing.T) {
 	c := newTestBackend(t, 4, 4)
 	c.SetFillColor(color.RGBA{R: 143, G: 143, B: 143, A: 191})
@@ -46,6 +57,94 @@ func TestSetFillColorSplitsPremultipliedAlpha(t *testing.T) {
 	if got.R != 207 || got.G != 207 || got.B != 207 || got.A != 255 {
 		t.Fatalf("premultiplied fill over white = (%d,%d,%d,%d), want (207,207,207,255)", got.R, got.G, got.B, got.A)
 	}
+}
+
+func TestMatchingFillClipKeepsScannerYFloorPhase(t *testing.T) {
+	const nearIntegerY = 2.0 - 1e-13
+	path := nearIntegerTrianglePath(nearIntegerY)
+
+	clipOnly := newTestBackend(t, 16, 16)
+	clipOnly.path = path.Clone()
+	clipOnly.Clip()
+	if got := backendClipAACoverage(t, clipOnly, 2, 1); got != 0 {
+		t.Fatalf("clip-only snapped coverage = %d, want 0", got)
+	}
+
+	fillThenClip := newTestBackend(t, 16, 16)
+	fillThenClip.path = path.Clone()
+	fillThenClip.Fill()
+	fillThenClip.path = path.Clone()
+	fillThenClip.Clip()
+	if got := backendClipAACoverage(t, fillThenClip, 2, 1); got == 0 {
+		t.Fatalf("matching fill/clip coverage = 0, want unsnapped coverage")
+	}
+}
+
+func TestRotatedClosedFillClipKeepsScannerYFloorPhase(t *testing.T) {
+	const nearIntegerY = 2.0 - 1e-13
+	fillPath := nearIntegerTrianglePath(nearIntegerY)
+	clipPath := rotatedNearIntegerTrianglePath(nearIntegerY)
+
+	if !pathsMatchForFillClipScannerPhase(fillPath, clipPath) {
+		t.Fatal("rotated closed fill/clip path did not match")
+	}
+
+	clipOnly := newTestBackend(t, 16, 16)
+	clipOnly.path = clipPath.Clone()
+	clipOnly.Clip()
+	if got := backendClipAACoverage(t, clipOnly, 2, 1); got != 0 {
+		t.Fatalf("rotated clip-only snapped coverage = %d, want 0", got)
+	}
+
+	fillThenClip := newTestBackend(t, 16, 16)
+	fillThenClip.path = fillPath.Clone()
+	fillThenClip.Fill()
+	fillThenClip.path = clipPath.Clone()
+	fillThenClip.Clip()
+	if got := backendClipAACoverage(t, fillThenClip, 2, 1); got == 0 {
+		t.Fatalf("rotated matching fill/clip coverage = 0, want unsnapped coverage")
+	}
+}
+
+func nearIntegerTrianglePath(y float64) *xpath.Path {
+	p := xpath.NewPath()
+	_ = p.MoveTo(1, y)
+	_ = p.LineTo(8, y)
+	_ = p.LineTo(8, 8)
+	_ = p.Close(false)
+	return p
+}
+
+func rotatedNearIntegerTrianglePath(y float64) *xpath.Path {
+	p := xpath.NewPath()
+	_ = p.MoveTo(8, y)
+	_ = p.LineTo(8, 8)
+	_ = p.LineTo(1, y)
+	_ = p.Close(false)
+	return p
+}
+
+func backendClipAACoverage(t *testing.T, c *splashCanvas, x, y int) int {
+	t.Helper()
+	clip := c.s.ensureClip()
+	rowSize := (c.width*splashAASize + 7) >> 3
+	aaBuf := make([]byte, rowSize*splashAASize)
+	for i := range aaBuf {
+		aaBuf[i] = 0xff
+	}
+	clip.ClipAALine(y, aaBuf, 0, c.width-1)
+	cell := x * splashAASize
+	coverage := 0
+	for yy := 0; yy < splashAASize; yy++ {
+		rowOff := yy * rowSize
+		byteIdx := rowOff + (cell >> 3)
+		if cell&7 == 0 {
+			coverage += bitCount4[(aaBuf[byteIdx]>>4)&0x0f]
+		} else {
+			coverage += bitCount4[aaBuf[byteIdx]&0x0f]
+		}
+	}
+	return coverage
 }
 
 func TestApplyAnnotationMultiplyMaskUpdatesLiveBitmap(t *testing.T) {
@@ -171,6 +270,211 @@ func TestSetFillPatternGouraudClipsToCurrentFillPath(t *testing.T) {
 	r, g, b = readBackendPixel(t, c, 8, 2)
 	if r != 255 || g != 255 || b != 255 {
 		t.Fatalf("Gouraud direct fill leaked outside current path: got (%d,%d,%d), want white", r, g, b)
+	}
+}
+
+func TestClipBoundsToShadingCacheBBoxFlipsYAndAppliesInverseMatrix(t *testing.T) {
+	got, ok := clipBoundsToShadingCacheBBox([4]float64{10, 20, 30, 60}, true, 100, [6]float64{0.5, 0, 0, 0.25, -2, 3})
+	if !ok {
+		t.Fatal("clipBoundsToShadingCacheBBox returned !ok")
+	}
+	want := [4]float64{3, 13, 13, 23}
+	for i := range want {
+		if math.Abs(got[i]-want[i]) > 1e-9 {
+			t.Fatalf("bbox[%d] = %.12f, want %.12f; got=%v", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestClipBoundsToShadingCacheBBoxRejectsInvalidBounds(t *testing.T) {
+	if _, ok := clipBoundsToShadingCacheBBox([4]float64{10, 20, 30, 60}, false, 100, [6]float64{1, 0, 0, 1, 0, 0}); ok {
+		t.Fatal("clipBoundsToShadingCacheBBox accepted boundsOK=false")
+	}
+	if _, ok := clipBoundsToShadingCacheBBox([4]float64{10, 20, 10, 60}, true, 100, [6]float64{1, 0, 0, 1, 0, 0}); ok {
+		t.Fatal("clipBoundsToShadingCacheBBox accepted empty x bounds")
+	}
+	if _, ok := clipBoundsToShadingCacheBBox([4]float64{10, 20, 30, 20}, true, 100, [6]float64{1, 0, 0, 1, 0, 0}); ok {
+		t.Fatal("clipBoundsToShadingCacheBBox accepted empty y bounds")
+	}
+}
+
+func TestCurrentClipBBoxForShadingCacheUsesSavedSoftMaskClip(t *testing.T) {
+	c := newTestBackend(t, 10, 10)
+	c.s.state.clip = xpath.NewClip(1, 2, 8, 7, c.s.vectorAA)
+
+	if err := c.s.BeginTransparencyGroup([4]float64{0, 0, 10, 10}, true, false, nil); err != nil {
+		t.Fatalf("BeginTransparencyGroup failed: %v", err)
+	}
+
+	got, ok := c.currentClipBBoxForShadingCache([6]float64{1, 0, 0, 1, 0, 0})
+	if !ok {
+		t.Fatal("currentClipBBoxForShadingCache returned !ok before soft-mask marking")
+	}
+	assertBBoxEqual(t, got, [4]float64{0, 0, 10, 10})
+
+	c.s.markTopGroupForSoftMask()
+	got, ok = c.currentClipBBoxForShadingCache([6]float64{1, 0, 0, 1, 0, 0})
+	if !ok {
+		t.Fatal("currentClipBBoxForShadingCache returned !ok for soft-mask group")
+	}
+	assertBBoxEqual(t, got, [4]float64{1, 2, 9, 8})
+}
+
+func TestCurrentClipBBoxForShadingCacheIntersectsActiveSoftMaskClipInCroppedGroup(t *testing.T) {
+	c := newTestBackend(t, 200, 200)
+	c.s.state.clip = xpath.NewClip(10, 20, 99, 119, c.s.vectorAA)
+	c.s.state.softMask = NewBitmap(200, 200, ModeMono8, false)
+	c.s.state.softMaskClip = clipBoundsSnapshot{
+		vector:      [4]float64{50, 70, 170, 150},
+		vectorOK:    true,
+		effective:   [4]float64{50, 70, 170, 150},
+		effectiveOK: true,
+		offsetX:     0,
+		offsetY:     0,
+	}
+	c.s.state.softMaskClipOK = true
+	c.s.state.blendFunc = BlendMultiply
+	c.s.groupStack = []*groupState{{cropped: true, tx: 40, ty: 50}}
+
+	got, ok := c.currentClipBBoxForShadingCache([6]float64{1, 0, 0, 1, 0, 0})
+	if !ok {
+		t.Fatal("currentClipBBoxForShadingCache returned !ok for active soft-mask clip")
+	}
+	assertBBoxEqual(t, got, [4]float64{10, 100, 100, 180})
+}
+
+func TestCurrentClipBBoxForShadingCacheIgnoresActiveSoftMaskClipOutsideCroppedGroup(t *testing.T) {
+	c := newTestBackend(t, 200, 200)
+	c.s.state.clip = xpath.NewClip(10, 20, 99, 119, c.s.vectorAA)
+	c.s.state.softMask = NewBitmap(200, 200, ModeMono8, false)
+	c.s.state.softMaskClip = clipBoundsSnapshot{
+		vector:      [4]float64{50, 70, 170, 150},
+		vectorOK:    true,
+		effective:   [4]float64{50, 70, 170, 150},
+		effectiveOK: true,
+	}
+	c.s.state.softMaskClipOK = true
+	c.s.state.blendFunc = BlendMultiply
+	c.s.groupStack = []*groupState{{}}
+
+	got, ok := c.currentClipBBoxForShadingCache([6]float64{1, 0, 0, 1, 0, 0})
+	if !ok {
+		t.Fatal("currentClipBBoxForShadingCache returned !ok without cropped group")
+	}
+	assertBBoxEqual(t, got, [4]float64{10, 80, 100, 180})
+}
+
+func TestCurrentClipBBoxForShadingCacheIntersectsEnclosingSoftMaskSavedClip(t *testing.T) {
+	c := newTestBackend(t, 200, 200)
+	c.s.state.clip = xpath.NewClip(10, 20, 99, 119, c.s.vectorAA)
+	c.s.state.softMask = NewBitmap(200, 200, ModeMono8, false)
+	c.s.state.blendFunc = BlendMultiply
+	c.s.groupStack = []*groupState{
+		{forSoftMask: true, savedClip: xpath.NewClip(50, 70, 169, 149, c.s.vectorAA)},
+		{cropped: true, tx: 40, ty: 50},
+	}
+
+	got, ok := c.currentClipBBoxForShadingCache([6]float64{1, 0, 0, 1, 0, 0})
+	if !ok {
+		t.Fatal("currentClipBBoxForShadingCache returned !ok for enclosing soft-mask clip")
+	}
+	assertBBoxEqual(t, got, [4]float64{10, 100, 100, 180})
+}
+
+func TestSoftMaskClipStackSurvivesNestedClearSoftMask(t *testing.T) {
+	c := newTestBackend(t, 20, 20)
+	c.s.state.clip = xpath.NewClip(2, 3, 9, 11, c.s.vectorAA)
+	if err := c.BeginSoftMaskGroupDeviceBBox([4]float64{0, 0, 20, 20}, false, false); err != nil {
+		t.Fatalf("BeginSoftMaskGroupDeviceBBox failed: %v", err)
+	}
+	if len(c.softMaskClipStack) != 1 {
+		t.Fatalf("softMaskClipStack length = %d, want 1", len(c.softMaskClipStack))
+	}
+
+	c.ClearSoftMask()
+	if len(c.softMaskClipStack) != 1 {
+		t.Fatalf("ClearSoftMask cleared softMaskClipStack; length = %d, want 1", len(c.softMaskClipStack))
+	}
+	clip, ok := c.popSoftMaskClip()
+	if !ok {
+		t.Fatal("popSoftMaskClip returned !ok after nested clear")
+	}
+	if !clip.vectorOK || clip.vector != ([4]float64{2, 3, 10, 12}) {
+		t.Fatalf("soft-mask clip snapshot = ok=%t %v, want [2 3 10 12]", clip.vectorOK, clip.vector)
+	}
+}
+
+func TestSoftMaskAxialCacheEffectiveBoundsCandidate(t *testing.T) {
+	c := newTestBackend(t, 4, 4)
+	matrix := [6]float64{50, 330, -330, 50, 0, 0}
+	vectorBBox := [4]float64{0.45, -0.50, 1.00, 0.45}
+	effectiveBBox := [4]float64{0.455, -0.505, 1.005, 0.445}
+
+	if c.softMaskAxialCacheEffectiveBoundsCandidate(matrix, vectorBBox, effectiveBBox, true, true) {
+		t.Fatal("candidate should require soft mask, blend function, and nested group stack")
+	}
+
+	c.s.state.softMask = NewBitmap(1, 1, ModeMono8, false)
+	c.s.state.blendFunc = BlendMultiply
+	c.s.groupStack = []*groupState{{}, {}}
+
+	if !c.softMaskAxialCacheEffectiveBoundsCandidate(matrix, vectorBBox, effectiveBBox, true, true) {
+		t.Fatal("candidate should accept the scoped soft-mask axial shading shape")
+	}
+	if c.softMaskAxialCacheEffectiveBoundsCandidate([6]float64{20, 330, -330, 50, 0, 0}, vectorBBox, effectiveBBox, true, true) {
+		t.Fatal("candidate accepted a matrix outside the tourism axial shape")
+	}
+	if c.softMaskAxialCacheEffectiveBoundsCandidate(matrix, [4]float64{0.20, -0.50, 1.00, 0.45}, effectiveBBox, true, true) {
+		t.Fatal("candidate accepted a vector bbox outside the scoped range")
+	}
+	if c.softMaskAxialCacheEffectiveBoundsCandidate(matrix, vectorBBox, [4]float64{0.47, -0.505, 1.005, 0.445}, true, true) {
+		t.Fatal("candidate accepted an effective bbox delta above tolerance")
+	}
+	if c.softMaskAxialCacheEffectiveBoundsCandidate(matrix, vectorBBox, effectiveBBox, false, true) {
+		t.Fatal("candidate accepted missing vector bounds")
+	}
+	if c.softMaskAxialCacheEffectiveBoundsCandidate(matrix, vectorBBox, effectiveBBox, true, false) {
+		t.Fatal("candidate accepted missing effective bounds")
+	}
+}
+
+func TestCroppedTopEdgeAxialShadingUsesIntegerYOrigin(t *testing.T) {
+	c := newTestBackend(t, 12, 3544)
+	matrix := [6]float64{0, 7.540418125, -7.540418125, 0, 5.878137083, 3535.159214167}
+	bbox := [4]float64{0, 3535, 11, 3543}
+
+	if c.croppedTopEdgeAxialShadingUsesIntegerYOrigin(matrix, bbox, entity.ShadingAxial) {
+		t.Fatal("candidate accepted a top-edge axial shading outside cropped groups")
+	}
+
+	c.s.groupStack = append(c.s.groupStack, &groupState{})
+	if c.croppedTopEdgeAxialShadingUsesIntegerYOrigin(matrix, bbox, entity.ShadingAxial) {
+		t.Fatal("candidate accepted a non-cropped transparency group")
+	}
+
+	c.s.groupStack[len(c.s.groupStack)-1].cropped = true
+	if !c.croppedTopEdgeAxialShadingUsesIntegerYOrigin(matrix, bbox, entity.ShadingAxial) {
+		t.Fatal("candidate rejected the scoped tourism cropped top-edge axial shading")
+	}
+	if got := c.shadingFillPathYOrigin(matrix, bbox, entity.ShadingAxial); got != float64(c.height) {
+		t.Fatalf("shadingFillPathYOrigin = %.9f, want %.9f", got, float64(c.height))
+	}
+	if c.croppedTopEdgeAxialShadingUsesIntegerYOrigin(matrix, bbox, entity.ShadingRadial) {
+		t.Fatal("candidate accepted a non-axial shading")
+	}
+	if c.croppedTopEdgeAxialShadingUsesIntegerYOrigin(
+		[6]float64{0, 9.459626042, -9.459626042, 0, 6.898221250, 3533.300431458},
+		[4]float64{0, 3533, 14, 3543},
+		entity.ShadingAxial,
+	) {
+		t.Fatal("candidate accepted the wider Fm37 top-edge axial shading")
+	}
+	if c.croppedTopEdgeAxialShadingUsesIntegerYOrigin(
+		[6]float64{6.088538750, 7.256037292, -7.256037292, 6.088538750, 0.287894792, 3533.779266250},
+		[4]float64{0, 3529, 4, 3543},
+		entity.ShadingAxial,
+	) {
+		t.Fatal("candidate accepted a rotated top-edge axial shading")
 	}
 }
 
@@ -340,6 +644,107 @@ func TestPopplerStrokePathAndMatrixKeepsDefaultForUnalignedTick(t *testing.T) {
 	}
 }
 
+func TestStrokeDropsMoveOnlySubpathLikePopplerGfxPath(t *testing.T) {
+	c := newTestBackend(t, 32, 32)
+	c.SetStrokeColor(color.Black)
+	c.SetLineWidth(6)
+	c.SetLineCap(int(LineCapRound))
+
+	c.MoveTo(16, 16)
+	c.Stroke()
+
+	r, g, b := readBackendPixel(t, c, 16, 16)
+	if r != 255 || g != 255 || b != 255 {
+		t.Fatalf("move-only stroke changed center pixel to (%d,%d,%d), want white", r, g, b)
+	}
+}
+
+func TestStrokeKeepsZeroLengthLineSegmentRoundCap(t *testing.T) {
+	c := newTestBackend(t, 32, 32)
+	c.SetStrokeColor(color.Black)
+	c.SetLineWidth(6)
+	c.SetLineCap(int(LineCapRound))
+
+	c.MoveTo(16, 16)
+	c.LineTo(16, 16)
+	c.Stroke()
+
+	r, g, b := readBackendPixel(t, c, 16, 16)
+	if r == 255 && g == 255 && b == 255 {
+		t.Fatal("zero-length line segment did not paint center pixel")
+	}
+}
+
+func TestStrokePathWithCTMDropsMoveOnlySubpathLikePopplerGfxPath(t *testing.T) {
+	c := newTestBackend(t, 32, 32)
+	c.SetStrokeColor(color.Black)
+	c.SetLineCap(int(LineCapRound))
+
+	c.StrokePathWithCTM(
+		[]renderer.PathElement{&renderer.MoveTo{X: 16, Y: 16}},
+		[6]float64{1, 0, 0, 1, 0, 0},
+		6,
+		nil,
+		0,
+	)
+
+	r, g, b := readBackendPixel(t, c, 16, 16)
+	if r != 255 || g != 255 || b != 255 {
+		t.Fatalf("raw move-only stroke changed center pixel to (%d,%d,%d), want white", r, g, b)
+	}
+}
+
+func TestStrokePathWithCTMKeepsZeroLengthLineSegmentRoundCap(t *testing.T) {
+	c := newTestBackend(t, 32, 32)
+	c.SetStrokeColor(color.Black)
+	c.SetLineCap(int(LineCapRound))
+
+	c.StrokePathWithCTM(
+		[]renderer.PathElement{
+			&renderer.MoveTo{X: 16, Y: 16},
+			&renderer.LineTo{X: 16, Y: 16},
+		},
+		[6]float64{1, 0, 0, 1, 0, 0},
+		6,
+		nil,
+		0,
+	)
+
+	r, g, b := readBackendPixel(t, c, 16, 16)
+	if r == 255 && g == 255 && b == 255 {
+		t.Fatal("raw zero-length line segment did not paint center pixel")
+	}
+}
+
+func TestFillPathWithCTMAppliesRawPathMatrix(t *testing.T) {
+	c := newTestBackend(t, 20, 20)
+	c.SetFillColor(color.Black)
+
+	c.FillPathWithCTM(
+		[]renderer.PathElement{
+			&renderer.MoveTo{X: 1, Y: 1},
+			&renderer.LineTo{X: 4, Y: 1},
+			&renderer.LineTo{X: 4, Y: 4},
+			&renderer.LineTo{X: 1, Y: 4},
+			&renderer.Close{},
+		},
+		[6]float64{2, 0, 0, 2, 0, 0},
+		false,
+	)
+
+	r, g, b := readBackendPixel(t, c, 3, 14)
+	if r != 0 || g != 0 || b != 0 {
+		t.Fatalf("raw fill CTM interior pixel = (%d,%d,%d), want black", r, g, b)
+	}
+	r, g, b = readBackendPixel(t, c, 1, 14)
+	if r != 255 || g != 255 || b != 255 {
+		t.Fatalf("raw fill CTM outside pixel = (%d,%d,%d), want white", r, g, b)
+	}
+	if c.s.state.matrix != [6]float64{1, 0, 0, 1, 0, 0} {
+		t.Fatalf("raw fill CTM left matrix %v, want identity", c.s.state.matrix)
+	}
+}
+
 func TestImageDrawMatrixUsesPopplerType3ImageCTM(t *testing.T) {
 	c := newTestBackend(t, 10, 17)
 	c.SetPageYOriginPx(16.25)
@@ -366,7 +771,82 @@ func TestImageDrawMatrixUsesPopplerType3ImageCTM(t *testing.T) {
 	}
 }
 
-func TestQuantizeType3GlyphOriginUsesPopplerFillGlyphFloor(t *testing.T) {
+func TestDrawImageWithSourceAlphaUsesImageAlpha(t *testing.T) {
+	c := newTestBackend(t, 1, 1)
+	img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	img.SetNRGBA(0, 0, color.NRGBA{R: 255, A: 128})
+
+	if err := c.DrawImageWithSourceAlpha(img, 0, 0, 1, 1, false); err != nil {
+		t.Fatalf("DrawImageWithSourceAlpha: %v", err)
+	}
+
+	got := c.Image().(*image.RGBA).RGBAAt(0, 0)
+	if got.R != 255 || got.G >= 255 || got.B >= 255 {
+		t.Fatalf("source alpha did not blend red over white, got (%d,%d,%d,%d)", got.R, got.G, got.B, got.A)
+	}
+}
+
+func TestDrawImageMaskUsesCurrentFill(t *testing.T) {
+	c := newTestBackend(t, 1, 1)
+	c.SetFillColor(color.RGBA{A: 255})
+	gray := image.NewGray(image.Rect(0, 0, 1, 1))
+	gray.SetGray(0, 0, color.Gray{Y: 255})
+
+	if err := c.DrawImageMask(infraimage.NewBitmapMaskFromImage(gray, false), 0, 0, 1, 1); err != nil {
+		t.Fatalf("DrawImageMask: %v", err)
+	}
+
+	got := c.Image().(*image.RGBA).RGBAAt(0, 0)
+	if got.R != 0 || got.G != 0 || got.B != 0 || got.A != 255 {
+		t.Fatalf("image mask fill pixel = (%d,%d,%d,%d), want opaque black", got.R, got.G, got.B, got.A)
+	}
+}
+
+func TestStrokeTextGlyphPathDisablesStrokeAdjustOnlyDuringTextStroke(t *testing.T) {
+	c := newTestBackend(t, 20, 20)
+	c.s.state.strokeAdjust = true
+	font := &stubFont{name: "Stub", unitsPerEm: 1000, advance: 500}
+
+	if err := c.strokeTextGlyphPath(font, 65, 4, 5, 10); err != nil {
+		t.Fatalf("strokeTextGlyphPath: %v", err)
+	}
+	if !c.s.state.strokeAdjust {
+		t.Fatal("strokeTextGlyphPath did not restore strokeAdjust")
+	}
+}
+
+func TestStrokeTextGlyphPathUsesPopplerZeroLineWidth(t *testing.T) {
+	c := newTestBackend(t, 20, 20)
+	c.SetGlyphTransform([4]float64{150.0 / 72.0, 0, 0, 150.0 / 72.0})
+	c.s.state.lineWidth = 0
+	font := &stubFont{name: "Stub", unitsPerEm: 1000, advance: 500}
+
+	if got := c.popplerTextZeroStrokeLineWidth(); got != 1.0/150.0 {
+		t.Fatalf("popplerTextZeroStrokeLineWidth = %.12f, want %.12f", got, 1.0/150.0)
+	}
+	if err := c.strokeTextGlyphPath(font, 65, 4, 5, 10); err != nil {
+		t.Fatalf("strokeTextGlyphPath: %v", err)
+	}
+	if c.s.state.lineWidth != 0 {
+		t.Fatalf("strokeTextGlyphPath lineWidth = %v, want restored zero", c.s.state.lineWidth)
+	}
+}
+
+func TestSplashCanvasAlphaSettersForwardExtGStateAlpha(t *testing.T) {
+	c := newTestBackend(t, 1, 1)
+
+	c.SetFillAlpha(0.25)
+	c.SetStrokeAlpha(0.5)
+
+	if c.s.state.fillAlpha != 0.25 {
+		t.Fatalf("fillAlpha = %v, want 0.25", c.s.state.fillAlpha)
+	}
+	if c.s.state.strokeAlpha != 0.5 {
+		t.Fatalf("strokeAlpha = %v, want 0.5", c.s.state.strokeAlpha)
+	}
+}
+
+func TestQuantizeType3GlyphOriginFloorsCacheablePlacementByDefault(t *testing.T) {
 	c := newTestBackend(t, 10, 17)
 	c.SetPageYOriginPx(1753.9375)
 
@@ -377,6 +857,45 @@ func TestQuantizeType3GlyphOriginUsesPopplerFillGlyphFloor(t *testing.T) {
 	if y != 1169.9375 {
 		t.Fatalf("quantized Type3 y = %v, want 1169.9375", y)
 	}
+}
+
+func TestQuantizeType3GlyphOriginRawDebugMode(t *testing.T) {
+	t.Setenv("PDF_DEBUG_TYPE3_GLYPH_ORIGIN_MODE", "raw")
+	c := newTestBackend(t, 10, 17)
+	c.SetPageYOriginPx(1753.9375)
+
+	x, y := c.QuantizeType3GlyphOrigin(330.747, 1169.4335)
+	if x != 330.747 {
+		t.Fatalf("raw Type3 x = %v, want 330.747", x)
+	}
+	if y != 1169.4335 {
+		t.Fatalf("raw Type3 y = %v, want 1169.4335", y)
+	}
+}
+
+func TestType3GlyphCacheRectangleAddsPopplerMaskFringe(t *testing.T) {
+	c := newTestBackend(t, 12, 14)
+	c.SetFillColor(color.Black)
+	c.BeginType3GlyphCache()
+	c.Rectangle(2, 4, 4, 4)
+	c.Fill()
+	c.EndType3GlyphCache()
+
+	assertRGB := func(x, y int, want byte) {
+		t.Helper()
+		got := c.Image().(*image.RGBA).RGBAAt(x, y)
+		if got.R != want || got.G != want || got.B != want {
+			t.Fatalf("pixel(%d,%d) = (%d,%d,%d), want (%d,%d,%d)", x, y, got.R, got.G, got.B, want, want, want)
+		}
+	}
+
+	assertRGB(2, 6, 0)
+	assertRGB(2, 5, 223)
+	assertRGB(6, 6, 223)
+	assertRGB(2, 10, 223)
+	assertRGB(6, 5, 251)
+	assertRGB(6, 10, 251)
+	assertRGB(1, 6, 255)
 }
 
 // linearShadingFunction implements entity.Function as a linear ramp
@@ -634,6 +1153,79 @@ func TestSetFillPatternAxialShading(t *testing.T) {
 	c.SetFillPattern(pattern)
 	if _, ok := c.s.state.fillPattern.(*AxialShader); !ok {
 		t.Fatalf("expected fillPattern *AxialShader, got %T", c.s.state.fillPattern)
+	}
+}
+
+func TestSetFillPatternAxialShadingSkipsTopLevelConstantPendingFill(t *testing.T) {
+	c := newTestBackend(t, 8, 8)
+	shading := entity.NewAxialShading("DeviceRGB", 0, 0, 8, 0,
+		[]entity.Function{&entity.ExponentialFunction{
+			C0:       []float64{1, 0.84, 0.06},
+			C1:       []float64{1, 0.84, 0.06},
+			Exponent: 1,
+			N:        3,
+		}}, [2]bool{true, true})
+	pattern := entity.NewShadingPattern("Sh", shading)
+
+	c.SetFillPattern(pattern)
+
+	if c.pendingFillShadingPattern != nil {
+		t.Fatalf("constant top-level axial shading should stay on regular pattern path")
+	}
+}
+
+func TestSetFillPatternAxialShadingSkipsTopLevelExponentialPendingFill(t *testing.T) {
+	c := newTestBackend(t, 8, 8)
+	shading := entity.NewAxialShading("DeviceRGB", 0, 0, 8, 0,
+		[]entity.Function{&entity.ExponentialFunction{
+			C0:       []float64{0.2, 0.5, 1},
+			C1:       []float64{1, 0, 0.4},
+			Exponent: 1,
+			N:        3,
+		}}, [2]bool{true, true})
+	pattern := entity.NewShadingPattern("Sh", shading)
+
+	c.SetFillPattern(pattern)
+
+	if c.pendingFillShadingPattern != nil {
+		t.Fatalf("top-level exponential axial shading should stay on regular pattern path")
+	}
+}
+
+func TestSetFillPatternAxialShadingUsesPendingFillForSampledTopLevel(t *testing.T) {
+	c := newTestBackend(t, 8, 8)
+	shading := entity.NewAxialShading("DeviceRGB", 0, 0, 8, 0,
+		[]entity.Function{&entity.SampledFunction{
+			Size:        []int{2},
+			RangeVal:    [][2]float64{{0, 1}, {0, 1}, {0, 1}},
+			Samples:     []float64{0, 0, 0, 1, 1, 1},
+			Interpolate: true,
+		}}, [2]bool{true, true})
+	pattern := entity.NewShadingPattern("Sh", shading)
+
+	c.SetFillPattern(pattern)
+
+	if c.pendingFillShadingPattern != pattern {
+		t.Fatalf("varying top-level axial shading should use shaded-fill path")
+	}
+}
+
+func TestSetFillPatternAxialShadingUsesPendingFillInTransparencyGroup(t *testing.T) {
+	c := newTestBackend(t, 8, 8)
+	c.s.groupStack = append(c.s.groupStack, &groupState{})
+	shading := entity.NewAxialShading("DeviceRGB", 0, 0, 8, 0,
+		[]entity.Function{&entity.ExponentialFunction{
+			C0:       []float64{1, 0.84, 0.06},
+			C1:       []float64{1, 0.84, 0.06},
+			Exponent: 1,
+			N:        3,
+		}}, [2]bool{true, true})
+	pattern := entity.NewShadingPattern("Sh", shading)
+
+	c.SetFillPattern(pattern)
+
+	if c.pendingFillShadingPattern != pattern {
+		t.Fatalf("group axial shading should use shaded-fill path even when constant")
 	}
 }
 

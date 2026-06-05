@@ -126,6 +126,7 @@ type GouraudShader struct {
 	Mode ColorMode
 	// Functions and ColorSpace are set for parameterized shadings.
 	Functions  []entity.Function
+	Mapper     entity.ShadingColorMapper
 	ColorSpace string
 }
 
@@ -139,9 +140,10 @@ func NewGouraudShader(triangles []GouraudVertex, mode ColorMode) *GouraudShader 
 	return &GouraudShader{Triangles: out, Mode: mode}
 }
 
-func NewParameterizedGouraudShader(triangles []GouraudVertex, mode ColorMode, functions []entity.Function, colorSpace string) *GouraudShader {
+func NewParameterizedGouraudShader(triangles []GouraudVertex, mode ColorMode, functions []entity.Function, mapper entity.ShadingColorMapper, colorSpace string) *GouraudShader {
 	shader := NewGouraudShader(triangles, mode)
 	shader.Functions = append([]entity.Function(nil), functions...)
+	shader.Mapper = mapper
 	shader.ColorSpace = colorSpace
 	return shader
 }
@@ -246,7 +248,7 @@ func (s *GouraudShader) GetColor(x, y int, c *Color) bool {
 			recordGouraudPatternStats(false, true)
 			return false
 		}
-		*c = packShadingOutput(out, s.ColorSpace, s.Mode)
+		*c = packShadingOutput(out, s.Mapper, s.ColorSpace, s.Mode)
 		if shouldTraceGouraudPixel(x, y) {
 			v0, v1, v2 := s.triangleVerts(idx)
 			fmt.Fprintf(os.Stderr, "SPLASH_GOURAUD_TRACE x=%d y=%d tri=%d param=%.12f color=(%d,%d,%d) v0=(%.6f,%.6f,%.12f) v1=(%.6f,%.6f,%.12f) v2=(%.6f,%.6f,%.12f)\n",
@@ -329,6 +331,7 @@ type gouraudVert3 struct {
 	c          [3]Color
 	params     [3][]float64
 	functions  []entity.Function
+	mapper     entity.ShadingColorMapper
 	colorSpace string
 	mode       ColorMode
 }
@@ -481,7 +484,7 @@ func (sp *Splash) rasterizeTriangle(t *gouraudVert3, stats *gouraudDirectStats) 
 				if err != nil || len(out) == 0 {
 					continue
 				}
-				px = packShadingOutput(out, t.colorSpace, t.mode)
+				px = packShadingOutput(out, t.mapper, t.colorSpace, t.mode)
 				sp.writeBitmapPixel(X, Y, px, stats)
 				continue
 			}
@@ -622,6 +625,10 @@ func (sp *Splash) writeBitmapPixel(x, y int, c Color, stats *gouraudDirectStats)
 	} else if stats != nil {
 		stats.clipMissing++
 	}
+	before := lastWriterSample{}
+	if shouldTraceLastWriterPixel(x, y) {
+		before = captureLastWriterSample(bm, x, y)
+	}
 	if stats != nil {
 		stats.written++
 	}
@@ -634,6 +641,7 @@ func (sp *Splash) writeBitmapPixel(x, y int, c Color, stats *gouraudDirectStats)
 			bm.alpha[ai] = 0xFF
 		}
 	}
+	traceLastWriter("gouraud", sp, bm, x, y, before)
 }
 
 // FillGouraudTriangleShadedFill drives a Gouraud mesh fill — called by the
@@ -669,6 +677,7 @@ func (sp *Splash) FillGouraudTriangleShadedFill(shader *GouraudShader, p *xpath.
 			t.params[k] = params[k]
 		}
 		t.functions = shader.Functions
+		t.mapper = shader.Mapper
 		t.colorSpace = shader.ColorSpace
 		t.mode = shader.Mode
 		sp.rasterizeTriangle(t, stats)

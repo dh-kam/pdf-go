@@ -290,6 +290,322 @@ func TestClipToPathEoFlag(t *testing.T) {
 	}
 }
 
+func TestClipToPathETicketRoundedFrameRemovesSideStripAA(t *testing.T) {
+	const (
+		scale        = 1240.0 / 595.0
+		bitmapWidth  = 1240
+		bitmapHeight = 1755
+	)
+	pageMatrix := [6]float64{scale, 0, 0, -scale, 0, bitmapHeight}
+	c := NewClip(0, 0, bitmapWidth-1, bitmapHeight-1, true)
+	for _, path := range buildETicketRoundedFrameClipPaths(t, 526.35, 806) {
+		if err := c.ClipToPath(path, pageMatrix, 1.0, false); err != nil {
+			t.Fatalf("ClipToPath: %v", err)
+		}
+	}
+
+	tests := []struct {
+		name string
+		path *Path
+		x    int
+		y    int
+	}{
+		{name: "top strip", path: mustPath(t, []pathOp{
+			{op: "m", x: 51, y: 803}, {op: "l", x: 544, y: 803}, {op: "l", x: 547, y: 806}, {op: "l", x: 48, y: 806}, {op: "l", x: 51, y: 803},
+		}), x: 250, y: 80},
+		{name: "right strip", path: mustPath(t, []pathOp{
+			{op: "m", x: 544, y: 803}, {op: "l", x: 544, y: 529.35}, {op: "l", x: 547, y: 526.35}, {op: "l", x: 547, y: 806}, {op: "l", x: 544, y: 803},
+		}), x: 1136, y: 295},
+		{name: "bottom strip", path: mustPath(t, []pathOp{
+			{op: "m", x: 544, y: 529.35}, {op: "l", x: 51, y: 529.35}, {op: "l", x: 48, y: 526.35}, {op: "l", x: 547, y: 526.35}, {op: "l", x: 544, y: 529.35},
+		}), x: 250, y: 653},
+		{name: "left strip", path: mustPath(t, []pathOp{
+			{op: "m", x: 51, y: 529.35}, {op: "l", x: 51, y: 803}, {op: "l", x: 48, y: 806}, {op: "l", x: 48, y: 526.35}, {op: "l", x: 51, y: 529.35},
+		}), x: 102, y: 295},
+	}
+	for _, tt := range tests {
+		before, got := clippedPixelShape(tt.path, pageMatrix, c, tt.x, tt.y, bitmapWidth, bitmapHeight)
+		if before == 0 {
+			t.Errorf("%s unclipped shape at (%d,%d) = 0, test fixture is invalid", tt.name, tt.x, tt.y)
+		}
+		if got != 0 {
+			t.Errorf("%s clipped shape at (%d,%d) = %d, want clipped out (unclipped=%d)", tt.name, tt.x, tt.y, got, before)
+		}
+	}
+}
+
+func TestClipAALineFullWidthReturnsRectAdjustedBounds(t *testing.T) {
+	const bitmapWidth = 20
+	rowSize := (bitmapWidth*aaSize + 7) >> 3
+	aaBuf := make([]byte, rowSize*aaSize)
+	for i := range aaBuf {
+		aaBuf[i] = 0xff
+	}
+
+	clip := NewClip(0, 0, bitmapWidth-1, 10, true)
+	if err := clip.ClipToRect(5.25, 0, 12.75, 10); err != nil {
+		t.Fatalf("ClipToRect: %v", err)
+	}
+
+	gotX0, gotX1 := clip.ClipAALineFullWidth(1, aaBuf, 0, bitmapWidth-1, bitmapWidth)
+	if gotX0 != 5 || gotX1 != 12 {
+		t.Fatalf("adjusted bounds = (%d,%d), want (5,12)", gotX0, gotX1)
+	}
+	if got := countFullWidthAABufPixel(aaBuf, rowSize, 4); got != 0 {
+		t.Fatalf("left-clipped pixel shape = %d, want 0", got)
+	}
+	if got := countFullWidthAABufPixel(aaBuf, rowSize, 13); got != 0 {
+		t.Fatalf("right-clipped pixel shape = %d, want 0", got)
+	}
+}
+
+func TestClipAALineFullWidthUsesPopplerLeftByteBoundaryClear(t *testing.T) {
+	const bitmapWidth = 6
+	rowSize := (bitmapWidth*aaSize + 7) >> 3
+	aaBuf := make([]byte, rowSize*aaSize)
+	for i := range aaBuf {
+		aaBuf[i] = 0xff
+	}
+
+	clip := NewClip(0, 0, bitmapWidth-1, 10, true)
+	if err := clip.ClipToRect(1.25, 0, bitmapWidth, 10); err != nil {
+		t.Fatalf("ClipToRect: %v", err)
+	}
+
+	gotX0, _ := clip.ClipAALineFullWidth(1, aaBuf, 1, bitmapWidth-1, bitmapWidth)
+	if gotX0 != 1 {
+		t.Fatalf("adjusted x0 = %d, want 1", gotX0)
+	}
+	for yy := 0; yy < aaSize; yy++ {
+		if got := aaBuf[yy*rowSize]; got != 0x07 {
+			t.Fatalf("row %d byte 0 = 0x%02x, want Poppler left mask 0x07", yy, got)
+		}
+	}
+}
+
+func TestClipAALineFullWidthUsesPopplerRightWholeByteClear(t *testing.T) {
+	const bitmapWidth = 6
+	rowSize := (bitmapWidth*aaSize + 7) >> 3
+	aaBuf := make([]byte, rowSize*aaSize)
+	for i := range aaBuf {
+		aaBuf[i] = 0xff
+	}
+
+	clip := NewClip(0, 0, bitmapWidth-1, 10, true)
+	if err := clip.ClipToRect(0, 0, 1.25, 10); err != nil {
+		t.Fatalf("ClipToRect: %v", err)
+	}
+
+	_, gotX1 := clip.ClipAALineFullWidth(1, aaBuf, 0, 2, bitmapWidth)
+	if gotX1 != 1 {
+		t.Fatalf("adjusted x1 = %d, want 1", gotX1)
+	}
+	for yy := 0; yy < aaSize; yy++ {
+		rowOff := yy * rowSize
+		if got := aaBuf[rowOff]; got != 0xfc {
+			t.Fatalf("row %d byte 0 = 0x%02x, want Poppler right leading mask 0xfc", yy, got)
+		}
+		if got := aaBuf[rowOff+1]; got != 0x00 {
+			t.Fatalf("row %d byte 1 = 0x%02x, want Poppler right whole-byte clear", yy, got)
+		}
+	}
+}
+
+func TestClipToPathSnapsNearIntegerYBoundaryForClipScanners(t *testing.T) {
+	const nearIntegerY = 2.0 - 1e-13
+	leakyRow := splashFloor(nearIntegerY * aaSize)
+	snappedRow := leakyRow + 1
+
+	t.Setenv("PDF_DISABLE_SPLASH_CLIP_SCANNER_Y_FLOOR_SNAP", "0")
+	t.Setenv("PDF_DEBUG_SPLASH_CLIP_SCANNER_Y_FLOOR_SNAP_EPS", "")
+	scanner := clipScannerForNearIntegerYBoundary(t, nearIntegerY)
+	if got := scannerIntersectionsAtRow(scanner, leakyRow); got != 0 {
+		t.Fatalf("default clip scanner row %d intersections = %d, want 0", leakyRow, got)
+	}
+	if got := scannerIntersectionsAtRow(scanner, snappedRow); got == 0 {
+		t.Fatalf("default clip scanner row %d intersections = 0, want snapped boundary intersections", snappedRow)
+	}
+
+	t.Setenv("PDF_DISABLE_SPLASH_CLIP_SCANNER_Y_FLOOR_SNAP", "1")
+	unsnapped := clipScannerForNearIntegerYBoundary(t, nearIntegerY)
+	if got := scannerIntersectionsAtRow(unsnapped, leakyRow); got == 0 {
+		t.Fatalf("disabled clip scanner row %d intersections = 0, want old floor-row intersections", leakyRow)
+	}
+}
+
+func clipScannerForNearIntegerYBoundary(t *testing.T, y float64) *Scanner {
+	t.Helper()
+	clip := NewClip(0, 0, 64, 64, true)
+	path := mustPath(t, []pathOp{
+		{op: "m", x: 10, y: y},
+		{op: "l", x: 30, y: y},
+		{op: "l", x: 20, y: 10},
+	})
+	_ = path.Close(true)
+	if err := clip.ClipToPath(path, identityMatrix, 1.0, false); err != nil {
+		t.Fatalf("ClipToPath: %v", err)
+	}
+	if len(clip.scanners) != 1 {
+		t.Fatalf("clip scanners = %d, want 1", len(clip.scanners))
+	}
+	return clip.scanners[0]
+}
+
+func scannerIntersectionsAtRow(scanner *Scanner, row int) int {
+	if scanner == nil || row < scanner.yMin || row > scanner.yMax {
+		return 0
+	}
+	return len(scanner.allIntersections[row-scanner.yMin])
+}
+
+func clippedPixelShape(path *Path, matrix [6]float64, clip *Clip, x, y, bitmapWidth, bitmapHeight int) (int, int) {
+	xPath := NewXPath(path, matrix, 1.0, true)
+	xPath.AAScale()
+	xPath.Sort()
+	scanner := NewScanner(xPath, false, 0, 0, bitmapWidth*aaSize, bitmapHeight*aaSize)
+	rowSize := ((bitmapWidth * aaSize) + 7) >> 3
+	aaBuf := make([]byte, rowSize*aaSize)
+	x0, x1 := scanner.RenderAALineFullWidth(y, aaBuf, bitmapWidth)
+	before := countFullWidthAABufPixel(aaBuf, rowSize, x)
+	_, _ = clip.ClipAALineFullWidth(y, aaBuf, x0, x1, bitmapWidth)
+	return before, countFullWidthAABufPixel(aaBuf, rowSize, x)
+}
+
+func buildETicketRoundedFrameClipPaths(t *testing.T, yMin, yMax float64) []*Path {
+	t.Helper()
+	return []*Path{
+		mustPath(t, []pathOp{
+			{op: "m", x: 48, y: yMin},
+			{op: "l", x: 48, y: yMax - 3},
+			{op: "c", x1: 48, y1: yMax - 1.66, x2: 49.66, y2: yMax, x: 51, y: yMax},
+			{op: "l", x: 547, y: yMax},
+			{op: "l", x: 547, y: yMin},
+			{op: "l", x: 48, y: yMin},
+		}),
+		mustPath(t, []pathOp{
+			{op: "m", x: 48, y: yMax},
+			{op: "l", x: 544, y: yMax},
+			{op: "c", x1: 545.34, y1: yMax, x2: 547, y2: yMax - 1.66, x: 547, y: yMax - 3},
+			{op: "l", x: 547, y: yMin},
+			{op: "l", x: 48, y: yMin},
+			{op: "l", x: 48, y: yMax},
+		}),
+		mustPath(t, []pathOp{
+			{op: "m", x: 547, y: yMax},
+			{op: "l", x: 547, y: yMin + 3},
+			{op: "c", x1: 547, y1: yMin + 1.65, x2: 545.34, y2: yMin, x: 544, y: yMin},
+			{op: "l", x: 48, y: yMin},
+			{op: "l", x: 48, y: yMax},
+			{op: "l", x: 547, y: yMax},
+		}),
+		mustPath(t, []pathOp{
+			{op: "m", x: 547, y: yMin},
+			{op: "l", x: 51, y: yMin},
+			{op: "c", x1: 49.66, y1: yMin, x2: 48, y2: yMin + 1.65, x: 48, y: yMin + 3},
+			{op: "l", x: 48, y: yMax},
+			{op: "l", x: 547, y: yMax},
+			{op: "l", x: 547, y: yMin},
+		}),
+		mustPath(t, []pathOp{
+			{op: "m", x: 48.75, y: yMax - 3},
+			{op: "c", x1: 48.75, y1: yMax - 1.99, x2: 49.99, y2: yMax - 0.75, x: 51, y: yMax - 0.75},
+			{op: "l", x: 544, y: yMax - 0.75},
+			{op: "l", x: 546.25, y: yMax - 3},
+			{op: "l", x: 546.25, y: yMin + 3},
+			{op: "l", x: 544, y: yMin + 0.75},
+			{op: "l", x: 51, y: yMin + 0.75},
+			{op: "l", x: 48.75, y: yMin + 3},
+			{op: "l", x: 48.75, y: yMax - 3},
+			{op: "l", x: 48, y: yMax - 3},
+			{op: "l", x: 48, y: yMin},
+			{op: "l", x: 547, y: yMin},
+			{op: "l", x: 547, y: yMax},
+			{op: "l", x: 48, y: yMax},
+			{op: "l", x: 48, y: yMax - 3},
+		}),
+		mustPath(t, []pathOp{
+			{op: "m", x: 544, y: yMax - 0.75},
+			{op: "c", x1: 545.01, y1: yMax - 0.75, x2: 546.25, y2: yMax - 1.99, x: 546.25, y: yMax - 3},
+			{op: "l", x: 546.25, y: yMin + 3},
+			{op: "l", x: 544, y: yMin + 0.75},
+			{op: "l", x: 51, y: yMin + 0.75},
+			{op: "l", x: 48.75, y: yMin + 3},
+			{op: "l", x: 48.75, y: yMax - 3},
+			{op: "l", x: 51, y: yMax - 0.75},
+			{op: "l", x: 544, y: yMax - 0.75},
+			{op: "l", x: 544, y: yMax},
+			{op: "l", x: 48, y: yMax},
+			{op: "l", x: 48, y: yMin},
+			{op: "l", x: 547, y: yMin},
+			{op: "l", x: 547, y: yMax},
+			{op: "l", x: 544, y: yMax},
+		}),
+		mustPath(t, []pathOp{
+			{op: "m", x: 546.25, y: yMin + 3},
+			{op: "c", x1: 546.25, y1: yMin + 1.99, x2: 545.01, y2: yMin + 0.75, x: 544, y: yMin + 0.75},
+			{op: "l", x: 51, y: yMin + 0.75},
+			{op: "l", x: 48.75, y: yMin + 3},
+			{op: "l", x: 48.75, y: yMax - 3},
+			{op: "l", x: 51, y: yMax - 0.75},
+			{op: "l", x: 544, y: yMax - 0.75},
+			{op: "l", x: 546.25, y: yMax - 3},
+			{op: "l", x: 546.25, y: yMin + 3},
+			{op: "l", x: 547, y: yMin + 3},
+			{op: "l", x: 547, y: yMax},
+			{op: "l", x: 48, y: yMax},
+			{op: "l", x: 48, y: yMin},
+			{op: "l", x: 547, y: yMin},
+			{op: "l", x: 547, y: yMin + 3},
+		}),
+		mustPath(t, []pathOp{
+			{op: "m", x: 51, y: yMin + 0.75},
+			{op: "c", x1: 49.99, y1: yMin + 0.75, x2: 48.75, y2: yMin + 1.99, x: 48.75, y: yMin + 3},
+			{op: "l", x: 48.75, y: yMax - 3},
+			{op: "l", x: 51, y: yMax - 0.75},
+			{op: "l", x: 544, y: yMax - 0.75},
+			{op: "l", x: 546.25, y: yMax - 3},
+			{op: "l", x: 546.25, y: yMin + 3},
+			{op: "l", x: 544, y: yMin + 0.75},
+			{op: "l", x: 51, y: yMin + 0.75},
+			{op: "l", x: 51, y: yMin},
+			{op: "l", x: 547, y: yMin},
+			{op: "l", x: 547, y: yMax},
+			{op: "l", x: 48, y: yMax},
+			{op: "l", x: 48, y: yMin},
+			{op: "l", x: 51, y: yMin},
+		}),
+	}
+}
+
+type pathOp struct {
+	op     string
+	x, y   float64
+	x1, y1 float64
+	x2, y2 float64
+}
+
+func mustPath(t *testing.T, ops []pathOp) *Path {
+	t.Helper()
+	p := NewPath()
+	for _, op := range ops {
+		var err error
+		switch op.op {
+		case "m":
+			err = p.MoveTo(op.x, op.y)
+		case "l":
+			err = p.LineTo(op.x, op.y)
+		case "c":
+			err = p.CurveTo(op.x1, op.y1, op.x2, op.y2, op.x, op.y)
+		default:
+			t.Fatalf("unknown path op %q", op.op)
+		}
+		if err != nil {
+			t.Fatalf("%s: %v", op.op, err)
+		}
+	}
+	return p
+}
+
 // scannerCtorAvailable reports whether Dev1's Phase 2 NewScanner has been
 // landed in a usable form. The Phase 0 skeleton returns &Scanner{} with no
 // fields populated, so we cannot exercise scanner-aware paths until then.

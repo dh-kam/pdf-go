@@ -43,9 +43,38 @@ func (p *Parser) ParseObject() (entity.Object, error) {
 // in the original lexer buffer when available.
 func (p *Parser) ParseObjectWithSpan() (entity.Object, int, int, error) {
 	if p.buf1 != nil {
-		obj := p.buf1
 		start := p.buf1Start
 		end := p.buf1End
+		if num, ok := p.buf1.(*entity.Integer); ok {
+			next1, err1 := p.lexer.Peek()
+			if err1 == nil && next1.Type == TokenNumber {
+				if _, err := p.lexer.NextToken(); err != nil {
+					return nil, 0, 0, err
+				}
+				gen, err := parseInteger(next1.Value)
+				if err != nil {
+					return nil, 0, 0, errors.Invalid("parse_number", err)
+				}
+				genEnd := p.lexer.Pos()
+				next2, err2 := p.lexer.Peek()
+				if err2 == nil && next2.Type == TokenKeyword && next2.Value == "R" {
+					if _, err := p.lexer.NextToken(); err != nil {
+						return nil, 0, 0, err
+					}
+					p.buf1 = nil
+					p.buf1Start = 0
+					p.buf1End = 0
+					p.buf2 = nil
+					p.buf3 = nil
+					return entity.NewRef(uint32(num.Value()), uint16(gen)), start, p.lexer.Pos(), nil
+				}
+				p.buf1 = entity.NewInteger(gen)
+				p.buf1Start = next1.Pos
+				p.buf1End = genEnd
+				return num, start, end, nil
+			}
+		}
+		obj := p.buf1
 		p.buf1 = nil
 		p.buf1Start = 0
 		p.buf1End = 0
@@ -224,10 +253,14 @@ func (p *Parser) parseArray() (entity.Object, error) {
 	for {
 		// Check for buffered value first
 		if p.buf1 != nil {
-			// We have a buffered value from previous parsing
-			// Add it to the array and clear the buffer
-			items = append(items, p.buf1)
-			p.buf1 = nil
+			// A buffered number may still be the object number in "obj gen R".
+			// Route it back through ParseObject so indirect references after a
+			// preceding integer are reconstructed instead of split into items.
+			obj, err := p.ParseObject()
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, obj)
 			continue
 		}
 

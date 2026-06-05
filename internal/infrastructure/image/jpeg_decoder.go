@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"hash/crc32"
 	stdimage "image"
 	"image/color"
 	"image/jpeg"
@@ -15,12 +16,23 @@ import (
 	"time"
 
 	djpeg "github.com/dh-kam/djpeg-go"
+	"github.com/dh-kam/pdf-go/internal/domain/colorspace"
 	"github.com/dh-kam/pdf-go/internal/domain/errors"
 	"github.com/dh-kam/pdf-go/internal/domain/image"
 )
 
 const imageMagickJPEGTimeout = 10 * time.Second
 const enableDjpegGoJPEGEnv = "GO_PDF_ENABLE_DJPEG_GO"
+const disableDCTDeviceCMYKPopplerLineEnv = "PDF_DISABLE_DCT_DEVICE_CMYK_POPPLER_LINE"
+const debugDCTDeviceCMYKTraceEnv = "PDF_DEBUG_DCT_DEVICE_CMYK_TRACE"
+const debugDCTDeviceCMYKForceBranchEnv = "PDF_DEBUG_DCT_DEVICE_CMYK_FORCE_BRANCH"
+
+const (
+	dctDeviceCMYKBranchAuto              = ""
+	dctDeviceCMYKBranchImageMagickLine   = "imagemagick-popplerline"
+	dctDeviceCMYKBranchStdlibPopplerLine = "stdlib-popplerline"
+	dctDeviceCMYKBranchDjpegPopplerLine  = "djpeg-popplerline"
+)
 
 // JPEGDecoder decodes JPEG images (DCTDecode filter).
 type JPEGDecoder struct{}
@@ -83,6 +95,289 @@ func stdImageFromDjpegRaster(raster *djpeg.Raster) (stdimage.Image, error) {
 		copy(dst, src)
 	}
 	return out, nil
+}
+
+func decodeDeviceCMYKDCTWithPopplerLine(data []byte, width, height int) (stdimage.Image, error) {
+	switch forced := forcedDCTDeviceCMYKBranch(); forced {
+	case dctDeviceCMYKBranchImageMagickLine:
+		return decodeDeviceCMYKDCTWithImageMagickCMYKPopplerLine(data, width, height)
+	case dctDeviceCMYKBranchStdlibPopplerLine:
+		return decodeDeviceCMYKDCTWithStdlibCMYKPopplerLine(data, width, height)
+	case dctDeviceCMYKBranchDjpegPopplerLine:
+		return decodeDeviceCMYKDCTWithDjpegCMYKPopplerLine(data, width, height)
+	}
+
+	// Poppler's DCTStream is libjpeg-backed; ImageMagick's JPEG delegate gives
+	// closer CMYK IDCT parity than Go's stdlib decoder, with stdlib as fallback.
+	if img, err := decodeDeviceCMYKDCTWithImageMagickCMYKPopplerLine(data, width, height); err == nil {
+		return img, nil
+	}
+
+	if os.Getenv("PDF_DEBUG_DCT_DEVICE_CMYK_POPPLER_LINE") != "1" {
+		return decodeDeviceCMYKDCTWithStdlibCMYKPopplerLine(data, width, height)
+	}
+
+	if img, err := decodeDeviceCMYKDCTWithStdlibCMYKPopplerLine(data, width, height); err == nil {
+		return img, nil
+	}
+
+	return decodeDeviceCMYKDCTWithDjpegCMYKPopplerLine(data, width, height)
+}
+
+func decodeDeviceCMYKDCTWithImageMagickCMYKPopplerLine(data []byte, width, height int) (stdimage.Image, error) {
+	if os.Getenv("GO_PDF_DISABLE_IMAGEMAGICK_JPEG") == "1" {
+		return nil, errors.Invalid("imagemagick_cmyk_jpeg_decode", fmt.Errorf("disabled"))
+	}
+	if width <= 0 || height <= 0 {
+		return nil, errors.Invalidf("imagemagick_cmyk_jpeg_decode", "invalid image size: %dx%d", width, height)
+	}
+
+	convertPath, err := exec.LookPath("convert")
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), imageMagickJPEGTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, convertPath, "jpeg:-", "-depth", "8", "cmyk:-")
+	cmd.Stdin = bytes.NewReader(data)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	raw, err := cmd.Output()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("convert jpeg to raw cmyk failed: %w: %s", err, stderr.String())
+	}
+
+	// CMYK JPEGs with Adobe APP14 use the same sample polarity correction as
+	// Poppler/libjpeg's DCTStream setup before DeviceCMYK getRGBLine conversion.
+	return rgbaFromImageMagickCMYKPopplerLine(raw, width, height, jpegHasAdobeMarker(data))
+}
+
+func rgbaFromImageMagickCMYKPopplerLine(raw []byte, width, height int, invertSamples bool) (*stdimage.RGBA, error) {
+	if width <= 0 || height <= 0 {
+		return nil, errors.Invalidf("imagemagick_cmyk_jpeg_decode", "invalid image size: %dx%d", width, height)
+	}
+	expected := width * height * 4
+	if len(raw) != expected {
+		return nil, errors.Invalidf(
+			"imagemagick_cmyk_jpeg_decode",
+			"raw cmyk length %d does not match image size %dx%d",
+			len(raw),
+			width,
+			height,
+		)
+	}
+
+	out := stdimage.NewRGBA(stdimage.Rect(0, 0, width, height))
+	src := 0
+	dst := 0
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			c := raw[src]
+			m := raw[src+1]
+			yComp := raw[src+2]
+			k := raw[src+3]
+			if invertSamples {
+				c = 0xff - c
+				m = 0xff - m
+				yComp = 0xff - yComp
+				k = 0xff - k
+			}
+			rgba := colorspace.ConvertDeviceCMYKBytesToRGBLineRGBA(c, m, yComp, k)
+			out.Pix[dst] = rgba.R
+			out.Pix[dst+1] = rgba.G
+			out.Pix[dst+2] = rgba.B
+			out.Pix[dst+3] = rgba.A
+			src += 4
+			dst += 4
+		}
+	}
+	return out, nil
+}
+
+func decodeDeviceCMYKDCTWithDjpegCMYKPopplerLine(data []byte, width, height int) (stdimage.Image, error) {
+	opts := []djpeg.Option{
+		djpeg.WithCompatibility(djpeg.CompatibilityPopplerPDF),
+		djpeg.WithOutputColorSpace(djpeg.ColorSpaceCMYK),
+	}
+	if inputColorSpace, ok := popplerDeviceCMYKDCTInputColorSpace(data); ok {
+		opts = append(opts, djpeg.WithInputColorSpace(inputColorSpace))
+	}
+
+	raster, err := djpeg.DecodeRaster(bytes.NewReader(data), opts...)
+	if err != nil {
+		return nil, errors.Invalid("dct_device_cmyk_poppler_line", err)
+	}
+	if raster == nil || raster.Format != djpeg.PixelFormatCMYK32 {
+		return nil, errors.Invalidf("dct_device_cmyk_poppler_line", "unexpected raster format: %v", raster)
+	}
+
+	bounds := raster.Bounds()
+	if width > 0 && height > 0 && (bounds.Dx() != width || bounds.Dy() != height) {
+		return nil, errors.Invalidf(
+			"dct_device_cmyk_poppler_line",
+			"raster size %dx%d does not match PDF image size %dx%d",
+			bounds.Dx(),
+			bounds.Dy(),
+			width,
+			height,
+		)
+	}
+
+	out := stdimage.NewRGBA(bounds)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		src := (y-bounds.Min.Y)*raster.Stride + (bounds.Min.X-raster.Rect.Min.X)*4
+		dst := (y-out.Rect.Min.Y)*out.Stride + (bounds.Min.X-out.Rect.Min.X)*4
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			rgba := colorspace.ConvertDeviceCMYKBytesToRGBLineRGBA(
+				raster.Pix[src],
+				raster.Pix[src+1],
+				raster.Pix[src+2],
+				raster.Pix[src+3],
+			)
+			out.Pix[dst] = rgba.R
+			out.Pix[dst+1] = rgba.G
+			out.Pix[dst+2] = rgba.B
+			out.Pix[dst+3] = rgba.A
+			src += 4
+			dst += 4
+		}
+	}
+	return out, nil
+}
+
+func forcedDCTDeviceCMYKBranch() string {
+	switch os.Getenv(debugDCTDeviceCMYKForceBranchEnv) {
+	case dctDeviceCMYKBranchImageMagickLine:
+		return dctDeviceCMYKBranchImageMagickLine
+	case dctDeviceCMYKBranchStdlibPopplerLine:
+		return dctDeviceCMYKBranchStdlibPopplerLine
+	case dctDeviceCMYKBranchDjpegPopplerLine:
+		return dctDeviceCMYKBranchDjpegPopplerLine
+	default:
+		return dctDeviceCMYKBranchAuto
+	}
+}
+
+func decodeDeviceCMYKDCTWithStdlibCMYKPopplerLine(data []byte, width, height int) (stdimage.Image, error) {
+	img, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	cmyk, ok := img.(*stdimage.CMYK)
+	if !ok {
+		return nil, errors.Invalidf("dct_device_cmyk_poppler_line", "unexpected stdlib image type: %T", img)
+	}
+
+	bounds := cmyk.Bounds()
+	if width > 0 && height > 0 && (bounds.Dx() != width || bounds.Dy() != height) {
+		return nil, errors.Invalidf(
+			"dct_device_cmyk_poppler_line",
+			"stdlib image size %dx%d does not match PDF image size %dx%d",
+			bounds.Dx(),
+			bounds.Dy(),
+			width,
+			height,
+		)
+	}
+
+	invertSamples := jpegHasAdobeMarker(data)
+	out := stdimage.NewRGBA(bounds)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		src := (y-cmyk.Rect.Min.Y)*cmyk.Stride + (bounds.Min.X-cmyk.Rect.Min.X)*4
+		dst := (y-out.Rect.Min.Y)*out.Stride + (bounds.Min.X-out.Rect.Min.X)*4
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			c := cmyk.Pix[src]
+			m := cmyk.Pix[src+1]
+			yComp := cmyk.Pix[src+2]
+			k := cmyk.Pix[src+3]
+			if invertSamples {
+				c = 0xff - c
+				m = 0xff - m
+				yComp = 0xff - yComp
+				k = 0xff - k
+			}
+			rgba := colorspace.ConvertDeviceCMYKBytesToRGBLineRGBA(c, m, yComp, k)
+			out.Pix[dst] = rgba.R
+			out.Pix[dst+1] = rgba.G
+			out.Pix[dst+2] = rgba.B
+			out.Pix[dst+3] = rgba.A
+			src += 4
+			dst += 4
+		}
+	}
+	return out, nil
+}
+
+func jpegHasAdobeMarker(data []byte) bool {
+	cfg, err := djpeg.DecodeRasterConfig(bytes.NewReader(data), djpeg.WithCompatibility(djpeg.CompatibilityPopplerPDF))
+	return err == nil && cfg.SawAdobeMarker
+}
+
+func traceDeviceCMYKDCTDecodeCandidate(data []byte, meta *image.ImageData) {
+	if os.Getenv(debugDCTDeviceCMYKTraceEnv) != "1" || meta == nil || meta.Filter != image.FilterDCT {
+		return
+	}
+
+	forced := forcedDCTDeviceCMYKBranch()
+	cfg, cfgErr := djpeg.DecodeRasterConfig(
+		bytes.NewReader(data),
+		djpeg.WithCompatibility(djpeg.CompatibilityPopplerPDF),
+		djpeg.WithOutputColorSpace(djpeg.ColorSpaceCMYK),
+	)
+	if cfgErr != nil {
+		fmt.Fprintf(os.Stderr, "DCT_CMYK_TRACE width=%d height=%d colorspace=%s bpc=%d decode=%d icc=%d raw_crc=%08x force=%s config_error=%v\n",
+			meta.Width,
+			meta.Height,
+			meta.ColorSpace,
+			meta.BitsPerComponent,
+			len(meta.Decode),
+			len(meta.ICCProfile),
+			crc32.ChecksumIEEE(data),
+			forced,
+			cfgErr,
+		)
+		return
+	}
+
+	inputColorSpace, hasInputColorSpace := popplerDeviceCMYKDCTInputColorSpace(data)
+	fmt.Fprintf(os.Stderr, "DCT_CMYK_TRACE width=%d height=%d colorspace=%s bpc=%d decode=%d icc=%d raw_crc=%08x force=%s components=%d adobe=%t transform=%d input=%v input_forced=%t\n",
+		meta.Width,
+		meta.Height,
+		meta.ColorSpace,
+		meta.BitsPerComponent,
+		len(meta.Decode),
+		len(meta.ICCProfile),
+		crc32.ChecksumIEEE(data),
+		forced,
+		cfg.InputComponents,
+		cfg.SawAdobeMarker,
+		cfg.AdobeTransform,
+		inputColorSpace,
+		hasInputColorSpace,
+	)
+}
+
+func popplerDeviceCMYKDCTInputColorSpace(data []byte) (djpeg.InputColorSpace, bool) {
+	cfg, err := djpeg.DecodeRasterConfig(
+		bytes.NewReader(data),
+		djpeg.WithCompatibility(djpeg.CompatibilityPopplerPDF),
+		djpeg.WithOutputColorSpace(djpeg.ColorSpaceCMYK),
+	)
+	if err != nil || cfg.InputComponents != 4 {
+		return djpeg.InputAuto, false
+	}
+
+	// Poppler DCTStream.cc sets 4-component jpeg_color_space from the Adobe
+	// APP14 transform only; component IDs such as 1/2/3/4 do not imply YCCK.
+	if cfg.SawAdobeMarker && cfg.AdobeTransform != 0 {
+		return djpeg.InputYCCK, true
+	}
+	return djpeg.InputCMYK, true
 }
 
 func decodeJPEGWithImageMagick(data []byte) (stdimage.Image, error) {

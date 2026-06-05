@@ -275,16 +275,9 @@ func renderLinkAnnotation(page *entity.Page, c domaincanvas.Canvas, initial [6]f
 	if !ok {
 		return nil
 	}
-	// /Border = [HRadius VRadius Width <DashArray>]; default [0 0 1].
-	width := 1.0
-	if borderArr, ok := dict.Get(entity.Name("Border")).(*entity.Array); ok && borderArr.Len() >= 3 {
-		switch v := borderArr.Get(2).(type) {
-		case *entity.Real:
-			width = v.Value()
-		case *entity.Integer:
-			width = float64(v.Value())
-		}
-	}
+	// Poppler resolves Link border style through AnnotBorderBS when /BS is
+	// present, otherwise /Border, otherwise a default width of 1.
+	width := annotationBorderWidth(dict)
 	if width <= 0 {
 		return nil
 	}

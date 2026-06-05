@@ -17,6 +17,9 @@ type pipe struct {
 	knockout  bool
 
 	x, y int
+	// sampleXOff is a debug-only pattern sampling offset used while isolating
+	// Poppler shaded-fill edge phase differences. It must stay zero by default.
+	sampleXOff int
 
 	// Direct row+offset addressing (Go does not let us hold a "moving pointer"
 	// the way C++ SplashColorPtr does, so we hold the row slice + cursor).
@@ -38,6 +41,10 @@ type pipe struct {
 	// 1208-1209). When non-nil the AA path multiplies aSrc by softMask byte
 	// at the current device (x,y).
 	softMask *Bitmap
+	// alpha0 mirrors pipe->alpha0Ptr for Poppler non-isolated group painting.
+	alpha0  *Bitmap
+	alpha0X int
+	alpha0Y int
 
 	s   *Splash
 	run func(p *pipe)
@@ -59,16 +66,25 @@ func (s *Splash) pipeInit(p *pipe, x, y int, pat Pattern, cSrc *Color, aInput by
 	p.aInput = aInput
 	p.usesShape = usesShape
 	p.shape = 0
+	p.sampleXOff = 0
 	p.patAlpha = 255
 	p.knockout = false
 	_, hasPatternAlpha := pat.(AlphaPattern)
-	p.noTransparency = aInput == 255 && !usesShape && !nonIsoGroup && !hasPatternAlpha
 	p.colorBytesPerPixel = bytesPerPixel(s.bitmap.mode)
 	// Capture blendFunc, mode, and softMask for per-pixel hooks
 	// (Splash.cc:475-485 softMask, Splash.cc:535-541 blendFunc).
 	p.blendFunc = s.state.blendFunc
 	p.mode = s.bitmap.mode
 	p.softMask = s.state.softMask
+	p.alpha0 = nil
+	p.alpha0X = 0
+	p.alpha0Y = 0
+	if s.state.inNonIsolatedGroup && s.nonIsoAlpha0 != nil && s.nonIsoAlpha0.alpha != nil {
+		p.alpha0 = s.nonIsoAlpha0
+		p.alpha0X = s.nonIsoAlpha0X
+		p.alpha0Y = s.nonIsoAlpha0Y
+	}
+	p.noTransparency = aInput == 255 && !usesShape && !nonIsoGroup && !hasPatternAlpha && p.alpha0 == nil
 
 	s.pipeSetXY(p, x, y)
 
@@ -76,10 +92,14 @@ func (s *Splash) pipeInit(p *pipe, x, y int, pat Pattern, cSrc *Color, aInput by
 	// !state->softMask.
 	noTrans := p.noTransparency && p.blendFunc == nil && p.softMask == nil
 	p.run = pickRun(s.bitmap.mode, noTrans, usesShape, p.pattern == nil)
-	if len(pipeTracePixels) > 0 {
+	if len(pipeTracePixels) > 0 || len(lastWriterPixels) > 0 {
 		run := p.run
 		p.run = func(pp *pipe) {
 			x, y := pp.x, pp.y
+			before := lastWriterSample{}
+			if shouldTraceLastWriterPixel(x, y) {
+				before = captureLastWriterSample(pp.s.bitmap, x, y)
+			}
 			if shouldTracePipePixel(x, y) {
 				tracePipePixelBefore(pp, x, y)
 			}
@@ -87,6 +107,7 @@ func (s *Splash) pipeInit(p *pipe, x, y int, pat Pattern, cSrc *Color, aInput by
 			if shouldTracePipePixel(x, y) {
 				tracePipePixelAfter(pp, x, y)
 			}
+			traceLastWriter("pipe", pp.s, pp.s.bitmap, x, y, before)
 		}
 	}
 }
@@ -105,6 +126,29 @@ func pipeSourceAlpha(p *pipe) byte {
 	return aSrc
 }
 
+func pipeResultAlphas(p *pipe, aSrc, aDest byte) (byte, int, int) {
+	aResult := aSrc + aDest - byte(Div255(int(aSrc)*int(aDest)))
+	alphaI := int(aResult)
+	alphaIm1 := int(aDest)
+	if alpha0, ok := pipeAlpha0(p); ok {
+		alphaI = int(aResult) + int(alpha0) - Div255(int(aResult)*int(alpha0))
+		alphaIm1 = int(alpha0) + int(aDest) - Div255(int(alpha0)*int(aDest))
+	}
+	return aResult, alphaI, alphaIm1
+}
+
+func pipeAlpha0(p *pipe) (byte, bool) {
+	if p == nil || p.alpha0 == nil || p.alpha0.alpha == nil {
+		return 0, false
+	}
+	x := p.alpha0X + p.x
+	y := p.alpha0Y + p.y
+	if x < 0 || y < 0 || x >= p.alpha0.width || y >= p.alpha0.height {
+		return 0, false
+	}
+	return p.alpha0.alpha[y*p.alpha0.width+x], true
+}
+
 func pipeSetPatternAlpha(p *pipe) bool {
 	p.patAlpha = 255
 	if p.pattern == nil {
@@ -115,6 +159,13 @@ func pipeSetPatternAlpha(p *pipe) bool {
 		return p.patAlpha != 0
 	}
 	return true
+}
+
+func pipePatternX(p *pipe) int {
+	if p == nil {
+		return 0
+	}
+	return p.x + p.sampleXOff
 }
 
 // pickRun selects the per-mode dispatch function (Splash.cc:259-292).
@@ -235,18 +286,22 @@ func tracePipePixelBefore(p *pipe, x, y int) {
 	src := p.cSrc
 	patternHit := false
 	if p.pattern != nil {
-		patternHit = p.pattern.GetColor(x, y, &src)
+		patternHit = p.pattern.GetColor(pipePatternX(p), y, &src)
 	}
 	softMask := byte(0)
 	hasSoftMask := p.softMask != nil
 	if hasSoftMask {
 		softMask = softMaskByte(p.softMask, x, y)
 	}
-	fmt.Fprintf(os.Stderr, "SPLASH_PIPE_TRACE before x=%d y=%d src=(%d,%d,%d) pattern=%t patternHit=%t aInput=%d usesShape=%t shape=%d softMask=%d hasSoftMask=%t dst=(%d,%d,%d) aDest=%d run=%p\n",
+	context := ""
+	if p.s != nil && p.s.debugPaintContext != "" {
+		context = fmt.Sprintf(" ctx=%q", p.s.debugPaintContext)
+	}
+	fmt.Fprintf(os.Stderr, "SPLASH_PIPE_TRACE before x=%d y=%d src=(%d,%d,%d) pattern=%t patternHit=%t aInput=%d usesShape=%t shape=%d softMask=%d hasSoftMask=%t dst=(%d,%d,%d) aDest=%d run=%p%s\n",
 		x, y, src[0], src[1], src[2], p.pattern != nil, patternHit,
 		p.aInput, p.usesShape, p.shape, softMask, hasSoftMask,
 		p.destRow[p.destOff], p.destRow[p.destOff+1], p.destRow[p.destOff+2], aDest,
-		p.run)
+		p.run, context)
 	if os.Getenv("PDF_DEBUG_SPLASH_PIPE_STACK") != "" && src[0] == 0 && src[1] == 0 && src[2] == 0 {
 		fmt.Fprintf(os.Stderr, "SPLASH_PIPE_TRACE stack x=%d y=%d\n%s", x, y, debug.Stack())
 	}
@@ -264,8 +319,12 @@ func tracePipePixelAfter(p *pipe, x, y int) {
 			aDest = p.aDestRow[aOff]
 		}
 	}
-	fmt.Fprintf(os.Stderr, "SPLASH_PIPE_TRACE after x=%d y=%d dst=(%d,%d,%d) aDest=%d\n",
-		x, y, p.destRow[off], p.destRow[off+1], p.destRow[off+2], aDest)
+	context := ""
+	if p.s != nil && p.s.debugPaintContext != "" {
+		context = fmt.Sprintf(" ctx=%q", p.s.debugPaintContext)
+	}
+	fmt.Fprintf(os.Stderr, "SPLASH_PIPE_TRACE after x=%d y=%d dst=(%d,%d,%d) aDest=%d%s\n",
+		x, y, p.destRow[off], p.destRow[off+1], p.destRow[off+2], aDest, context)
 }
 
 // rowStride returns the byte stride of a row, falling back to width*bpp when

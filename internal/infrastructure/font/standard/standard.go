@@ -43,8 +43,8 @@ var Standard14 = map[string]*StandardFont{
 	"Courier-Bold":          newStandardFont("Courier Bold", FontBold, "NimbusMonoPS-Bold.afm", getWidths("CourierBold"), gomonobold.TTF, readURWBase35Font("NimbusMonoPS-Bold.otf"), [4]float64{-113, -250, 749, 801}),
 	"Courier-Oblique":       newStandardFont("Courier Oblique", FontItalic, "NimbusMonoPS-Italic.afm", getWidths("CourierOblique"), gomonoitalic.TTF, readURWBase35Font("NimbusMonoPS-Italic.otf"), [4]float64{-27, -250, 849, 805}),
 	"Courier-BoldOblique":   newStandardFont("Courier Bold Oblique", FontBoldItalic, "NimbusMonoPS-BoldItalic.afm", getWidths("CourierBoldOblique"), gomonoitalic.TTF, readURWBase35Font("NimbusMonoPS-BoldItalic.otf"), [4]float64{-57, -250, 869, 801}),
-	"Symbol":                newStandardFont("Symbol", FontNormal, "StandardSymbolsPS.afm", getWidths("Symbol"), gosmallcaps.TTF, nil, [4]float64{-180, -293, 1090, 1010}),
-	"ZapfDingbats":          newStandardFont("Zapf Dingbats", FontNormal, "D050000L.afm", getWidths("ZapfDingbats"), gosmallcaps.TTF, nil, [4]float64{-1, -143, 981, 820}),
+	"Symbol":                newURWEncodedStandardFont("Symbol", FontNormal, "StandardSymbolsPS.afm", getWidths("Symbol"), "StandardSymbolsPS.otf", gosmallcaps.TTF, [4]float64{-180, -293, 1090, 1010}),
+	"ZapfDingbats":          newURWEncodedStandardFont("Zapf Dingbats", FontNormal, "D050000L.afm", getWidths("ZapfDingbats"), "D050000L.otf", gosmallcaps.TTF, [4]float64{-1, -143, 981, 820}),
 }
 
 // FontWeight represents font weight.
@@ -63,6 +63,8 @@ type StandardFont struct {
 	sfntData    []byte
 	rasterData  []byte
 	widths      []float64
+	glyphNames  map[uint32]string
+	glyphByName map[string]uint32
 	boundingBox entity.BoundingBox
 	weight      FontWeight
 	syncOnce    sync.Once
@@ -75,11 +77,26 @@ const urwBase35AFMDir = "/usr/share/fonts/type1/urw-base35"
 const standardWidthScale = 2048.0 / 1000.0
 
 func newStandardFont(name string, weight FontWeight, afmFileName string, fallbackWidths []float64, sfntData, rasterData []byte, fallbackBBox [4]float64) *StandardFont {
+	return newStandardFontWithMetricScale(name, weight, afmFileName, fallbackWidths, sfntData, rasterData, fallbackBBox, standardWidthScale)
+}
+
+func newURWEncodedStandardFont(name string, weight FontWeight, afmFileName string, fallbackWidths []float64, otfFileName string, fallbackSFNT []byte, fallbackBBox [4]float64) *StandardFont {
+	urwData := readURWBase35Font(otfFileName)
+	if len(urwData) == 0 {
+		return newStandardFontWithMetricScale(name, weight, afmFileName, fallbackWidths, fallbackSFNT, nil, fallbackBBox, standardWidthScale)
+	}
+	return newStandardFontWithMetricScale(name, weight, afmFileName, fallbackWidths, urwData, urwData, fallbackBBox, 1)
+}
+
+func newStandardFontWithMetricScale(name string, weight FontWeight, afmFileName string, fallbackWidths []float64, sfntData, rasterData []byte, fallbackBBox [4]float64, metricScale float64) *StandardFont {
+	glyphNames := readURWAFMGlyphNames(afmFileName)
 	return &StandardFont{
 		name:        name,
 		weight:      weight,
-		widths:      readURWAFMWidths(afmFileName, fallbackWidths),
-		boundingBox: readURWAFMFontBBox(afmFileName, fallbackBBox),
+		widths:      readURWAFMWidths(afmFileName, fallbackWidths, metricScale),
+		glyphNames:  glyphNames,
+		glyphByName: reverseGlyphNames(glyphNames),
+		boundingBox: readURWAFMFontBBox(afmFileName, fallbackBBox, metricScale),
 		sfntData:    sfntData,
 		rasterData:  rasterData,
 	}
@@ -93,7 +110,7 @@ func readURWBase35Font(fileName string) []byte {
 	return data
 }
 
-func readURWAFMWidths(fileName string, fallback []float64) []float64 {
+func readURWAFMWidths(fileName string, fallback []float64, metricScale float64) []float64 {
 	widths := cloneWidths(fallback)
 	data, err := os.ReadFile(urwBase35AFMDir + "/" + fileName)
 	if err != nil {
@@ -112,12 +129,49 @@ func readURWAFMWidths(fileName string, fallback []float64) []float64 {
 		if err != nil {
 			continue
 		}
-		widths[code] = width * standardWidthScale
+		widths[code] = width * metricScale
 	}
 	return widths
 }
 
-func readURWAFMFontBBox(fileName string, fallback [4]float64) entity.BoundingBox {
+func readURWAFMGlyphNames(fileName string) map[uint32]string {
+	data, err := os.ReadFile(urwBase35AFMDir + "/" + fileName)
+	if err != nil {
+		return nil
+	}
+	out := map[uint32]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 8 || fields[0] != "C" || fields[2] != ";" || fields[5] != ";" || fields[6] != "N" {
+			continue
+		}
+		code, err := strconv.Atoi(fields[1])
+		if err != nil || code < 0 || code > 255 {
+			continue
+		}
+		name := strings.TrimSpace(fields[7])
+		if name == "" || name == ".notdef" {
+			continue
+		}
+		out[uint32(code)] = name
+	}
+	return out
+}
+
+func reverseGlyphNames(glyphNames map[uint32]string) map[string]uint32 {
+	if len(glyphNames) == 0 {
+		return nil
+	}
+	out := map[string]uint32{}
+	for code, name := range glyphNames {
+		if _, exists := out[name]; !exists {
+			out[name] = code
+		}
+	}
+	return out
+}
+
+func readURWAFMFontBBox(fileName string, fallback [4]float64, metricScale float64) entity.BoundingBox {
 	bbox := fallback
 	data, err := os.ReadFile(urwBase35AFMDir + "/" + fileName)
 	if err == nil {
@@ -133,7 +187,7 @@ func readURWAFMFontBBox(fileName string, fallback [4]float64) entity.BoundingBox
 			break
 		}
 	}
-	return scaleStandardFontBBox(bbox)
+	return scaleStandardFontBBox(bbox, metricScale)
 }
 
 func parseAFMFontBBox(fields []string) ([4]float64, bool) {
@@ -151,12 +205,12 @@ func parseAFMFontBBox(fields []string) ([4]float64, bool) {
 	return bbox, true
 }
 
-func scaleStandardFontBBox(bbox [4]float64) entity.BoundingBox {
+func scaleStandardFontBBox(bbox [4]float64, metricScale float64) entity.BoundingBox {
 	return entity.BoundingBox{
-		XMin: bbox[0] * standardWidthScale,
-		YMin: bbox[1] * standardWidthScale,
-		XMax: bbox[2] * standardWidthScale,
-		YMax: bbox[3] * standardWidthScale,
+		XMin: bbox[0] * metricScale,
+		YMin: bbox[1] * metricScale,
+		XMax: bbox[2] * metricScale,
+		YMax: bbox[3] * metricScale,
 	}
 }
 
@@ -235,6 +289,9 @@ func (f *StandardFont) CharCodeToGlyph(code uint32) (uint32, error) {
 
 // GlyphName returns the glyph name for a glyph ID.
 func (f *StandardFont) GlyphName(glyph uint32) string {
+	if name := f.glyphNames[glyph]; name != "" {
+		return name
+	}
 	// Standard fonts use simple glyph names
 	if glyph > 255 && glyph <= 0x10FFFF {
 		return string(rune(glyph))
@@ -244,6 +301,9 @@ func (f *StandardFont) GlyphName(glyph uint32) string {
 
 // GlyphIDByName resolves a small set of Adobe glyph names to glyph IDs.
 func (f *StandardFont) GlyphIDByName(name string) (uint32, bool) {
+	if glyph, ok := f.glyphByName[name]; ok {
+		return glyph, true
+	}
 	switch name {
 	case "gamma":
 		return uint32('γ'), true

@@ -215,6 +215,24 @@ func ConvertDeviceCMYKBytesToRGBA(c, m, y, k uint8) color.RGBA {
 	}
 }
 
+// ConvertDeviceCMYKBytesToRGBLineRGBA converts CMYK image samples to RGBA using
+// Poppler's GfxDeviceCMYKColorSpace::getRGBLine byte-output quantization.
+func ConvertDeviceCMYKBytesToRGBLineRGBA(c, m, y, k uint8) color.RGBA {
+	r, g, b := deviceCMYKToRGB(
+		float64(c)/255.0,
+		float64(m)/255.0,
+		float64(y)/255.0,
+		float64(k)/255.0,
+	)
+
+	return color.RGBA{
+		R: popplerDblToByteTruncate(r),
+		G: popplerDblToByteTruncate(g),
+		B: popplerDblToByteTruncate(b),
+		A: 255,
+	}
+}
+
 func deviceCMYKToRGB(c, m, y, k float64) (float64, float64, float64) {
 	c = clamp01(c)
 	m = clamp01(m)
@@ -310,10 +328,24 @@ func popplerDblToCol(v float64) int {
 	return int(v * 0x10000)
 }
 
+func popplerQuantizedColorInputs(values []float64, count int) []float64 {
+	out := make([]float64, count)
+	for i := range out {
+		if i < len(values) {
+			out[i] = popplerDblToColToDbl(values[i])
+		}
+	}
+	return out
+}
+
 func popplerDblToByte(v float64) uint8 {
+	return popplerDblToByteTruncate(v)
+}
+
+func popplerDblToByteTruncate(v float64) uint8 {
 	v = clamp01(v)
-	// Poppler's dblToByte uses round-half-up: (int)(v*255 + 0.5).
-	return uint8(v*255.0 + 0.5)
+	// Poppler's dblToByte truncates: static_cast<unsigned char>(x * 255.0).
+	return uint8(v * 255.0)
 }
 
 // GetNumComponents returns 4 for DeviceCMYK.
@@ -472,8 +504,36 @@ func (cs *SeparationColorSpace) ConvertToRGBA(values []float64) color.RGBA {
 		return color.RGBA{0, 0, 0, 255}
 	}
 
-	// Evaluate the tint function
-	colorValues, err := cs.tintFunction.Evaluate(values)
+	colorValues, err := cs.tintFunction.Evaluate(popplerQuantizedColorInputs(values, 1))
+	if err != nil || colorValues == nil {
+		if cs.alternate != nil {
+			return cs.alternate.ConvertToRGBA([]float64{0})
+		}
+		return color.RGBA{0, 0, 0, 255}
+	}
+
+	if cs.alternate != nil {
+		return cs.alternate.ConvertToRGBA(colorValues)
+	}
+
+	return color.RGBA{0, 0, 0, 255}
+}
+
+// ConvertImageTintToRGBA converts a decoded image tint to RGBA.
+//
+// Poppler's GfxImageColorMap applies the image Decode array in floating point,
+// evaluates the tint transform from that raw value, then quantizes the alternate
+// color components. This differs from graphics color operators, whose operands
+// already travel through GfxColorComp quantization before the tint transform.
+func (cs *SeparationColorSpace) ConvertImageTintToRGBA(tint float64) color.RGBA {
+	if cs.tintFunction == nil {
+		if cs.alternate != nil {
+			return cs.alternate.ConvertToRGBA([]float64{0})
+		}
+		return color.RGBA{0, 0, 0, 255}
+	}
+
+	colorValues, err := cs.tintFunction.Evaluate([]float64{tint})
 	if err != nil || colorValues == nil {
 		if cs.alternate != nil {
 			return cs.alternate.ConvertToRGBA([]float64{0})
@@ -530,7 +590,7 @@ func (cs *DeviceNColorSpace) ConvertToRGBA(values []float64) color.RGBA {
 	in := make([]float64, len(cs.names))
 	for i := range in {
 		if i < len(values) {
-			in[i] = values[i]
+			in[i] = popplerDblToColToDbl(values[i])
 		}
 	}
 	colorValues, err := cs.tintFunction.Evaluate(in)
@@ -651,7 +711,6 @@ func (r *Registry) parsePatternColorSpace(arr *entity.Array) (ColorSpace, error)
 
 // parseICCBasedColorSpace parses an ICCBased color space.
 func (r *Registry) parseICCBasedColorSpace(arr *entity.Array) (ColorSpace, error) {
-	// ICCBased color space has a stream as the second element
 	if arr.Len() < 2 {
 		return nil, fmt.Errorf("iccbased color space requires stream object")
 	}
@@ -661,8 +720,13 @@ func (r *Registry) parseICCBasedColorSpace(arr *entity.Array) (ColorSpace, error
 		return nil, fmt.Errorf("iccbased color space requires stream object")
 	}
 
-	// Get the alternate color space
-	var alternate ColorSpace = NewDeviceRGB() // Default alternate
+	nObj := stream.Dict().Get(entity.NewName("N"))
+	n, ok := objectIntValue(nObj)
+	if !ok || n < 1 || n > 4 {
+		return nil, fmt.Errorf("iccbased color space requires valid N")
+	}
+
+	alternate := defaultICCBasedAlternate(n)
 
 	altObj := stream.Dict().Get(entity.NewName("Alternate"))
 	if altObj != nil {
@@ -671,8 +735,30 @@ func (r *Registry) parseICCBasedColorSpace(arr *entity.Array) (ColorSpace, error
 			alternate = altCS
 		}
 	}
+	if alternate == nil || alternate.GetNumComponents() != n {
+		return nil, fmt.Errorf("iccbased alternate component count mismatch")
+	}
 
-	return alternate, nil
+	ranges := parseNumberRanges(stream.Dict().Get(entity.NewName("Range")), n)
+	profile, err := stream.Decode()
+	if err != nil || len(profile) == 0 {
+		profile = stream.RawBytes()
+	}
+
+	return NewICCBasedColorSpace(n, alternate, ranges, profile), nil
+}
+
+func defaultICCBasedAlternate(n int) ColorSpace {
+	switch n {
+	case 1:
+		return NewDeviceGray()
+	case 3:
+		return NewDeviceRGB()
+	case 4:
+		return NewDeviceCMYK()
+	default:
+		return nil
+	}
 }
 
 // parseIndexedColorSpace parses an Indexed color space.
@@ -788,9 +874,99 @@ func (r *Registry) parseCalGrayColorSpace(arr *entity.Array) (ColorSpace, error)
 
 // parseCalRGBColorSpace parses a CalRGB color space.
 func (r *Registry) parseCalRGBColorSpace(arr *entity.Array) (ColorSpace, error) {
-	// CalRGB is a CIE-based RGB color space
-	// For simplicity, treat it as DeviceRGB for now
-	return NewDeviceRGB(), nil
+	whitePoint := [3]float64{0.9505, 1.0, 1.0890}
+	blackPoint := [3]float64{0, 0, 0}
+	gamma := [3]float64{1, 1, 1}
+	matrix := [9]float64{1, 0, 0, 0, 1, 0, 0, 0, 1}
+
+	if arr.Len() >= 2 {
+		if dict, ok := arr.Get(1).(*entity.Dict); ok {
+			whitePoint = parseNumberTriple(dict.Get(entity.NewName("WhitePoint")), whitePoint)
+			blackPoint = parseNumberTriple(dict.Get(entity.NewName("BlackPoint")), blackPoint)
+			gamma = parseNumberTriple(dict.Get(entity.NewName("Gamma")), gamma)
+			matrix = parseNumberMatrix9(dict.Get(entity.NewName("Matrix")), matrix)
+		}
+	}
+
+	return NewCalRGB(whitePoint, blackPoint, gamma, matrix)
+}
+
+func parseNumberTriple(obj entity.Object, fallback [3]float64) [3]float64 {
+	arr, ok := obj.(*entity.Array)
+	if !ok || arr.Len() < 3 {
+		return fallback
+	}
+
+	out := fallback
+	for i := 0; i < 3; i++ {
+		value, ok := numberObjectValue(arr.Get(i))
+		if !ok {
+			return fallback
+		}
+		out[i] = value
+	}
+	return out
+}
+
+func parseNumberMatrix9(obj entity.Object, fallback [9]float64) [9]float64 {
+	arr, ok := obj.(*entity.Array)
+	if !ok || arr.Len() < 9 {
+		return fallback
+	}
+
+	out := fallback
+	for i := 0; i < 9; i++ {
+		value, ok := numberObjectValue(arr.Get(i))
+		if !ok {
+			return fallback
+		}
+		out[i] = value
+	}
+	return out
+}
+
+func numberObjectValue(obj entity.Object) (float64, bool) {
+	switch v := obj.(type) {
+	case *entity.Integer:
+		return float64(v.Value()), true
+	case *entity.Real:
+		return v.Value(), true
+	default:
+		return 0, false
+	}
+}
+
+func objectIntValue(obj entity.Object) (int, bool) {
+	switch v := obj.(type) {
+	case *entity.Integer:
+		return int(v.Value()), true
+	case *entity.Real:
+		return int(v.Value()), true
+	default:
+		return 0, false
+	}
+}
+
+func parseNumberRanges(obj entity.Object, n int) [][2]float64 {
+	ranges := make([][2]float64, n)
+	for i := range ranges {
+		ranges[i] = [2]float64{0, 1}
+	}
+
+	arr, ok := obj.(*entity.Array)
+	if !ok || arr.Len() < 2*n {
+		return ranges
+	}
+
+	for i := 0; i < n; i++ {
+		lo, okLo := numberObjectValue(arr.Get(i * 2))
+		hi, okHi := numberObjectValue(arr.Get(i*2 + 1))
+		if !okLo || !okHi {
+			return ranges
+		}
+		ranges[i] = [2]float64{lo, hi}
+	}
+	return ranges
 }
 
 // parseLabColorSpace parses a Lab color space.
@@ -1025,9 +1201,8 @@ func parseStitchingFunction(dict *entity.Dict) entity.Function {
 // parseSampledFunction parses a sampled function.
 func parseSampledFunction(dict *entity.Dict, streamObj entity.Object) entity.Function {
 	fn := &entity.SampledFunction{
-		Size:   []int{1},
-		Encode: [][2]float64{{0, 1}},
-		Decode: [][2]float64{{0, 1}},
+		Size:        []int{1},
+		Interpolate: true,
 	}
 
 	// Parse Size
@@ -1046,77 +1221,94 @@ func parseSampledFunction(dict *entity.Dict, streamObj entity.Object) entity.Fun
 		}
 	}
 
-	// Parse Domain
-	domainObj := dict.Get(entity.NewName("Domain"))
-	if domainObj != nil {
-		if arr, ok := domainObj.(*entity.Array); ok {
-			domain := make([][2]float64, 0)
-			for i := 0; i < arr.Len(); i += 2 {
-				if i+1 < arr.Len() {
-					var d0, d1 float64
-					if item0 := arr.Get(i); item0 != nil {
-						switch v := item0.(type) {
-						case *entity.Real:
-							d0 = v.Value()
-						case *entity.Integer:
-							d0 = float64(v.Value())
-						}
-					}
-					if item1 := arr.Get(i + 1); item1 != nil {
-						switch v := item1.(type) {
-						case *entity.Real:
-							d1 = v.Value()
-						case *entity.Integer:
-							d1 = float64(v.Value())
-						}
-					}
-					domain = append(domain, [2]float64{d0, d1})
-				}
-			}
-			fn.Domain = domain
+	if domain := parseFunctionNumberPairs(dict.Get(entity.NewName("Domain"))); len(domain) > 0 {
+		fn.Domain = domain
+	}
+	if rng := parseFunctionNumberPairs(dict.Get(entity.NewName("Range"))); len(rng) > 0 {
+		fn.RangeVal = rng
+	}
+	if encode := parseFunctionNumberPairs(dict.Get(entity.NewName("Encode"))); len(encode) > 0 {
+		fn.Encode = encode
+	}
+	if len(fn.Encode) == 0 {
+		fn.Encode = make([][2]float64, len(fn.Size))
+		for i, dim := range fn.Size {
+			fn.Encode[i] = [2]float64{0, float64(dim - 1)}
 		}
 	}
-
-	// Parse Range
-	rangeObj := dict.Get(entity.NewName("Range"))
-	if rangeObj != nil {
-		if arr, ok := rangeObj.(*entity.Array); ok {
-			rng := make([][2]float64, 0)
-			for i := 0; i < arr.Len(); i += 2 {
-				if i+1 < arr.Len() {
-					var r0, r1 float64
-					if item0 := arr.Get(i); item0 != nil {
-						switch v := item0.(type) {
-						case *entity.Real:
-							r0 = v.Value()
-						case *entity.Integer:
-							r0 = float64(v.Value())
-						}
-					}
-					if item1 := arr.Get(i + 1); item1 != nil {
-						switch v := item1.(type) {
-						case *entity.Real:
-							r1 = v.Value()
-						case *entity.Integer:
-							r1 = float64(v.Value())
-						}
-					}
-					rng = append(rng, [2]float64{r0, r1})
-				}
-			}
-			fn.RangeVal = rng
-		}
+	if decode := parseFunctionNumberPairs(dict.Get(entity.NewName("Decode"))); len(decode) > 0 {
+		fn.Decode = decode
+	}
+	if len(fn.Decode) == 0 && len(fn.RangeVal) > 0 {
+		fn.Decode = append([][2]float64(nil), fn.RangeVal...)
 	}
 
 	// Parse samples from stream
 	if stream, ok := streamObj.(*entity.Stream); ok {
 		data, err := stream.Decode()
 		if err == nil {
-			fn.Samples = parseSampleValues(data)
+			bitsPerSample := parseFunctionInt(dict.Get(entity.NewName("BitsPerSample")), 8)
+			sampleCount := sampledFunctionSampleCount(fn)
+			fn.Samples = parseSampleValuesWithBits(data, bitsPerSample, sampleCount)
 		}
 	}
 
 	return fn
+}
+
+func parseFunctionNumberPairs(obj entity.Object) [][2]float64 {
+	arr, ok := obj.(*entity.Array)
+	if !ok {
+		return nil
+	}
+	pairs := make([][2]float64, 0, arr.Len()/2)
+	for i := 0; i+1 < arr.Len(); i += 2 {
+		v0, ok0 := functionNumber(arr.Get(i))
+		v1, ok1 := functionNumber(arr.Get(i + 1))
+		if ok0 && ok1 {
+			pairs = append(pairs, [2]float64{v0, v1})
+		}
+	}
+	return pairs
+}
+
+func functionNumber(obj entity.Object) (float64, bool) {
+	switch v := obj.(type) {
+	case *entity.Real:
+		return v.Value(), true
+	case *entity.Integer:
+		return float64(v.Value()), true
+	default:
+		return 0, false
+	}
+}
+
+func parseFunctionInt(obj entity.Object, fallback int) int {
+	if v, ok := obj.(*entity.Integer); ok {
+		return int(v.Value())
+	}
+	return fallback
+}
+
+func sampledFunctionSampleCount(fn *entity.SampledFunction) int {
+	if fn == nil || len(fn.Size) == 0 {
+		return 0
+	}
+	points := 1
+	for _, dim := range fn.Size {
+		if dim <= 0 {
+			return 0
+		}
+		points *= dim
+	}
+	outputs := len(fn.RangeVal)
+	if outputs == 0 {
+		outputs = len(fn.Decode)
+	}
+	if outputs == 0 {
+		outputs = 1
+	}
+	return points * outputs
 }
 
 // parsePostScriptFunction parses a PostScript calculator function (type 4).
@@ -1193,9 +1385,37 @@ func parsePostScriptFunction(dict *entity.Dict, obj entity.Object) entity.Functi
 
 // parseSampleValues parses sample values from a byte array.
 func parseSampleValues(data []byte) []float64 {
-	values := make([]float64, len(data))
-	for i, b := range data {
-		values[i] = float64(b) / 255.0
+	return parseSampleValuesWithBits(data, 8, len(data))
+}
+
+func parseSampleValuesWithBits(data []byte, bitsPerSample, sampleCount int) []float64 {
+	if bitsPerSample <= 0 || bitsPerSample > 32 {
+		bitsPerSample = 8
+	}
+	maxValue := (uint64(1) << bitsPerSample) - 1
+	if maxValue == 0 {
+		return nil
+	}
+	if sampleCount <= 0 {
+		sampleCount = len(data) * 8 / bitsPerSample
+	}
+	values := make([]float64, 0, sampleCount)
+	var buf uint64
+	bits := 0
+	for _, b := range data {
+		buf = (buf << 8) | uint64(b)
+		bits += 8
+		for bits >= bitsPerSample && len(values) < sampleCount {
+			shift := bits - bitsPerSample
+			sample := (buf >> shift) & maxValue
+			values = append(values, float64(sample)/float64(maxValue))
+			bits -= bitsPerSample
+			if bits == 0 {
+				buf = 0
+			} else {
+				buf &= (uint64(1) << bits) - 1
+			}
+		}
 	}
 	return values
 }

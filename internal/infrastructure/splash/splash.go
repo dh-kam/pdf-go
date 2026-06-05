@@ -1,8 +1,6 @@
 package splash
 
-import (
-	"github.com/dh-kam/pdf-go/internal/infrastructure/splash/xpath"
-)
+import "github.com/dh-kam/pdf-go/internal/infrastructure/splash/xpath"
 
 // ImageSource provides one row of image samples per call (Splash.h:50-55).
 // colorLine is filled with srcWidth*nComps bytes; alphaLine, if non-nil,
@@ -31,19 +29,39 @@ type Splash struct {
 	// downscaleVFlipTopDown skips the post-scale vertical flip for callers whose
 	// ImageSource has already been normalized to top-down rows.
 	downscaleVFlipTopDown bool
+	// forceScaleThenFlip bypasses local top-down image downscale shortcuts for a
+	// narrow Poppler scaleImage+vertFlip parity probe.
+	forceScaleThenFlip bool
 	// mirrorStrokeNormals compensates for splashCanvas paths that are already
 	// Y-flipped into device space before Splash.makeStrokePath runs. Poppler builds
 	// stroke outlines in user space and applies the mirrored CTM later in
 	// SplashXPath; flipping the normal here preserves that outline orientation.
 	mirrorStrokeNormals bool
+	// textGlyphPathIntegerSlopeBias nudges exact-integer glyph outline slopes
+	// toward Poppler's callback arithmetic only while Tr 2/6 text glyph paths are
+	// painted. Generic vector paths must not inherit this AA tie-breaker.
+	textGlyphPathIntegerSlopeBias bool
+	// disableClipScannerYFloorSnapOnce keeps a just-painted fill path's AA scanner
+	// phase consistent when the identical path is immediately reused as a clip.
+	disableClipScannerYFloorSnapOnce bool
 	// debugStrokeIndex carries the canvas stroke ordinal into debug-only trace
 	// hooks without affecting normal rendering.
 	debugStrokeIndex int
 	// debugFillIndex carries the canvas fill ordinal into debug-only trace hooks.
 	debugFillIndex int
+	// debugPaintContext carries the active PDF operator path for trace hooks.
+	debugPaintContext string
 	// groupStack holds saved per-group bitmaps + composite parameters for the
 	// transparency-group stack (Splash.cc:5021-5254 + PDF spec 11.4.7).
 	groupStack []*groupState
+	// nonIsoAlpha0 mirrors Splash::alpha0Bitmap while rendering inside a
+	// Poppler-style non-isolated transparency group.
+	nonIsoAlpha0  *Bitmap
+	nonIsoAlpha0X int
+	nonIsoAlpha0Y int
+	// freshPatternAlphaForNextGroup forces the next transparency group to start
+	// with Poppler's fresh child-Splash pattern-alpha state.
+	freshPatternAlphaForNextGroup bool
 }
 
 // New constructs a Splash bound to b (Splash.cc:1445).
@@ -71,6 +89,7 @@ func New(b *Bitmap, vectorAA bool) (*Splash, error) {
 			strokeAdjust:       false,
 		},
 	}
+	s.state.resetTransfer()
 	s.state.clip = xpath.NewClip(0, 0, b.Width()-1, b.Height()-1, vectorAA)
 	if vectorAA && b.Width() > 0 {
 		s.aaBuf = make([]byte, splashAASize*b.Width())
@@ -159,7 +178,64 @@ func (s *Splash) SetBlendFunc(f BlendFunc) { s.state.blendFunc = f }
 // SetSoftMask installs a single-channel ModeMono8 alpha mask consulted per
 // pixel inside the AA pipe (Splash.cc:1709-1712 + Splash.cc:475-485,
 // PDF spec 11.4.7 soft masks). Pass nil to clear.
-func (s *Splash) SetSoftMask(mask *Bitmap) { s.state.softMask = mask }
+func (s *Splash) SetSoftMask(mask *Bitmap) {
+	if s == nil || s.state == nil {
+		return
+	}
+	s.state.softMask = mask
+	s.state.softMaskClip = clipBoundsSnapshot{}
+	s.state.softMaskClipOK = false
+}
+
+func (s *Splash) setSoftMaskWithClip(mask *Bitmap, clip clipBoundsSnapshot, clipOK bool) {
+	if s == nil || s.state == nil {
+		return
+	}
+	s.state.softMask = mask
+	if mask != nil && clipOK {
+		s.state.softMaskClip = clip
+		s.state.softMaskClipOK = true
+		return
+	}
+	s.state.softMaskClip = clipBoundsSnapshot{}
+	s.state.softMaskClipOK = false
+}
+
+func (s *Splash) captureSoftMaskState() softMaskStateSnapshot {
+	if s == nil || s.state == nil {
+		return softMaskStateSnapshot{}
+	}
+	return softMaskStateSnapshot{
+		mask:   s.state.softMask,
+		clip:   s.state.softMaskClip,
+		clipOK: s.state.softMaskClipOK,
+	}
+}
+
+func (s *Splash) restoreSoftMaskState(snapshot softMaskStateSnapshot) {
+	if s == nil || s.state == nil {
+		return
+	}
+	s.state.softMask = snapshot.mask
+	s.state.softMaskClip = snapshot.clip
+	s.state.softMaskClipOK = snapshot.clipOK
+}
+
+// SetTransfer installs Poppler-style transfer lookup tables (Splash::setTransfer).
+func (s *Splash) SetTransfer(red, green, blue, gray [256]byte) {
+	if s == nil || s.state == nil {
+		return
+	}
+	s.state.setTransfer(red, green, blue, gray)
+}
+
+// ResetTransfer restores identity transfer lookup tables.
+func (s *Splash) ResetTransfer() {
+	if s == nil || s.state == nil {
+		return
+	}
+	s.state.resetTransfer()
+}
 
 // SaveState pushes the current state onto the stack (Splash.cc:1737).
 func (s *Splash) SaveState() {
@@ -190,7 +266,17 @@ func (s *Splash) ClipToRect(x0, y0, x1, y1 float64) error {
 
 // ClipToPath intersects the clip with a path (Splash.cc:1704).
 func (s *Splash) ClipToPath(p *xpath.Path, eo bool) error {
+	if s.disableClipScannerYFloorSnapOnce {
+		s.disableClipScannerYFloorSnapOnce = false
+		return s.ensureClip().ClipToPathWithYFloorSnapEps(p, s.state.matrix, s.state.flatness, eo, 0)
+	}
 	return s.ensureClip().ClipToPath(p, s.state.matrix, s.state.flatness, eo)
+}
+
+func (s *Splash) disableNextClipScannerYFloorSnap() {
+	if s != nil {
+		s.disableClipScannerYFloorSnapOnce = true
+	}
 }
 
 func (s *Splash) ensureClip() *xpath.Clip {

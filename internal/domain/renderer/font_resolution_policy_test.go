@@ -61,8 +61,55 @@ func TestResolveType0FontCandidate_DelegatesToResolverForDescendantSubtype(t *te
 	assert.Equal(t, "ParentType0", resolver.base)
 }
 
+func TestWrapCIDFontType0CWithCIDToGIDMap_DefaultKeepsRawCIDGlyphIDs(t *testing.T) {
+	eval := NewEvaluator(nil)
+	font := &cidToGIDMapTestFont{
+		glyphRenderTestFont: &glyphRenderTestFont{
+			name:    "RawCIDType0C",
+			charMap: map[uint32]uint32{3296: 3296},
+		},
+		cidToGID: map[uint32]uint32{3296: 22},
+	}
+
+	wrapped := eval.wrapCIDFontType0CWithCIDToGIDMap(font)
+
+	require.IsType(t, &cidDirectFont{}, wrapped)
+	assert.True(t, wrapped.IsCIDFont())
+	glyph, err := wrapped.CharCodeToGlyph(3296)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(3296), glyph)
+}
+
+func TestWrapCIDFontType0CWithCIDToGIDMap_DebugGateEnablesMap(t *testing.T) {
+	t.Setenv("PDF_DEBUG_CIDTYPE0C_CIDTOGID_MAP", "1")
+	eval := NewEvaluator(nil)
+	font := &cidToGIDMapTestFont{
+		glyphRenderTestFont: &glyphRenderTestFont{
+			name:    "RawCIDType0C",
+			charMap: map[uint32]uint32{3296: 3296},
+		},
+		cidToGID: map[uint32]uint32{3296: 22},
+	}
+
+	wrapped := eval.wrapCIDFontType0CWithCIDToGIDMap(font)
+
+	require.IsType(t, &cidToGIDMappedFont{}, wrapped)
+	glyph, err := wrapped.CharCodeToGlyph(3296)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(22), glyph)
+}
+
 func TestDefaultFontCandidateResolver_Type3ReturnsFont(t *testing.T) {
 	eval := NewEvaluator(nil)
 	resolved := defaultFontCandidateResolver{}.ResolveCandidate(eval, entity.NewDict(), "Type3", "Type3Font", nil, assert.AnError)
 	assert.NotNil(t, resolved)
+}
+
+type cidToGIDMapTestFont struct {
+	*glyphRenderTestFont
+	cidToGID map[uint32]uint32
+}
+
+func (f *cidToGIDMapTestFont) CIDToGIDMap() (map[uint32]uint32, bool) {
+	return f.cidToGID, len(f.cidToGID) > 0
 }

@@ -29,6 +29,34 @@ func makeRGBCell(t *testing.T, w, h int, src []byte) *Bitmap {
 	return bm
 }
 
+func makeRGBAlphaCell(t *testing.T, w, h int, src, alpha []byte) *Bitmap {
+	t.Helper()
+	if len(src) != 3*w*h {
+		t.Fatalf("makeRGBAlphaCell: src len %d != %d", len(src), 3*w*h)
+	}
+	if len(alpha) != w*h {
+		t.Fatalf("makeRGBAlphaCell: alpha len %d != %d", len(alpha), w*h)
+	}
+	bm := NewBitmap(w, h, ModeRGB8, true)
+	copy(bm.Data(), src)
+	copy(bm.Alpha(), alpha)
+	return bm
+}
+
+func makeMonoAlphaCell(t *testing.T, w, h int, src, alpha []byte) *Bitmap {
+	t.Helper()
+	if len(src) != w*h {
+		t.Fatalf("makeMonoAlphaCell: src len %d != %d", len(src), w*h)
+	}
+	if len(alpha) != w*h {
+		t.Fatalf("makeMonoAlphaCell: alpha len %d != %d", len(alpha), w*h)
+	}
+	bm := NewBitmap(w, h, ModeMono8, true)
+	copy(bm.Data(), src)
+	copy(bm.Alpha(), alpha)
+	return bm
+}
+
 // identMatrix is the identity affine [1 0 0 1 0 0].
 var identMatrix = [6]float64{1, 0, 0, 1, 0, 0}
 
@@ -234,6 +262,72 @@ func TestTilingPatternPaintType1NoTint(t *testing.T) {
 	pat.GetColor(1, 0, &c)
 	if c[0] != 0 || c[1] != 255 || c[2] != 128 {
 		t.Fatalf("paint1 (1,0): got %v want [0 255 128]", c[:3])
+	}
+}
+
+func TestTilingPatternPaintType1AlphaUsesPreviousLastColumn(t *testing.T) {
+	rgb := []byte{
+		255, 0, 0,
+		0, 255, 0,
+		0, 0, 255,
+	}
+	alpha := []byte{255, 128, 0}
+	bm := makeRGBAlphaCell(t, 3, 1, rgb, alpha)
+	pat := NewTilingPattern(bm, [4]float64{0, 0, 3, 1}, 3, 1, identMatrix, 1, Color{})
+
+	if got := pat.PatternAlpha(2, 0); got != 128 {
+		t.Fatalf("last-column alpha = %d, want previous pixel alpha 128", got)
+	}
+	var c Color
+	if !pat.GetColor(2, 0, &c) {
+		t.Fatalf("last-column GetColor should use previous alpha coverage")
+	}
+	if c[0] != 0 || c[1] != 0 || c[2] != 255 {
+		t.Fatalf("last-column color = %v, want raw last pixel blue", c[:3])
+	}
+}
+
+func TestTilingPatternPaintType2AlphaUsesPreviousLastRowWhenTall(t *testing.T) {
+	h := 52
+	src := make([]byte, h)
+	alpha := make([]byte, h)
+	for y := 0; y < h; y++ {
+		src[y] = byte(y)
+		alpha[y] = byte(y)
+	}
+	alpha[h-1] = 0
+	alpha[h-2] = 90
+	bm := makeMonoAlphaCell(t, 1, h, src, alpha)
+	pat := NewTilingPatternWithMode(bm, [4]float64{0, 0, 1, float64(h)}, 1, float64(h), identMatrix, 2, Color{255, 0, 0}, ModeRGB8)
+
+	if got := pat.PatternAlpha(0, h-1); got != 90 {
+		t.Fatalf("tall last-row alpha = %d, want previous row alpha 90", got)
+	}
+	var c Color
+	if !pat.GetColor(0, h-1, &c) {
+		t.Fatalf("tall last-row GetColor should use previous row alpha coverage")
+	}
+}
+
+func TestTilingPatternPaintType2AlphaKeepsLastRowAtHeight51(t *testing.T) {
+	h := 51
+	src := make([]byte, h)
+	alpha := make([]byte, h)
+	for y := 0; y < h; y++ {
+		src[y] = byte(y)
+		alpha[y] = 200
+	}
+	alpha[h-1] = 0
+	alpha[h-2] = 90
+	bm := makeMonoAlphaCell(t, 1, h, src, alpha)
+	pat := NewTilingPatternWithMode(bm, [4]float64{0, 0, 1, float64(h)}, 1, float64(h), identMatrix, 2, Color{255, 0, 0}, ModeRGB8)
+
+	if got := pat.PatternAlpha(0, h-1); got != 0 {
+		t.Fatalf("height-51 last-row alpha = %d, want raw last row alpha 0", got)
+	}
+	var c Color
+	if pat.GetColor(0, h-1, &c) {
+		t.Fatalf("height-51 last row should keep raw zero alpha")
 	}
 }
 

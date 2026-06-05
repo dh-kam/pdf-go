@@ -1043,235 +1043,142 @@ func (f *FontFile) parsePostTable(r io.ReadSeeker, entry TableEntry) error {
 func (f *FontFile) parseOS2Table(r io.Reader, entry TableEntry) error {
 	table := &OS2Table{}
 
-	// Read version
-	if err := binary.Read(r, binary.BigEndian, &table.Version); err != nil {
+	data, err := readTablePayload(r, entry.Length)
+	if err != nil {
 		return err
 	}
-	if err := binary.Read(r, binary.BigEndian, &table.XAvgCharWidth); err != nil {
-		return err
-	}
-	if err := binary.Read(r, binary.BigEndian, &table.WeightClass); err != nil {
-		return err
-	}
-	if err := binary.Read(r, binary.BigEndian, &table.WidthClass); err != nil {
-		return err
-	}
-	if err := binary.Read(r, binary.BigEndian, &table.FsType); err != nil {
-		return err
-	}
-	// Read more fields for version 1 and later
-	if table.Version >= 1 {
-		if err := binary.Read(r, binary.BigEndian, &table.YSubscriptXSize); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.YSubscriptYSize); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.YSubscriptXOffset); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.YSubscriptYOffset); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.YSuperscriptXSize); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.YSuperscriptYSize); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.YSuperscriptXOffset); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.YSuperscriptYOffset); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.YStrikeoutSize); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.YStrikeoutPosition); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.FamilyClass); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.Panose[0]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.Panose[1]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.Panose[2]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.Panose[3]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.Panose[4]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.Panose[5]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.Panose[6]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.Panose[7]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.Panose[8]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.Panose[9]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange1[0]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange1[1]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange1[2]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange1[3]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange2[0]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange2[1]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange2[2]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange2[3]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange3[0]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange3[1]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange3[2]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange3[3]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange4[0]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange4[1]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange4[2]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.UnicodeRange4[3]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.VendorID[0]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.VendorID[1]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.VendorID[2]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.VendorID[3]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.Selection[0]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.Selection[1]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.FirstCharIndex); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.LastCharIndex); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.TypoAscender); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.TypoDescender); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.TypoLineGap); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.WinAscent); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.WinDescent); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.WinLineGap); err != nil {
-			return err
-		}
+	if len(data) < 10 {
+		return io.ErrUnexpectedEOF
 	}
 
-	if table.Version >= 2 {
-		if err := binary.Read(r, binary.BigEndian, &table.USWeight); err != nil {
-			return err
+	u16 := func(off int) (uint16, bool) {
+		if off+2 > len(data) {
+			return 0, false
 		}
-		if err := binary.Read(r, binary.BigEndian, &table.USWidthClass); err != nil {
-			return err
+		return binary.BigEndian.Uint16(data[off : off+2]), true
+	}
+	i16 := func(off int) (int16, bool) {
+		v, ok := u16(off)
+		return int16(v), ok
+	}
+	u32 := func(off int) (uint32, bool) {
+		if off+4 > len(data) {
+			return 0, false
 		}
-		if err := binary.Read(r, binary.BigEndian, &table.SubscriptXSize); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.SubscriptYSize); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.SubscriptXOffset); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.SubscriptYOffset); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.SuperscriptXSize); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.SuperscriptYSize); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.SuperscriptXOffset); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.SuperscriptYOffset); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.StrikeoutSize); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.StrikeoutPosition); err != nil {
-			return err
-		}
+		return binary.BigEndian.Uint32(data[off : off+4]), true
 	}
 
-	if table.Version >= 5 {
-		if err := binary.Read(r, binary.BigEndian, &table.VendorID[0]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.VendorID[1]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.VendorID[2]); err != nil {
-			return err
-		}
-		if err := binary.Read(r, binary.BigEndian, &table.VendorID[3]); err != nil {
-			return err
-		}
+	table.Version = binary.BigEndian.Uint16(data[0:2])
+	table.XAvgCharWidth = int16(binary.BigEndian.Uint16(data[2:4]))
+	table.WeightClass = binary.BigEndian.Uint16(data[4:6])
+	table.WidthClass = binary.BigEndian.Uint16(data[6:8])
+	table.FsType = binary.BigEndian.Uint16(data[8:10])
+
+	if v, ok := i16(10); ok {
+		table.YSubscriptXSize = v
+	}
+	if v, ok := i16(12); ok {
+		table.YSubscriptYSize = v
+	}
+	if v, ok := i16(14); ok {
+		table.YSubscriptXOffset = v
+	}
+	if v, ok := i16(16); ok {
+		table.YSubscriptYOffset = v
+	}
+	if v, ok := i16(18); ok {
+		table.YSuperscriptXSize = v
+	}
+	if v, ok := i16(20); ok {
+		table.YSuperscriptYSize = v
+	}
+	if v, ok := i16(22); ok {
+		table.YSuperscriptXOffset = v
+	}
+	if v, ok := i16(24); ok {
+		table.YSuperscriptYOffset = v
+	}
+	if v, ok := i16(26); ok {
+		table.YStrikeoutSize = v
+	}
+	if v, ok := i16(28); ok {
+		table.YStrikeoutPosition = v
+	}
+	if v, ok := i16(30); ok {
+		table.FamilyClass = v
+	}
+	if len(data) >= 42 {
+		copy(table.Panose[:], data[32:42])
+	}
+	if v, ok := u32(42); ok {
+		table.UnicodeRange1[0] = v
+	}
+	if v, ok := u32(46); ok {
+		table.UnicodeRange2[0] = v
+	}
+	if v, ok := u32(50); ok {
+		table.UnicodeRange3[0] = v
+	}
+	if v, ok := u32(54); ok {
+		table.UnicodeRange4[0] = v
+	}
+	if len(data) >= 62 {
+		copy(table.VendorID[:], data[58:62])
+	}
+	if v, ok := u16(62); ok {
+		table.Selection[0] = v
+	}
+	if v, ok := u16(64); ok {
+		table.FirstCharIndex = v
+	}
+	if v, ok := u16(66); ok {
+		table.LastCharIndex = v
+	}
+	if v, ok := i16(68); ok {
+		table.TypoAscender = v
+	}
+	if v, ok := i16(70); ok {
+		table.TypoDescender = v
+	}
+	if v, ok := i16(72); ok {
+		table.TypoLineGap = v
+	}
+	if v, ok := u16(74); ok {
+		table.WinAscent = v
+	}
+	if v, ok := u16(76); ok {
+		table.WinDescent = v
+	}
+	if v, ok := i16(86); ok {
+		table.SubscriptXSize = v
+	}
+	if v, ok := i16(88); ok {
+		table.SubscriptYSize = v
+	}
+	if v, ok := i16(90); ok {
+		table.SubscriptXOffset = v
+	}
+	if v, ok := i16(92); ok {
+		table.SubscriptYOffset = v
+	}
+	if v, ok := u16(94); ok {
+		table.USWidthClass = v
 	}
 
 	f.OS2 = table
 	return nil
+}
+
+func readTablePayload(r io.Reader, length uint32) ([]byte, error) {
+	if length == 0 {
+		return io.ReadAll(r)
+	}
+	buf := make([]byte, length)
+	_, err := io.ReadFull(r, buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 // GetGlyphData returns the glyph data for a given glyph ID.

@@ -14,6 +14,13 @@ func TestNormalizeBaseFontName(t *testing.T) {
 	assert.Equal(t, "Helvetica", normalizeBaseFontName("CUBAGX+SFSX1440"))
 	assert.Equal(t, "Helvetica-Bold", normalizeBaseFontName("OUCZRR+NimbusSanL-Bold"))
 	assert.Equal(t, "Helvetica-Bold", normalizeBaseFontName("ZBVPYI+Calibri-Bold"))
+	assert.Equal(t, "Helvetica", normalizeBaseFontName("ArialMT"))
+	assert.Equal(t, "Helvetica-Bold", normalizeBaseFontName("Arial-BoldMT"))
+	assert.Equal(t, "Helvetica-Oblique", normalizeBaseFontName("Arial-ItalicMT"))
+	assert.Equal(t, "Helvetica-BoldOblique", normalizeBaseFontName("Arial-BoldItalicMT"))
+	assert.Equal(t, "Courier", normalizeBaseFontName("CourierNewPSMT"))
+	assert.Equal(t, "Times-BoldItalic", normalizeBaseFontName("TimesNewRomanPS-BoldItalicMT"))
+	assert.Equal(t, "Symbol", normalizeBaseFontName("SymbolMT"))
 }
 
 func TestStripSubsetPrefix_TrimsSlashAndSubsetPrefix(t *testing.T) {

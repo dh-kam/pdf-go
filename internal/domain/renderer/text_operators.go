@@ -2,6 +2,7 @@ package renderer
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -52,7 +53,10 @@ func (e *Evaluator) renderTextCharByChar(text string, font entity.Font, fontSize
 		if e.canvas != nil {
 			if type3Font != nil {
 				if err := e.renderType3Glyph(type3Font, codeUnit.code, x, y, fontSize); err != nil {
-					// Log but continue rendering other glyphs
+					if os.Getenv("PDF_DEBUG_TYPE3_ERRORS") == "1" {
+						fmt.Fprintf(os.Stderr, "PDF_TYPE3_RENDER_SKIP font=%q code=%d x=%.6f y=%.6f size=%.6f err=%v\n",
+							type3Font.Name(), codeUnit.code, x, y, fontSize, err)
+					}
 					continue
 				}
 			} else {

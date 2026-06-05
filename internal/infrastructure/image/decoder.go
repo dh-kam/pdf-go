@@ -14,6 +14,7 @@ import (
 	"image/color"
 	"io"
 	"math"
+	"os"
 
 	"github.com/dh-kam/pdf-go/internal/domain/colorspace"
 	"github.com/dh-kam/pdf-go/internal/domain/errors"
@@ -76,6 +77,15 @@ func (d *Decoder) Decode(data *image.ImageData) (image.Image, error) {
 	switch data.Filter {
 	case image.FilterDCT:
 		// JPEG
+		traceDeviceCMYKDCTDecodeCandidate(rawData, data)
+		if shouldDecodeDeviceCMYKDCTWithPopplerLine(data) {
+			if img, err = decodeDeviceCMYKDCTWithPopplerLine(rawData, data.Width, data.Height); err == nil {
+				colorSpace = data.ColorSpace
+				decodeApplied = false
+				iccApplied = false
+				break
+			}
+		}
 		decoder, ok := d.decoders[image.FilterDCT]
 		if !ok {
 			return nil, errors.NotFoundf("image_decoder", "no decoder for filter: %s", data.Filter)
@@ -170,6 +180,21 @@ func (d *Decoder) Decode(data *image.ImageData) (image.Image, error) {
 	}
 
 	return result, nil
+}
+
+func shouldDecodeDeviceCMYKDCTWithPopplerLine(data *image.ImageData) bool {
+	// System Poppler/libjpeg matches the Splash line conversion for DeviceCMYK
+	// DCT images in the 2nd corpus; keep it enabled unless explicitly disabled
+	// for diagnostics.
+	popplerLineEnabled := os.Getenv(disableDCTDeviceCMYKPopplerLineEnv) != "1" ||
+		forcedDCTDeviceCMYKBranch() != dctDeviceCMYKBranchAuto
+	return popplerLineEnabled &&
+		data != nil &&
+		data.Filter == image.FilterDCT &&
+		data.ColorSpace == image.ColorSpaceDeviceCMYK &&
+		data.BitsPerComponent == 8 &&
+		len(data.Decode) == 0 &&
+		len(data.ICCProfile) == 0
 }
 
 func jbig2DecodeOptions(data *image.ImageData) jbig2.DecodeOptions {
@@ -284,9 +309,13 @@ func (d *Decoder) decodeRawImage(data []byte, imgData *image.ImageData, decode [
 		bytesPerPixel = 1
 	case image.ColorSpaceDeviceRGB:
 		bytesPerPixel = 3
+	case image.ColorSpaceCalRGB:
+		bytesPerPixel = 3
 	case image.ColorSpaceDeviceCMYK:
 		bytesPerPixel = 4
 	case image.ColorSpaceIndexed:
+		bytesPerPixel = 1
+	case image.ColorSpaceSeparation:
 		bytesPerPixel = 1
 	default:
 		bytesPerPixel = 3 // Default to RGB
@@ -304,7 +333,17 @@ func (d *Decoder) decodeRawImage(data []byte, imgData *image.ImageData, decode [
 		return d.decodeGrayImage(data, width, height, bpc, bytesPerRow, decode, imgData.ICCProfile)
 
 	case image.ColorSpaceDeviceRGB:
+		if transform, ok := newPopplerRGBICCTransform(imgData); ok {
+			rgba, err := d.decodeRGBImage(data, width, height, bpc, bytesPerRow, decode, nil)
+			if err != nil {
+				return nil, err
+			}
+			return &postScaleICCRGBImage{RGBA: rgba, transform: transform}, nil
+		}
 		return d.decodeRGBImage(data, width, height, bpc, bytesPerRow, decode, imgData.ICCProfile)
+
+	case image.ColorSpaceCalRGB:
+		return d.decodeMappedRGBImage(data, width, height, bpc, bytesPerRow, decode, imgData.ColorMapper)
 
 	case image.ColorSpaceDeviceCMYK:
 		return d.decodeCMYKImage(data, width, height, bpc, bytesPerRow, decode, imgData.ICCProfile, imgData.CMYKConversionMode)
@@ -323,9 +362,129 @@ func (d *Decoder) decodeRawImage(data []byte, imgData *image.ImageData, decode [
 			imgData.CMYKConversionMode,
 		)
 
+	case image.ColorSpaceSeparation:
+		return d.decodeSeparationImage(data, width, height, bpc, bytesPerRow, decode, imgData.ColorMapper)
+
 	default:
 		return nil, errors.Invalid("colorspace", fmt.Errorf("unsupported color space: %s", cs))
 	}
+}
+
+func (d *Decoder) decodeMappedRGBImage(
+	data []byte,
+	width, height, bpc, bytesPerRow int,
+	decode []float64,
+	mapper image.ColorMapper,
+) (*stdimage.RGBA, error) {
+	if mapper == nil {
+		return nil, errors.Invalid("mapped_rgb_mapper", fmt.Errorf("missing mapped RGB image color mapper"))
+	}
+	if mapper.GetNumComponents() != 3 {
+		return nil, errors.Invalid("mapped_rgb_mapper", fmt.Errorf("unsupported mapped RGB component count: %d", mapper.GetNumComponents()))
+	}
+
+	img := stdimage.NewRGBA(stdimage.Rect(0, 0, width, height))
+	pix := img.Pix
+	stride := img.Stride
+	maxValue := rawImageComponentMaxValue(bpc)
+	if maxValue <= 0 {
+		return nil, errors.Invalid("mapped_rgb_bpc", fmt.Errorf("unsupported mapped RGB bits per component: %d", bpc))
+	}
+
+	for y := 0; y < height; y++ {
+		rowStart := y * bytesPerRow
+		dstRow := y * stride
+		bitOffset := 0
+		for x := 0; x < width; x++ {
+			var components [3]float64
+			if bpc == 8 {
+				idx := rowStart + x*3
+				if idx+2 >= len(data) {
+					break
+				}
+				components[0] = decodeSample(float64(data[idx]), decode, 0, maxValue, false) / maxValue
+				components[1] = decodeSample(float64(data[idx+1]), decode, 1, maxValue, false) / maxValue
+				components[2] = decodeSample(float64(data[idx+2]), decode, 2, maxValue, false) / maxValue
+			} else {
+				for c := 0; c < 3; c++ {
+					value := float64(readRawImageComponent(data, rowStart, bitOffset, bpc))
+					components[c] = decodeSample(value, decode, c, maxValue, false) / maxValue
+					bitOffset += bpc
+				}
+			}
+
+			rgba := mapper.ConvertToRGBA(components[:])
+			dst := dstRow + x*4
+			pix[dst] = rgba.R
+			pix[dst+1] = rgba.G
+			pix[dst+2] = rgba.B
+			pix[dst+3] = rgba.A
+		}
+	}
+
+	return img, nil
+}
+
+type separationImageColorMapper interface {
+	ConvertImageTintToRGBA(float64) color.RGBA
+}
+
+func (d *Decoder) decodeSeparationImage(
+	data []byte,
+	width, height, bpc, bytesPerRow int,
+	decode []float64,
+	mapper image.ColorMapper,
+) (*stdimage.RGBA, error) {
+	if mapper == nil {
+		return nil, errors.Invalid("separation_mapper", fmt.Errorf("missing Separation image color mapper"))
+	}
+	if mapper.GetNumComponents() != 1 {
+		return nil, errors.Invalid("separation_mapper", fmt.Errorf("unsupported Separation component count: %d", mapper.GetNumComponents()))
+	}
+
+	img := stdimage.NewRGBA(stdimage.Rect(0, 0, width, height))
+	pix := img.Pix
+	stride := img.Stride
+	maxValue := rawImageComponentMaxValue(bpc)
+	if maxValue <= 0 {
+		return nil, errors.Invalid("separation_bpc", fmt.Errorf("unsupported Separation bits per component: %d", bpc))
+	}
+
+	imageMapper, hasImageMapper := mapper.(separationImageColorMapper)
+	convertTint := func(tint float64) color.RGBA {
+		if hasImageMapper {
+			return imageMapper.ConvertImageTintToRGBA(tint)
+		}
+		return mapper.ConvertToRGBA([]float64{tint})
+	}
+
+	for y := 0; y < height; y++ {
+		rowStart := y * bytesPerRow
+		dstRow := y * stride
+		bitOffset := 0
+		for x := 0; x < width; x++ {
+			var sample float64
+			if bpc == 8 {
+				src := rowStart + x
+				if src >= len(data) {
+					break
+				}
+				sample = float64(data[src])
+			} else {
+				sample = float64(readRawImageComponent(data, rowStart, bitOffset, bpc))
+				bitOffset += bpc
+			}
+			sample = decodeSample(sample, decode, 0, maxValue, false)
+			rgba := convertTint(sample / maxValue)
+			dst := dstRow + x*4
+			pix[dst] = rgba.R
+			pix[dst+1] = rgba.G
+			pix[dst+2] = rgba.B
+			pix[dst+3] = rgba.A
+		}
+	}
+
+	return img, nil
 }
 
 func (d *Decoder) decodeIndexedImage(
@@ -361,10 +520,6 @@ func (d *Decoder) decodeIndexedImage(
 
 	maxPaletteIndex := len(lookup)/components - 1
 	maxValue := float64((uint64(1) << uint(bpc)) - 1)
-	decodeMaxValue := maxValue
-	if float64(maxPaletteIndex) < decodeMaxValue {
-		decodeMaxValue = float64(maxPaletteIndex)
-	}
 	sampleMask := uint8((uint64(1) << uint(bpc)) - 1)
 	curves, _ := parseICCChannelCurves(iccProfile, components)
 
@@ -376,6 +531,12 @@ func (d *Decoder) decodeIndexedImage(
 	if base == image.ColorSpaceDeviceCMYK {
 		cmykPaletteRGB = lookupCMYKIndexedLUT023(lookup)
 	}
+	// Poppler's SplashOutputDev builds one-component image lookup tables with
+	// GfxImageColorMap::getRGB(), not the direct DeviceCMYK getRGBLine path.
+	usePopplerIndexedCMYKLookup := base == image.ColorSpaceDeviceCMYK &&
+		cmykConversionMode == image.CMYKConversionModeDefault &&
+		len(iccProfile) == 0 &&
+		os.Getenv("PDF_DEBUG_DISABLE_INDEXED_CMYK_POPPLER_LOOKUP") != "1"
 
 	img := stdimage.NewRGBA(stdimage.Rect(0, 0, width, height))
 	pix := img.Pix
@@ -397,7 +558,7 @@ func (d *Decoder) decodeIndexedImage(
 				idx = int((data[byteIdx] >> bitShift) & sampleMask)
 			}
 			if len(decode) >= 2 {
-				idx = int(decodeSample(float64(idx), decode, 0, decodeMaxValue, true))
+				idx = int(decodeSample(float64(idx), decode, 0, maxValue, true))
 			}
 			if idx > maxPaletteIndex {
 				idx = maxPaletteIndex
@@ -445,6 +606,14 @@ func (d *Decoder) decodeIndexedImage(
 					yComp = applyCurvesToByte(yComp, 2, curves)
 					k = applyCurvesToByte(k, 3, curves)
 					rgba := convertCMYKToRGBA(c, m, yComp, k, cmykConversionMode)
+					if usePopplerIndexedCMYKLookup {
+						rgba = colorspace.ConvertDeviceCMYKToRGBA([]float64{
+							float64(c) / 255.0,
+							float64(m) / 255.0,
+							float64(yComp) / 255.0,
+							float64(k) / 255.0,
+						})
+					}
 					pix[dst] = rgba.R
 					pix[dst+1] = rgba.G
 					pix[dst+2] = rgba.B
@@ -490,28 +659,19 @@ func (d *Decoder) decodeGrayImage(
 		}
 	} else {
 		// Other bit depths
-		maxIntValue := (1 << uint(bpc)) - 1
-		maxValue := float64(maxIntValue)
+		maxValue := rawImageComponentMaxValue(bpc)
 		for y := 0; y < height; y++ {
 			rowStart := y * bytesPerRow
 			dstRow := y * stride
 			bitOffset := 0
 			for x := 0; x < width; x++ {
-				byteOffset := bitOffset / 8
-				bitShift := 8 - bpc - (bitOffset % 8)
-				if bitShift < 0 {
-					bitShift = 0
+				value := float64(readRawImageComponent(data, rowStart, bitOffset, bpc))
+				value = decodeSample(value, decode, 0, maxValue, false)
+				v := scaleSampleToByte(value, maxValue)
+				if curve != nil {
+					v = applyCurveToByte(v, curve)
 				}
-				byteIdx := rowStart + byteOffset
-				if byteIdx < len(data) {
-					value := float64((data[byteIdx] >> bitShift) & uint8(maxIntValue))
-					value = decodeSample(value, decode, 0, maxValue, false)
-					v := scaleSampleToByte(value, maxValue)
-					if curve != nil {
-						v = applyCurveToByte(v, curve)
-					}
-					pix[dstRow+x] = v
-				}
+				pix[dstRow+x] = v
 				bitOffset += bpc
 			}
 		}
@@ -557,8 +717,7 @@ func (d *Decoder) decodeRGBImage(
 		}
 	} else {
 		// Other bit depths
-		maxIntValue := (1 << uint(bpc)) - 1
-		maxValue := float64(maxIntValue)
+		maxValue := rawImageComponentMaxValue(bpc)
 		for y := 0; y < height; y++ {
 			rowStart := y * bytesPerRow
 			dstRow := y * stride
@@ -566,16 +725,7 @@ func (d *Decoder) decodeRGBImage(
 			for x := 0; x < width; x++ {
 				var r, g, b float64
 				for c := 0; c < 3; c++ {
-					byteOffset := bitOffset / 8
-					bitShift := 8 - bpc - (bitOffset % 8)
-					if bitShift < 0 {
-						bitShift = 0
-					}
-					byteIdx := rowStart + byteOffset
-					value := float64(0)
-					if byteIdx < len(data) {
-						value = float64((data[byteIdx] >> bitShift) & uint8(maxIntValue))
-					}
+					value := float64(readRawImageComponent(data, rowStart, bitOffset, bpc))
 					value = decodeSample(value, decode, c, maxValue, false)
 					switch c {
 					case 0:
@@ -653,8 +803,7 @@ func (d *Decoder) decodeCMYKImage(
 		}
 	} else {
 		// Other bit depths
-		maxIntValue := (1 << uint(bpc)) - 1
-		maxValue := float64(maxIntValue)
+		maxValue := rawImageComponentMaxValue(bpc)
 		for y := 0; y < height; y++ {
 			rowStart := y * bytesPerRow
 			dstRow := y * stride
@@ -662,16 +811,7 @@ func (d *Decoder) decodeCMYKImage(
 			for x := 0; x < width; x++ {
 				var c, m, yComponent, k float64
 				for ch := 0; ch < 4; ch++ {
-					byteOffset := bitOffset / 8
-					bitShift := 8 - bpc - (bitOffset % 8)
-					if bitShift < 0 {
-						bitShift = 0
-					}
-					byteIdx := rowStart + byteOffset
-					value := float64(0)
-					if byteIdx < len(data) {
-						value = float64((data[byteIdx] >> bitShift) & uint8(maxIntValue))
-					}
+					value := float64(readRawImageComponent(data, rowStart, bitOffset, bpc))
 					value = decodeSample(value, decode, ch, maxValue, false)
 					switch ch {
 					case 0:
@@ -836,9 +976,55 @@ func decodeSample(value float64, decode []float64, componentIndex int, maxValue 
 	return decoded
 }
 
+func rawImageComponentMaxValue(bpc int) float64 {
+	if bpc <= 0 {
+		return 0
+	}
+	if bpc > 8 {
+		return 255
+	}
+	maxValue := (uint64(1) << uint(bpc)) - 1
+	return float64(maxValue)
+}
+
+func readRawImageComponent(data []byte, rowStart, bitOffset, bpc int) uint8 {
+	if bpc <= 0 {
+		return 0
+	}
+	if bpc == 16 {
+		byteIdx := rowStart + bitOffset/8
+		if byteIdx >= 0 && byteIdx < len(data) {
+			return data[byteIdx]
+		}
+		return 0
+	}
+
+	var sample uint32
+	for i := 0; i < bpc; i++ {
+		bitPos := bitOffset + i
+		byteIdx := rowStart + bitPos/8
+		sample <<= 1
+		if byteIdx < 0 || byteIdx >= len(data) {
+			continue
+		}
+		bitShift := 7 - (bitPos % 8)
+		sample |= uint32((data[byteIdx] >> bitShift) & 1)
+	}
+	return uint8(sample)
+}
+
 func scaleSampleToByte(value float64, maxValue float64) uint8 {
 	if maxValue <= 0 {
 		return 0
+	}
+	if os.Getenv("PDF_DEBUG_IMAGE_BYTE_LOOKUP_QUANT") == "1" {
+		mapped := value / maxValue
+		if mapped < 0 {
+			mapped = 0
+		} else if mapped > 1 {
+			mapped = 1
+		}
+		return uint8(mapped*255.0 + 0.5)
 	}
 	return colorspace.ConvertComponentToByte(value / maxValue)
 }
@@ -1044,6 +1230,10 @@ func parseICCChannelCurves(profile []byte, components int) ([]func(float64) floa
 		minTagSize     = 8
 	)
 
+	if components == 3 && isSRGBICCProfile(profile) {
+		return nil, false
+	}
+
 	if len(profile) < tagHeaderStart+4 {
 		return nil, false
 	}
@@ -1101,6 +1291,121 @@ func parseICCChannelCurves(profile []byte, components int) ([]func(float64) floa
 	return curves, true
 }
 
+func isSRGBICCProfile(profile []byte) bool {
+	return bytes.Contains(profile, []byte("sRGB")) ||
+		bytes.Contains(profile, []byte("IEC61966")) ||
+		isSRGBEquivalentMatrixProfile(profile)
+}
+
+func isSRGBEquivalentMatrixProfile(profile []byte) bool {
+	const (
+		tagHeaderStart = 128
+		tagRecordSize  = 12
+	)
+	if len(profile) < tagHeaderStart+4 {
+		return false
+	}
+	if string(profile[16:20]) != "RGB " || string(profile[20:24]) != "XYZ " {
+		return false
+	}
+
+	tagCount := int(binary.BigEndian.Uint32(profile[tagHeaderStart : tagHeaderStart+4]))
+	if tagCount <= 0 {
+		return false
+	}
+
+	rXYZ, ok := parseICCXYZTag(profile, tagCount, tagHeaderStart, tagRecordSize, []byte("rXYZ"))
+	if !ok || !almostICCXYZ(rXYZ, [3]float64{0.43607, 0.22250, 0.01393}) {
+		return false
+	}
+	gXYZ, ok := parseICCXYZTag(profile, tagCount, tagHeaderStart, tagRecordSize, []byte("gXYZ"))
+	if !ok || !almostICCXYZ(gXYZ, [3]float64{0.38506, 0.71688, 0.09710}) {
+		return false
+	}
+	bXYZ, ok := parseICCXYZTag(profile, tagCount, tagHeaderStart, tagRecordSize, []byte("bXYZ"))
+	if !ok || !almostICCXYZ(bXYZ, [3]float64{0.14308, 0.06062, 0.71417}) {
+		return false
+	}
+	wtpt, ok := parseICCXYZTag(profile, tagCount, tagHeaderStart, tagRecordSize, []byte("wtpt"))
+	if !ok || !almostICCXYZ(wtpt, [3]float64{0.96420, 1.0, 0.82490}) {
+		return false
+	}
+
+	return isSRGBParametricTRCTag(profile, tagCount, tagHeaderStart, tagRecordSize, []byte("rTRC")) &&
+		isSRGBParametricTRCTag(profile, tagCount, tagHeaderStart, tagRecordSize, []byte("gTRC")) &&
+		isSRGBParametricTRCTag(profile, tagCount, tagHeaderStart, tagRecordSize, []byte("bTRC"))
+}
+
+func parseICCXYZTag(profile []byte, tagCount, tagHeaderStart, tagRecordSize int, tagName []byte) ([3]float64, bool) {
+	var xyz [3]float64
+	data, ok := parseICCTagData(profile, tagCount, tagHeaderStart, tagRecordSize, 20, tagName)
+	if !ok || string(data[0:4]) != "XYZ " {
+		return xyz, false
+	}
+	xyz[0] = readS15Fixed16(data, 8)
+	xyz[1] = readS15Fixed16(data, 12)
+	xyz[2] = readS15Fixed16(data, 16)
+	return xyz, true
+}
+
+func isSRGBParametricTRCTag(profile []byte, tagCount, tagHeaderStart, tagRecordSize int, tagName []byte) bool {
+	data, ok := parseICCTagData(profile, tagCount, tagHeaderStart, tagRecordSize, 40, tagName)
+	if !ok || string(data[0:4]) != "para" {
+		return false
+	}
+	if int(binary.BigEndian.Uint16(data[8:10])) != 4 {
+		return false
+	}
+	params := parseFixed16Array(data[12:])
+	if len(params) < 7 {
+		return false
+	}
+	expected := []float64{
+		2.4,
+		1.0 / 1.055,
+		0.055 / 1.055,
+		1.0 / 12.92,
+		0.04045,
+		0,
+		0,
+	}
+	for i, want := range expected {
+		if math.Abs(params[i]-want) > 8e-4 {
+			return false
+		}
+	}
+	return true
+}
+
+func parseICCTagData(profile []byte, tagCount, tagHeaderStart, tagRecordSize, minTagSize int, tagName []byte) ([]byte, bool) {
+	for i := 0; i < tagCount; i++ {
+		tagOffset := tagHeaderStart + 4 + i*tagRecordSize
+		if tagOffset+tagRecordSize > len(profile) {
+			return nil, false
+		}
+		if string(profile[tagOffset:tagOffset+4]) != string(tagName) {
+			continue
+		}
+		dataOffset := int(binary.BigEndian.Uint32(profile[tagOffset+4 : tagOffset+8]))
+		dataSize := int(binary.BigEndian.Uint32(profile[tagOffset+8 : tagOffset+12]))
+		if dataOffset < 0 || dataSize < minTagSize || dataOffset+dataSize > len(profile) {
+			return nil, false
+		}
+		return profile[dataOffset : dataOffset+dataSize], true
+	}
+	return nil, false
+}
+
+func almostICCXYZ(got, want [3]float64) bool {
+	const tolerance = 8e-4
+	for i := range got {
+		if math.Abs(got[i]-want[i]) > tolerance {
+			return false
+		}
+	}
+	return true
+}
+
 func parseICCOneCurve(profile []byte, tagCount, tagHeaderStart, tagRecordSize, minTagSize int, tagName []byte) func(float64) float64 {
 	if tagName == nil {
 		return nil
@@ -1152,7 +1457,7 @@ func parseICCParametricCurve(data []byte) func(float64) float64 {
 		return nil
 	}
 
-	funcType := int(math.Round(readS15Fixed16(data, 8)))
+	funcType := int(binary.BigEndian.Uint16(data[8:10]))
 	params := parseFixed16Array(data[12:])
 	switch funcType {
 	case 0:
@@ -1171,52 +1476,52 @@ func parseICCParametricCurve(data []byte) func(float64) float64 {
 			return nil
 		}
 		gamma, a, b := params[0], params[1], params[2]
+		if a == 0 {
+			return nil
+		}
 		threshold := -b / a
 		return func(v float64) float64 {
-			t := a*v + b
-			if a == 0 || t < threshold {
+			if v < threshold {
 				return 0
 			}
-			return math.Pow(t, gamma)
+			return math.Pow(a*v+b, gamma)
 		}
 	case 2:
 		if len(params) < 4 {
 			return nil
 		}
 		gamma, a, b, c := params[0], params[1], params[2], params[3]
+		if a == 0 {
+			return nil
+		}
 		threshold := -b / a
 		return func(v float64) float64 {
-			t := a*v + b
-			if t < threshold {
+			if v < threshold {
 				return c
 			}
-			return math.Pow(t, gamma) + c
+			return math.Pow(a*v+b, gamma) + c
 		}
 	case 3:
 		if len(params) < 5 {
 			return nil
 		}
 		gamma, a, b, c, d := params[0], params[1], params[2], params[3], params[4]
-		threshold := -b / a
 		return func(v float64) float64 {
-			t := a*v + b
-			if t < threshold {
-				return d
+			if v < d {
+				return c * v
 			}
-			return math.Pow(t, gamma) + c
+			return math.Pow(a*v+b, gamma)
 		}
 	case 4:
-		if len(params) < 6 {
+		if len(params) < 7 {
 			return nil
 		}
-		gamma, a, b, c, d, e := params[0], params[1], params[2], params[3], params[4], params[5]
-		threshold := -b / a
+		gamma, a, b, c, d, e, f := params[0], params[1], params[2], params[3], params[4], params[5], params[6]
 		return func(v float64) float64 {
-			t := a*v + b
-			if t < threshold {
-				return d*v + e
+			if v < d {
+				return c*v + f
 			}
-			return math.Pow(t, gamma) + c
+			return math.Pow(a*v+b, gamma) + e
 		}
 	default:
 		return nil

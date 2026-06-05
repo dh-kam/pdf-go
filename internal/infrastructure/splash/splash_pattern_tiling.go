@@ -173,13 +173,8 @@ func (p *TilingPattern) GetColor(x, y int, c *Color) bool {
 	if !ok {
 		return false
 	}
-	cellW := p.CellBitmap.Width()
-	if p.cellHasAlpha {
-		alpha := p.CellBitmap.Alpha()
-		idx := by*cellW + bx
-		if idx < 0 || idx >= len(alpha) || alpha[idx] == 0 {
-			return false
-		}
+	if p.cellHasAlpha && p.tilingBitmapSrcAlphaAtCell(bx, by) == 0 {
+		return false
 	}
 	readBitmapPixel(p.CellBitmap, bx, by, c)
 	if p.PaintType == 2 {
@@ -199,8 +194,26 @@ func (p *TilingPattern) PatternAlpha(x, y int) byte {
 	if !ok {
 		return 0
 	}
+	return p.tilingBitmapSrcAlphaAtCell(bx, by)
+}
+
+func (p *TilingPattern) tilingBitmapSrcAlphaAtCell(bx, by int) byte {
+	if !p.cellHasAlpha {
+		return 255
+	}
 	alpha := p.CellBitmap.Alpha()
 	cellW := p.CellBitmap.Width()
+	cellH := p.CellBitmap.Height()
+	if cellW <= 0 || cellH <= 0 || alpha == nil {
+		return 0
+	}
+	if p.PaintType == 1 {
+		if bx == cellW-1 && cellW > 1 {
+			bx--
+		}
+	} else if by == cellH-1 && by > 50 {
+		by--
+	}
 	idx := by*cellW + bx
 	if idx < 0 || idx >= len(alpha) {
 		return 0

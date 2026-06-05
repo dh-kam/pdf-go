@@ -75,7 +75,7 @@ func BlendMultiply(src, dst, blend *Color, mode ColorMode) {
 func BlendScreen(src, dst, blend *Color, mode ColorMode) {
 	n := nComps(mode)
 	for i := 0; i < n; i++ {
-		blend[i] = byte(int(src[i]) + int(dst[i]) - Div255(int(src[i])*int(dst[i])))
+		blend[i] = byte(int(src[i]) + int(dst[i]) - (int(src[i])*int(dst[i]))/255)
 	}
 	blendCopyExtra(src, blend, n)
 }
@@ -87,9 +87,9 @@ func BlendOverlay(src, dst, blend *Color, mode ColorMode) {
 		cs := int(src[i])
 		cb := int(dst[i])
 		if cb <= 127 {
-			blend[i] = byte(Div255(2 * cs * cb))
+			blend[i] = byte((2 * cs * cb) / 255)
 		} else {
-			blend[i] = byte(2*cs + 2*cb - Div255(2*cs*cb) - 255)
+			blend[i] = byte(255 - (2*((255-cs)*(255-cb)))/255)
 		}
 	}
 	blendCopyExtra(src, blend, n)
@@ -166,9 +166,9 @@ func BlendHardLight(src, dst, blend *Color, mode ColorMode) {
 		cs := int(src[i])
 		cb := int(dst[i])
 		if cs <= 127 {
-			blend[i] = byte(Div255(2 * cs * cb))
+			blend[i] = byte((2 * cs * cb) / 255)
 		} else {
-			blend[i] = byte(2*cs + 2*cb - Div255(2*cs*cb) - 255)
+			blend[i] = byte(255 - (2*((255-cb)*(255-cs)))/255)
 		}
 	}
 	blendCopyExtra(src, blend, n)
@@ -235,7 +235,7 @@ func BlendExclusion(src, dst, blend *Color, mode ColorMode) {
 	for i := 0; i < n; i++ {
 		cs := int(src[i])
 		cb := int(dst[i])
-		blend[i] = byte(cs + cb - 2*Div255(cs*cb))
+		blend[i] = byte(cs + cb - (2*cs*cb)/255)
 	}
 	blendCopyExtra(src, blend, n)
 }

@@ -2,9 +2,11 @@ package splash
 
 import (
 	"errors"
+	"image/color"
 	"testing"
 
 	"github.com/dh-kam/pdf-go/internal/domain/entity"
+	"github.com/dh-kam/pdf-go/internal/infrastructure/splash/xpath"
 )
 
 // stubFont is a minimal entity.Font used to exercise the splash text path
@@ -20,11 +22,11 @@ type stubFont struct {
 	missingPathFor uint32
 }
 
-func (f *stubFont) Name() string                      { return f.name }
-func (f *stubFont) IsCIDFont() bool                   { return false }
-func (f *stubFont) IsSymbolic() bool                  { return false }
-func (f *stubFont) UnitsPerEm() uint16                { return f.unitsPerEm }
-func (f *stubFont) GlyphName(g uint32) string         { return "" }
+func (f *stubFont) Name() string              { return f.name }
+func (f *stubFont) IsCIDFont() bool           { return false }
+func (f *stubFont) IsSymbolic() bool          { return false }
+func (f *stubFont) UnitsPerEm() uint16        { return f.unitsPerEm }
+func (f *stubFont) GlyphName(g uint32) string { return "" }
 func (f *stubFont) GetBoundingBox() (float64, float64, float64, float64) {
 	return 0, 0, 1000, 1000
 }
@@ -52,6 +54,68 @@ func (f *stubFont) RenderGlyph(g uint32, size float64) (*entity.GlyphPath, error
 		&entity.PathClose{},
 	}
 	return &entity.GlyphPath{Commands: cmds, Bounds: [4]float64{0, 0, size, size}}, nil
+}
+
+type matrixPathStubFont struct {
+	stubFont
+	matrixRenderCalls int
+	gotMatrix         [4]float64
+	gotSize           float64
+}
+
+func (f *matrixPathStubFont) RenderGlyphPathMatrix(g uint32, size float64, matrix [4]float64) (*entity.GlyphPath, error) {
+	f.matrixRenderCalls++
+	f.gotMatrix = matrix
+	f.gotSize = size
+	if g == f.missingPathFor {
+		return &entity.GlyphPath{}, nil
+	}
+	cmds := []entity.PathCommand{
+		&entity.PathMoveTo{X: 0, Y: 0},
+		&entity.PathLineTo{X: size, Y: 0},
+		&entity.PathLineTo{X: size, Y: size},
+		&entity.PathLineTo{X: 0, Y: size},
+		&entity.PathClose{},
+	}
+	return &entity.GlyphPath{Commands: cmds, Bounds: [4]float64{0, 0, size, size}}, nil
+}
+
+type textMatrixPathStubFont struct {
+	matrixPathStubFont
+	textMatrixRenderCalls int
+	gotTextMatrix         [4]float64
+	gotTextSize           float64
+}
+
+func (f *textMatrixPathStubFont) RenderGlyphPathTextMatrix(g uint32, size float64, matrix [4]float64) (*entity.GlyphPath, error) {
+	f.textMatrixRenderCalls++
+	f.gotTextMatrix = matrix
+	f.gotTextSize = size
+	if g == f.missingPathFor {
+		return &entity.GlyphPath{}, nil
+	}
+	cmds := []entity.PathCommand{
+		&entity.PathMoveTo{X: 0, Y: 0},
+		&entity.PathLineTo{X: size, Y: 0},
+		&entity.PathLineTo{X: size, Y: size},
+		&entity.PathLineTo{X: 0, Y: size},
+		&entity.PathClose{},
+	}
+	return &entity.GlyphPath{Commands: cmds, Bounds: [4]float64{0, 0, size, size}}, nil
+}
+
+type transformedPhaseStubFont struct {
+	stubFont
+	calls     int
+	gotPhaseX float64
+	gotPhaseY float64
+}
+
+func (f *transformedPhaseStubFont) RenderGlyphBitmapTransformedPhased(g uint32, sizePt, scaleX, scaleY, phaseX, phaseY float64) ([]byte, int, int, int, int, error) {
+	f.calls++
+	f.gotPhaseX = phaseX
+	f.gotPhaseY = phaseY
+	return []byte{0xff}, 1, 1, 0, 1, nil
 }
 
 // scanNonWhitePixels counts RGB8 pixels in the backend's bitmap that are not
@@ -93,6 +157,153 @@ func TestSplashCanvasDrawTextDrawsPixels(t *testing.T) {
 	}
 }
 
+func TestSplashCanvasRenderMode2UsesSingleMatrixPathForFillStroke(t *testing.T) {
+	c := newTestBackend(t, 50, 30)
+	c.SetFillColor(blackColorForTest())
+	c.SetStrokeColor(blackColorForTest())
+	c.SetLineWidth(1)
+	c.SetTextRenderMode(2)
+	c.SetGlyphTransform([4]float64{2, 0, 0, 3})
+	c.s.state.strokeAdjust = true
+	font := &matrixPathStubFont{
+		stubFont: stubFont{name: "MatrixStub", unitsPerEm: 1000, advance: 500},
+	}
+
+	c.currentFont = font
+	c.fontSize = 12
+	c.BeginText(10, 20)
+	if err := c.ShowText("A"); err != nil {
+		t.Fatalf("ShowText: %v", err)
+	}
+	c.EndText()
+
+	if font.matrixRenderCalls != 1 {
+		t.Fatalf("RenderGlyphPathMatrix calls = %d, want 1", font.matrixRenderCalls)
+	}
+	if font.renderCalls != 0 {
+		t.Fatalf("RenderGlyph calls = %d, want 0", font.renderCalls)
+	}
+	if font.gotMatrix != [4]float64{2, 0, 0, 3} {
+		t.Fatalf("RenderGlyphPathMatrix matrix = %v", font.gotMatrix)
+	}
+	if font.gotSize != 12 {
+		t.Fatalf("RenderGlyphPathMatrix size = %v, want 12", font.gotSize)
+	}
+	if !c.s.state.strokeAdjust {
+		t.Fatal("Tr 2 fill+stroke did not restore strokeAdjust")
+	}
+}
+
+func TestSplashCanvasDeferredTextMatrixPathGate(t *testing.T) {
+	t.Setenv("PDF_DEBUG_SPLASH_TEXT_PATH_DEFER_MATRIX", "1")
+	c := newTestBackend(t, 50, 30)
+	c.SetFillColor(blackColorForTest())
+	c.SetStrokeColor(blackColorForTest())
+	c.SetLineWidth(1)
+	c.SetTextRenderMode(2)
+	c.SetGlyphTransform([4]float64{2, 0, 0, 3})
+	c.s.state.strokeAdjust = true
+	font := &textMatrixPathStubFont{
+		matrixPathStubFont: matrixPathStubFont{
+			stubFont: stubFont{name: "TextMatrixStub", unitsPerEm: 1000, advance: 500},
+		},
+	}
+
+	c.currentFont = font
+	c.fontSize = 12
+	c.BeginText(10, 20)
+	if err := c.ShowText("A"); err != nil {
+		t.Fatalf("ShowText: %v", err)
+	}
+	c.EndText()
+
+	if font.textMatrixRenderCalls != 1 {
+		t.Fatalf("RenderGlyphPathTextMatrix calls = %d, want 1", font.textMatrixRenderCalls)
+	}
+	if font.matrixRenderCalls != 0 {
+		t.Fatalf("RenderGlyphPathMatrix calls = %d, want 0", font.matrixRenderCalls)
+	}
+	if font.renderCalls != 0 {
+		t.Fatalf("RenderGlyph calls = %d, want 0", font.renderCalls)
+	}
+	if font.gotTextMatrix != [4]float64{2, 0, 0, 3} {
+		t.Fatalf("RenderGlyphPathTextMatrix matrix = %v", font.gotTextMatrix)
+	}
+	if font.gotTextSize != 12 {
+		t.Fatalf("RenderGlyphPathTextMatrix size = %v, want 12", font.gotTextSize)
+	}
+}
+
+func TestSplashCanvasTextRenderMode7AppliesClipAtPDFTextEnd(t *testing.T) {
+	c := newTestBackend(t, 40, 40)
+	c.SetFillColor(blackColorForTest())
+	font := &stubFont{name: "Stub", unitsPerEm: 1000, advance: 500}
+	c.currentFont = font
+	c.fontSize = 12
+	c.SetTextRenderMode(7)
+
+	c.BeginPDFTextObject()
+	c.BeginText(10, 20)
+	if err := c.ShowText("A"); err != nil {
+		t.Fatalf("ShowText: %v", err)
+	}
+	c.EndText()
+	if got := scanNonWhitePixels(t, c); got != 0 {
+		t.Fatalf("Tr 7 clip-only text painted %d pixels before ET", got)
+	}
+	if c.textClipPath == nil || c.textClipPath.IsEmpty() {
+		t.Fatal("Tr 7 did not accumulate a text clip path")
+	}
+	c.EndPDFTextObject()
+
+	c.SetFillColor(color.RGBA{R: 0xff, A: 0xff})
+	p := xpath.NewPath()
+	_ = p.MoveTo(0, 0)
+	_ = p.LineTo(39, 0)
+	_ = p.LineTo(39, 39)
+	_ = p.LineTo(0, 39)
+	_ = p.Close(false)
+	if err := c.s.Fill(p, false); err != nil {
+		t.Fatalf("Fill after text clip: %v", err)
+	}
+
+	r, g, b := readBackendPixel(t, c, 15, 25)
+	if r != 0xff || g != 0 || b != 0 {
+		t.Fatalf("inside text clip = (%d,%d,%d), want red", r, g, b)
+	}
+	r, g, b = readBackendPixel(t, c, 2, 2)
+	if r != 0xff || g != 0xff || b != 0xff {
+		t.Fatalf("outside text clip = (%d,%d,%d), want white", r, g, b)
+	}
+}
+
+func TestSplashCanvasFTGlyphBitmapIgnoresYPhase(t *testing.T) {
+	c := newTestBackend(t, 50, 30)
+	c.SetFillColor(blackColorForTest())
+	c.SetGlyphTransform([4]float64{2, 0, 0, 3})
+	font := &transformedPhaseStubFont{
+		stubFont: stubFont{name: "PhaseStub", unitsPerEm: 1000, advance: 500},
+	}
+
+	c.currentFont = font
+	c.fontSize = 12
+	c.BeginText(10.25, 20.75)
+	if err := c.ShowText("A"); err != nil {
+		t.Fatalf("ShowText: %v", err)
+	}
+	c.EndText()
+
+	if font.calls != 1 {
+		t.Fatalf("RenderGlyphBitmapTransformedPhased calls = %d, want 1", font.calls)
+	}
+	if font.gotPhaseX == 0 {
+		t.Fatalf("RenderGlyphBitmapTransformedPhased phaseX = 0, want fractional x phase")
+	}
+	if font.gotPhaseY != 0 {
+		t.Fatalf("RenderGlyphBitmapTransformedPhased phaseY = %v, want 0 like SplashFTFont", font.gotPhaseY)
+	}
+}
+
 // TestSplashCanvasGlyphCacheHit verifies fetchGlyph memoises so repeated
 // DrawText with the same rune does not re-rasterize.
 func TestSplashCanvasGlyphCacheHit(t *testing.T) {
@@ -110,6 +321,30 @@ func TestSplashCanvasGlyphCacheHit(t *testing.T) {
 	}
 	if font.renderCalls != 1 {
 		t.Fatalf("second DrawText with same glyph: renderCalls=%d, want still 1 (cache hit)", font.renderCalls)
+	}
+}
+
+func TestSplashCanvasGlyphCacheSeparatesCloseFreeTypeTransforms(t *testing.T) {
+	c := newTestBackend(t, 50, 30)
+	c.SetFillColor(blackColorForTest())
+	font := &transformedPhaseStubFont{
+		stubFont: stubFont{name: "Stub", unitsPerEm: 1000, advance: 500},
+	}
+
+	c.SetGlyphTransform([4]float64{9.281041666666667, 0, 0, 12.374791666666667})
+	if err := c.DrawText("A", 10, 20, font, 1); err != nil {
+		t.Fatalf("DrawText#1: %v", err)
+	}
+	if font.calls != 1 {
+		t.Fatalf("first DrawText: calls=%d, want 1", font.calls)
+	}
+
+	c.SetGlyphTransform([4]float64{9.281458333333333, 0, 0, 12.375208333333335})
+	if err := c.DrawText("A", 10, 20, font, 1); err != nil {
+		t.Fatalf("DrawText#2: %v", err)
+	}
+	if font.calls != 2 {
+		t.Fatalf("close transform DrawText: calls=%d, want 2", font.calls)
 	}
 }
 

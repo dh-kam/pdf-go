@@ -38,6 +38,10 @@ type config struct {
 	tileSize             int
 	skipCompressedCopies bool
 	pureGoJPEG           bool
+	keepImages           bool
+	badPixelsOut         string
+	badRegionsOut        string
+	badPixelLimitPerPage int
 }
 
 const defaultPDFRenderBuildTags = ""
@@ -102,6 +106,10 @@ func parseFlags() config {
 	flag.IntVar(&cfg.tileSize, "tile-size", 48, "diff marker tile size in pixels")
 	flag.BoolVar(&cfg.skipCompressedCopies, "skip-compressed-duplicates", false, "skip GeoTopo-komprimiert duplicate fixtures")
 	flag.BoolVar(&cfg.pureGoJPEG, "pure-go-jpeg", false, "run ours with pure-Go JPEG DCTDecode path by enabling djpeg-go and disabling ImageMagick JPEG fallback")
+	flag.BoolVar(&cfg.keepImages, "keep-images", true, "keep rendered poppler/ours/diff PNGs in the output directory")
+	flag.StringVar(&cfg.badPixelsOut, "bad-pixels-out", "", "optional CSV path for sampled mismatching pixels; relative paths are under -out")
+	flag.StringVar(&cfg.badRegionsOut, "bad-regions-out", "", "optional CSV path for connected mismatching pixel regions; relative paths are under -out")
+	flag.IntVar(&cfg.badPixelLimitPerPage, "bad-pixel-limit-per-page", 2000, "maximum bad-pixel samples per page written to -bad-pixels-out")
 	flag.Parse()
 	cfg.timeout = time.Duration(*timeoutSec) * time.Second
 	return cfg
@@ -129,6 +137,9 @@ func run(cfg config) error {
 	if cfg.workers <= 0 {
 		cfg.workers = 1
 	}
+	if cfg.badPixelLimitPerPage < 0 {
+		cfg.badPixelLimitPerPage = 0
+	}
 	if err := os.RemoveAll(cfg.outDir); err != nil {
 		return fmt.Errorf("clean output dir: %w", err)
 	}
@@ -150,13 +161,22 @@ func run(cfg config) error {
 	if len(jobs) == 0 {
 		return fmt.Errorf("no PDF files found under %q", cfg.scanRoot)
 	}
+	diag, err := newDiagnosticsWriter(cfg)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("Comparing %d PDF files at %d DPI with backend=%s pure-go-jpeg=%t\n", len(jobs), cfg.dpi, cfg.backend, cfg.pureGoJPEG)
 
 	rows := make([]pageRow, 0)
 	for _, job := range jobs {
 		fmt.Printf("[%d/%d] %s\n", job.index+1, len(jobs), job.rel)
-		docRows := compareDocument(cfg, job)
+		docRows := compareDocument(cfg, job, diag)
 		rows = append(rows, docRows...)
+	}
+	if diag != nil {
+		if err := diag.Close(); err != nil {
+			return err
+		}
 	}
 	sort.SliceStable(rows, func(i, j int) bool {
 		if rows[i].PDFRel != rows[j].PDFRel {
@@ -355,7 +375,7 @@ func shouldSkipDir(name string, path string, cfg config) bool {
 	return false
 }
 
-func compareDocument(cfg config, job pdfJob) []pageRow {
+func compareDocument(cfg config, job pdfJob, diag *diagnosticsWriter) []pageRow {
 	popplerDir := filepath.Join(cfg.outDir, "poppler", job.slug)
 	oursDir := filepath.Join(cfg.outDir, "ours", job.slug)
 	diffDir := filepath.Join(cfg.outDir, "diff", job.slug)
@@ -373,6 +393,9 @@ func compareDocument(cfg config, job pdfJob) []pageRow {
 	maxPage := maxPageNumber(popplerPages, oursPages)
 	if maxPage == 0 {
 		errText := strings.TrimSpace(strings.Join(nonEmpty(popplerErr, oursErr), "; "))
+		if isZeroPageRenderFailure(errText) {
+			return nil
+		}
 		if errText == "" {
 			errText = "no rendered pages"
 		}
@@ -401,12 +424,23 @@ func compareDocument(cfg config, job pdfJob) []pageRow {
 		row.OursRel = relToOut(cfg, oursPNG)
 		if popplerPNG != "" && oursPNG != "" {
 			diffPNG := filepath.Join(diffDir, fmt.Sprintf("page-%04d-xor.png", page))
-			stats, err := comparePNGs(popplerPNG, oursPNG, diffPNG, cfg.tileSize)
+			stats, pageDiag, err := comparePNGs(popplerPNG, oursPNG, diffPNG, compareOptions{
+				tileSize:      cfg.tileSize,
+				writeDiff:     cfg.keepImages,
+				badPixelLimit: cfg.badPixelLimitPerPage,
+				needPixels:    diag != nil && diag.HasPixelOutput(),
+				needRegions:   diag != nil && diag.HasRegionOutput(),
+			})
 			if err != nil {
 				row.Error = appendError(row.Error, err.Error())
 			} else {
-				row.DiffPNG = diffPNG
-				row.DiffRel = relToOut(cfg, diffPNG)
+				if diag != nil {
+					diag.Write(job.rel, page, pageDiag)
+				}
+				if cfg.keepImages {
+					row.DiffPNG = diffPNG
+					row.DiffRel = relToOut(cfg, diffPNG)
+				}
 				row.Width = stats.width
 				row.Height = stats.height
 				row.MatchedPixels = stats.matchedPixels
@@ -414,10 +448,27 @@ func compareDocument(cfg config, job pdfJob) []pageRow {
 				row.ExactPercent = stats.exactPercent
 				row.Exact100 = stats.matchedPixels == stats.totalPixels && stats.totalPixels > 0
 			}
+			if !cfg.keepImages {
+				row.PopplerPNG = ""
+				row.OursPNG = ""
+				row.PopplerRel = ""
+				row.OursRel = ""
+			}
 		}
 		rows = append(rows, row)
 	}
+	if !cfg.keepImages {
+		_ = os.RemoveAll(popplerDir)
+		_ = os.RemoveAll(oursDir)
+		_ = os.RemoveAll(diffDir)
+	}
 	return rows
+}
+
+func isZeroPageRenderFailure(errText string) bool {
+	lower := strings.ToLower(errText)
+	return strings.Contains(lower, "invalid page count 0") ||
+		strings.Contains(lower, "the first page (1) can not be after the last page (0)")
 }
 
 func renderPoppler(cfg config, pdfPath, outDir, logDir, password string) string {
@@ -514,26 +565,94 @@ type compareStats struct {
 	exactPercent  float64
 }
 
-func comparePNGs(popplerPath, oursPath, diffPath string, tileSize int) (compareStats, error) {
+type compareOptions struct {
+	tileSize      int
+	writeDiff     bool
+	badPixelLimit int
+	needPixels    bool
+	needRegions   bool
+}
+
+type mismatchPixel struct {
+	x          int
+	y          int
+	popplerR   uint8
+	popplerG   uint8
+	popplerB   uint8
+	oursR      uint8
+	oursG      uint8
+	oursB      uint8
+	deltaR     int
+	deltaG     int
+	deltaB     int
+	deltaMax   int
+	regionID   int
+	sampleRank int
+	flat       int
+}
+
+type mismatchRegion struct {
+	id          int
+	x0          int
+	y0          int
+	x1          int
+	y1          int
+	badPixels   int
+	centroidX   float64
+	centroidY   float64
+	maxDelta    int
+	nearSampleX int
+	nearSampleY int
+	hasSample   bool
+}
+
+type compareDiagnostics struct {
+	pixels  []mismatchPixel
+	regions []mismatchRegion
+}
+
+func comparePNGs(popplerPath, oursPath, diffPath string, opts compareOptions) (compareStats, compareDiagnostics, error) {
 	popplerImg, err := decodePNG(popplerPath)
 	if err != nil {
-		return compareStats{}, fmt.Errorf("decode poppler png: %w", err)
+		return compareStats{}, compareDiagnostics{}, fmt.Errorf("decode poppler png: %w", err)
 	}
 	oursImg, err := decodePNG(oursPath)
 	if err != nil {
-		return compareStats{}, fmt.Errorf("decode ours png: %w", err)
+		return compareStats{}, compareDiagnostics{}, fmt.Errorf("decode ours png: %w", err)
 	}
 	pb := popplerImg.Bounds()
 	ob := oursImg.Bounds()
 	width := maxInt(pb.Dx(), ob.Dx())
 	height := maxInt(pb.Dy(), ob.Dy())
 	if width <= 0 || height <= 0 {
-		return compareStats{}, fmt.Errorf("invalid image dimensions")
+		return compareStats{}, compareDiagnostics{}, fmt.Errorf("invalid image dimensions")
 	}
-	diff := image.NewRGBA(image.Rect(0, 0, width, height))
-	tilesX := (width + tileSize - 1) / tileSize
-	tilesY := (height + tileSize - 1) / tileSize
-	mismatchTiles := make([]bool, tilesX*tilesY)
+	tileSize := opts.tileSize
+	if tileSize <= 0 {
+		tileSize = 48
+	}
+	var diff *image.RGBA
+	var mismatchTiles []bool
+	tilesX := 0
+	tilesY := 0
+	if opts.writeDiff {
+		diff = image.NewRGBA(image.Rect(0, 0, width, height))
+		tilesX = (width + tileSize - 1) / tileSize
+		tilesY = (height + tileSize - 1) / tileSize
+		mismatchTiles = make([]bool, tilesX*tilesY)
+	}
+	var mismatchMap []bool
+	var deltaMaxMap []uint8
+	if opts.needRegions {
+		size := width * height
+		mismatchMap = make([]bool, size)
+		deltaMaxMap = make([]uint8, size)
+	}
+	sampleLimit := opts.badPixelLimit
+	if !opts.needPixels {
+		sampleLimit = 0
+	}
+	samples := make([]mismatchPixel, 0, minInt(sampleLimit, 1024))
 	var matched int64
 	total := int64(width) * int64(height)
 	for y := 0; y < height; y++ {
@@ -542,31 +661,62 @@ func comparePNGs(popplerPath, oursPath, diffPath string, tileSize int) (compareS
 			or, og, obv, ook := rgbAt(oursImg, x, y)
 			if pok && ook && pr == or && pg == og && pbv == obv {
 				matched++
-				diff.SetRGBA(x, y, color.RGBA{245, 245, 245, 255})
+				if opts.writeDiff {
+					diff.SetRGBA(x, y, color.RGBA{245, 245, 245, 255})
+				}
 				continue
 			}
-			mismatchTiles[(y/tileSize)*tilesX+x/tileSize] = true
-			if pok && ook {
-				diff.SetRGBA(x, y, color.RGBA{amplifyXOR(pr ^ or), amplifyXOR(pg ^ og), amplifyXOR(pbv ^ obv), 255})
-			} else {
-				diff.SetRGBA(x, y, color.RGBA{255, 0, 255, 255})
+			dr := absInt(int(pr) - int(or))
+			dg := absInt(int(pg) - int(og))
+			db := absInt(int(pbv) - int(obv))
+			deltaMax := maxInt(maxInt(dr, dg), db)
+			flat := y*width + x
+			if opts.needRegions {
+				mismatchMap[flat] = true
+				deltaMaxMap[flat] = uint8(deltaMax)
+			}
+			if sampleLimit > 0 && len(samples) < sampleLimit {
+				samples = append(samples, mismatchPixel{
+					x: x, y: y,
+					popplerR: pr, popplerG: pg, popplerB: pbv,
+					oursR: or, oursG: og, oursB: obv,
+					deltaR: dr, deltaG: dg, deltaB: db, deltaMax: deltaMax,
+					flat: flat,
+				})
+			}
+			if opts.writeDiff {
+				mismatchTiles[(y/tileSize)*tilesX+x/tileSize] = true
+				if pok && ook {
+					diff.SetRGBA(x, y, color.RGBA{amplifyXOR(pr ^ or), amplifyXOR(pg ^ og), amplifyXOR(pbv ^ obv), 255})
+				} else {
+					diff.SetRGBA(x, y, color.RGBA{255, 0, 255, 255})
+				}
 			}
 		}
 	}
-	drawTileComponentEllipses(diff, mismatchTiles, tilesX, tilesY, tileSize, width, height)
-	if err := os.MkdirAll(filepath.Dir(diffPath), 0o755); err != nil {
-		return compareStats{}, err
+	var regions []mismatchRegion
+	if opts.needRegions {
+		regions, samples = buildMismatchRegions(mismatchMap, deltaMaxMap, width, height, samples)
 	}
-	f, err := os.Create(diffPath)
-	if err != nil {
-		return compareStats{}, err
+	for i := range samples {
+		samples[i].sampleRank = i + 1
 	}
-	if err := png.Encode(f, diff); err != nil {
-		_ = f.Close()
-		return compareStats{}, err
-	}
-	if err := f.Close(); err != nil {
-		return compareStats{}, err
+	if opts.writeDiff {
+		drawTileComponentEllipses(diff, mismatchTiles, tilesX, tilesY, tileSize, width, height)
+		if err := os.MkdirAll(filepath.Dir(diffPath), 0o755); err != nil {
+			return compareStats{}, compareDiagnostics{}, err
+		}
+		f, err := os.Create(diffPath)
+		if err != nil {
+			return compareStats{}, compareDiagnostics{}, err
+		}
+		if err := png.Encode(f, diff); err != nil {
+			_ = f.Close()
+			return compareStats{}, compareDiagnostics{}, err
+		}
+		if err := f.Close(); err != nil {
+			return compareStats{}, compareDiagnostics{}, err
+		}
 	}
 	return compareStats{
 		width:         width,
@@ -574,7 +724,245 @@ func comparePNGs(popplerPath, oursPath, diffPath string, tileSize int) (compareS
 		matchedPixels: matched,
 		totalPixels:   total,
 		exactPercent:  percent(matched, total),
-	}, nil
+	}, compareDiagnostics{pixels: samples, regions: regions}, nil
+}
+
+func buildMismatchRegions(mismatchMap []bool, deltaMaxMap []uint8, width, height int, samples []mismatchPixel) ([]mismatchRegion, []mismatchPixel) {
+	if width <= 0 || height <= 0 || len(mismatchMap) == 0 {
+		return nil, samples
+	}
+	sampleByFlat := make(map[int]int, len(samples))
+	for i := range samples {
+		sampleByFlat[samples[i].flat] = i
+	}
+	visited := make([]bool, len(mismatchMap))
+	queue := make([]int, 0, 1024)
+	regions := make([]mismatchRegion, 0)
+	for flat, mismatch := range mismatchMap {
+		if !mismatch || visited[flat] {
+			continue
+		}
+		region := mismatchRegion{
+			id: len(regions) + 1,
+			x0: flat % width,
+			y0: flat / width,
+			x1: flat % width,
+			y1: flat / width,
+		}
+		var sumX, sumY int64
+		visited[flat] = true
+		queue = append(queue[:0], flat)
+		for head := 0; head < len(queue); head++ {
+			cur := queue[head]
+			x := cur % width
+			y := cur / width
+			region.badPixels++
+			sumX += int64(x)
+			sumY += int64(y)
+			if x < region.x0 {
+				region.x0 = x
+			}
+			if x > region.x1 {
+				region.x1 = x
+			}
+			if y < region.y0 {
+				region.y0 = y
+			}
+			if y > region.y1 {
+				region.y1 = y
+			}
+			if cur < len(deltaMaxMap) && int(deltaMaxMap[cur]) > region.maxDelta {
+				region.maxDelta = int(deltaMaxMap[cur])
+			}
+			if sampleIndex, ok := sampleByFlat[cur]; ok {
+				samples[sampleIndex].regionID = region.id
+				if !region.hasSample {
+					region.nearSampleX = x
+					region.nearSampleY = y
+					region.hasSample = true
+				}
+			}
+			for _, next := range neighborPixels(cur, x, y, width, height) {
+				if mismatchMap[next] && !visited[next] {
+					visited[next] = true
+					queue = append(queue, next)
+				}
+			}
+		}
+		region.centroidX = float64(sumX) / float64(region.badPixels)
+		region.centroidY = float64(sumY) / float64(region.badPixels)
+		regions = append(regions, region)
+	}
+	return regions, samples
+}
+
+func neighborPixels(flat, x, y, width, height int) []int {
+	out := make([]int, 0, 4)
+	if x > 0 {
+		out = append(out, flat-1)
+	}
+	if x+1 < width {
+		out = append(out, flat+1)
+	}
+	if y > 0 {
+		out = append(out, flat-width)
+	}
+	if y+1 < height {
+		out = append(out, flat+width)
+	}
+	return out
+}
+
+type diagnosticsWriter struct {
+	pixelFile    *os.File
+	regionFile   *os.File
+	pixelWriter  *csv.Writer
+	regionWriter *csv.Writer
+	err          error
+	closed       bool
+}
+
+func newDiagnosticsWriter(cfg config) (*diagnosticsWriter, error) {
+	pixelPath := resolveDiagnosticsPath(cfg.outDir, cfg.badPixelsOut)
+	regionPath := resolveDiagnosticsPath(cfg.outDir, cfg.badRegionsOut)
+	if pixelPath == "" && regionPath == "" {
+		return nil, nil
+	}
+
+	d := &diagnosticsWriter{}
+	if pixelPath != "" {
+		file, writer, err := createCSVWriter(pixelPath)
+		if err != nil {
+			return nil, fmt.Errorf("create bad pixels csv: %w", err)
+		}
+		d.pixelFile = file
+		d.pixelWriter = writer
+		if err := writer.Write([]string{
+			"pdf", "page", "x", "y",
+			"poppler_r", "poppler_g", "poppler_b",
+			"ours_r", "ours_g", "ours_b",
+			"dr", "dg", "db", "delta_max", "region_id", "sample_rank",
+		}); err != nil {
+			_ = d.Close()
+			return nil, err
+		}
+	}
+	if regionPath != "" {
+		file, writer, err := createCSVWriter(regionPath)
+		if err != nil {
+			_ = d.Close()
+			return nil, fmt.Errorf("create bad regions csv: %w", err)
+		}
+		d.regionFile = file
+		d.regionWriter = writer
+		if err := writer.Write([]string{
+			"pdf", "page", "region_id", "x0", "y0", "x1", "y1",
+			"width", "height", "bad_pixels", "centroid_x", "centroid_y",
+			"dominant_delta", "nearest_sample",
+		}); err != nil {
+			_ = d.Close()
+			return nil, err
+		}
+	}
+	return d, nil
+}
+
+func resolveDiagnosticsPath(outDir, path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	return filepath.Join(outDir, path)
+}
+
+func createCSVWriter(path string) (*os.File, *csv.Writer, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, nil, err
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return file, csv.NewWriter(file), nil
+}
+
+func (d *diagnosticsWriter) HasPixelOutput() bool {
+	return d != nil && d.pixelWriter != nil
+}
+
+func (d *diagnosticsWriter) HasRegionOutput() bool {
+	return d != nil && d.regionWriter != nil
+}
+
+func (d *diagnosticsWriter) Write(pdf string, page int, diag compareDiagnostics) {
+	if d == nil || d.err != nil {
+		return
+	}
+	if d.pixelWriter != nil {
+		for _, p := range diag.pixels {
+			if err := d.pixelWriter.Write([]string{
+				pdf, strconv.Itoa(page), strconv.Itoa(p.x), strconv.Itoa(p.y),
+				strconv.Itoa(int(p.popplerR)), strconv.Itoa(int(p.popplerG)), strconv.Itoa(int(p.popplerB)),
+				strconv.Itoa(int(p.oursR)), strconv.Itoa(int(p.oursG)), strconv.Itoa(int(p.oursB)),
+				strconv.Itoa(p.deltaR), strconv.Itoa(p.deltaG), strconv.Itoa(p.deltaB),
+				strconv.Itoa(p.deltaMax), strconv.Itoa(p.regionID), strconv.Itoa(p.sampleRank),
+			}); err != nil {
+				d.err = err
+				return
+			}
+		}
+	}
+	if d.regionWriter != nil {
+		for _, r := range diag.regions {
+			nearestSample := ""
+			if r.hasSample {
+				nearestSample = fmt.Sprintf("%d:%d", r.nearSampleX, r.nearSampleY)
+			}
+			if err := d.regionWriter.Write([]string{
+				pdf, strconv.Itoa(page), strconv.Itoa(r.id),
+				strconv.Itoa(r.x0), strconv.Itoa(r.y0), strconv.Itoa(r.x1), strconv.Itoa(r.y1),
+				strconv.Itoa(r.x1 - r.x0 + 1), strconv.Itoa(r.y1 - r.y0 + 1), strconv.Itoa(r.badPixels),
+				fmt.Sprintf("%.2f", r.centroidX), fmt.Sprintf("%.2f", r.centroidY),
+				strconv.Itoa(r.maxDelta), nearestSample,
+			}); err != nil {
+				d.err = err
+				return
+			}
+		}
+	}
+}
+
+func (d *diagnosticsWriter) Close() error {
+	if d == nil || d.closed {
+		return nil
+	}
+	d.closed = true
+	if d.pixelWriter != nil {
+		d.pixelWriter.Flush()
+		if err := d.pixelWriter.Error(); err != nil && d.err == nil {
+			d.err = err
+		}
+	}
+	if d.regionWriter != nil {
+		d.regionWriter.Flush()
+		if err := d.regionWriter.Error(); err != nil && d.err == nil {
+			d.err = err
+		}
+	}
+	if d.pixelFile != nil {
+		if err := d.pixelFile.Close(); err != nil && d.err == nil {
+			d.err = err
+		}
+	}
+	if d.regionFile != nil {
+		if err := d.regionFile.Close(); err != nil && d.err == nil {
+			d.err = err
+		}
+	}
+	return d.err
 }
 
 func decodePNG(path string) (image.Image, error) {
@@ -970,6 +1358,20 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 func clamp(v, min, max int) int {

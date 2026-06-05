@@ -96,8 +96,7 @@ func GetPredictor(predictorType int) (Predictor, error) {
 	case 2:
 		return &TIFFPredictor{}, nil
 	case 10, 11, 12, 13, 14, 15:
-		// Predictor 10 uses PNG predictor with algorithm from filter byte
-		// Predictors 11-15 directly specify PNG algorithm (no filter byte)
+		// PDF PNG predictors store a filter byte at the start of every row.
 		return &PNGPredictor{predictorType: predictorType}, nil
 	default:
 		return nil, fmt.Errorf("%w: %d", ErrInvalidPredictor, predictorType)
@@ -154,37 +153,26 @@ func (p *TIFFPredictor) Decode(data []byte, columns int, colors int, bitsPerComp
 
 // PNGPredictor implements PNG prediction (predictors 10-15).
 type PNGPredictor struct {
-	predictorType int // 10=read filter byte, 11=None, 12=Sub, 13=Up, 14=Average, 15=Paeth
+	predictorType int
 }
 
 // Decode decodes PNG predictor encoded data.
-// PNG prediction uses a filter byte per row followed by the filtered data.
-// For predictor type 10, the filter byte is included in the data.
-// For predictor types 11-15, the filter byte is NOT included (algorithm is fixed).
+// PDF PNG prediction stores a filter byte per row followed by the filtered data.
 func (p *PNGPredictor) Decode(data []byte, columns int, colors int, bitsPerComponent int) ([]byte, error) {
 	if len(data) == 0 {
 		return data, nil
 	}
 
-	// Calculate bytes per row
-	bytesPerSample := (bitsPerComponent + 7) / 8
-	samplesPerRow := columns * colors
-	bytesPerRow := samplesPerRow * bytesPerSample
+	// PDF PNG predictors use the PNG "bytes per pixel" distance for
+	// Sub/Average/Paeth left references, while rows remain bit-packed.
+	bytesPerPixel := (colors*bitsPerComponent + 7) / 8
+	bytesPerRow := (columns*colors*bitsPerComponent + 7) / 8
 
 	if bytesPerRow == 0 {
 		return nil, fmt.Errorf("%w: bytes per row is zero", ErrInvalidParameters)
 	}
 
-	// For predictor type 10, data includes filter byte per row
-	// For predictor types 11-15, data does NOT include filter byte (algorithm is fixed)
-	hasFilterByte := (p.predictorType == 10)
-
-	var totalRowSize int
-	if hasFilterByte {
-		totalRowSize = bytesPerRow + 1 // +1 for filter byte
-	} else {
-		totalRowSize = bytesPerRow
-	}
+	totalRowSize := bytesPerRow + 1 // +1 for the PNG filter byte
 
 	if len(data)%totalRowSize != 0 {
 		return nil, fmt.Errorf("%w: data length %d is not a multiple of row size %d",
@@ -198,33 +186,27 @@ func (p *PNGPredictor) Decode(data []byte, columns int, colors int, bitsPerCompo
 		rowOffset := row * totalRowSize
 		var rowData []byte
 		resultOffset := row * bytesPerRow
-
-		// If algorithm is specified (1-4) from predictor type 12-15, use it
-		// Otherwise use the filter byte from the data (predictor 10)
-		algorithm := 0
-		if hasFilterByte {
-			// Predictor type 10: read filter byte from data
-			filterByte := data[rowOffset]
-			rowData = data[rowOffset+1 : rowOffset+1+bytesPerRow]
-			algorithm = int(filterByte)
-		} else {
-			// Predictor types 11-15: algorithm is fixed, no filter byte
-			rowData = data[rowOffset : rowOffset+bytesPerRow]
-			algorithm = p.predictorType - 11 // 11->0, 12->1, 13->2, 14->3, 15->4
+		var prevRow []byte
+		if row > 0 {
+			prevRow = result[resultOffset-bytesPerRow : resultOffset]
 		}
+
+		filterByte := data[rowOffset]
+		rowData = data[rowOffset+1 : rowOffset+1+bytesPerRow]
+		algorithm := int(filterByte)
 
 		var err error
 		switch algorithm {
 		case 0: // None
 			err = p.decodeNone(rowData, result[resultOffset:resultOffset+bytesPerRow])
 		case 1: // Sub
-			err = p.decodeSub(rowData, result[resultOffset:resultOffset+bytesPerRow], bytesPerSample)
+			err = p.decodeSub(rowData, result[resultOffset:resultOffset+bytesPerRow], bytesPerPixel)
 		case 2: // Up
-			err = p.decodeUp(rowData, result[resultOffset:resultOffset+bytesPerRow], result[:resultOffset])
+			err = p.decodeUp(rowData, result[resultOffset:resultOffset+bytesPerRow], prevRow)
 		case 3: // Average
-			err = p.decodeAverage(rowData, result[resultOffset:resultOffset+bytesPerRow], bytesPerSample, result[:resultOffset])
+			err = p.decodeAverage(rowData, result[resultOffset:resultOffset+bytesPerRow], bytesPerPixel, prevRow)
 		case 4: // Paeth
-			err = p.decodePaeth(rowData, result[resultOffset:resultOffset+bytesPerRow], bytesPerSample, result[:resultOffset])
+			err = p.decodePaeth(rowData, result[resultOffset:resultOffset+bytesPerRow], bytesPerPixel, prevRow)
 		default:
 			return nil, fmt.Errorf("%w: unknown PNG filter type %d", ErrInvalidPredictor, algorithm)
 		}
@@ -244,18 +226,18 @@ func (p *PNGPredictor) decodeNone(rowData, result []byte) error {
 }
 
 // decodeSub implements PNG Sub filter (filter type 1).
-// Sub(x) = Raw(x) + Raw(x - bytesPerSample)
-func (p *PNGPredictor) decodeSub(rowData, result []byte, bytesPerSample int) error {
+// Sub(x) = Raw(x) + Raw(x - bytesPerPixel)
+func (p *PNGPredictor) decodeSub(rowData, result []byte, bytesPerPixel int) error {
 	bytesPerRow := len(rowData)
 	if len(result) != bytesPerRow {
 		return fmt.Errorf("%w: row size mismatch", ErrInvalidDataSize)
 	}
 
 	for i := 0; i < bytesPerRow; i++ {
-		if i < bytesPerSample {
+		if i < bytesPerPixel {
 			result[i] = rowData[i]
 		} else {
-			result[i] = rowData[i] + result[i-bytesPerSample]
+			result[i] = rowData[i] + result[i-bytesPerPixel]
 		}
 	}
 	return nil
@@ -282,8 +264,8 @@ func (p *PNGPredictor) decodeUp(rowData, result, prevRow []byte) error {
 }
 
 // decodeAverage implements PNG Average filter (filter type 3).
-// Average(x) = Raw(x) + floor((Raw(x - bytesPerSample) + Prior(x)) / 2)
-func (p *PNGPredictor) decodeAverage(rowData, result []byte, bytesPerSample int, prevRow []byte) error {
+// Average(x) = Raw(x) + floor((Raw(x - bytesPerPixel) + Prior(x)) / 2)
+func (p *PNGPredictor) decodeAverage(rowData, result []byte, bytesPerPixel int, prevRow []byte) error {
 	bytesPerRow := len(rowData)
 	if len(result) != bytesPerRow {
 		return fmt.Errorf("%w: row size mismatch", ErrInvalidDataSize)
@@ -291,8 +273,8 @@ func (p *PNGPredictor) decodeAverage(rowData, result []byte, bytesPerSample int,
 
 	for i := 0; i < bytesPerRow; i++ {
 		var left byte
-		if i >= bytesPerSample {
-			left = result[i-bytesPerSample]
+		if i >= bytesPerPixel {
+			left = result[i-bytesPerPixel]
 		}
 
 		var up byte
@@ -307,8 +289,8 @@ func (p *PNGPredictor) decodeAverage(rowData, result []byte, bytesPerSample int,
 }
 
 // decodePaeth implements PNG Paeth filter (filter type 4).
-// Paeth(x) = Raw(x) + PaethPredictor(Raw(x - bytesPerSample), Prior(x), Prior(x - bytesPerSample))
-func (p *PNGPredictor) decodePaeth(rowData, result []byte, bytesPerSample int, prevRow []byte) error {
+// Paeth(x) = Raw(x) + PaethPredictor(Raw(x - bytesPerPixel), Prior(x), Prior(x - bytesPerPixel))
+func (p *PNGPredictor) decodePaeth(rowData, result []byte, bytesPerPixel int, prevRow []byte) error {
 	bytesPerRow := len(rowData)
 	if len(result) != bytesPerRow {
 		return fmt.Errorf("%w: row size mismatch", ErrInvalidDataSize)
@@ -316,16 +298,16 @@ func (p *PNGPredictor) decodePaeth(rowData, result []byte, bytesPerSample int, p
 
 	for i := 0; i < bytesPerRow; i++ {
 		var left byte
-		if i >= bytesPerSample {
-			left = result[i-bytesPerSample]
+		if i >= bytesPerPixel {
+			left = result[i-bytesPerPixel]
 		}
 
 		var up byte
 		var upLeft byte
 		if len(prevRow) > 0 {
 			up = prevRow[i]
-			if i >= bytesPerSample {
-				upLeft = prevRow[i-bytesPerSample]
+			if i >= bytesPerPixel {
+				upLeft = prevRow[i-bytesPerPixel]
 			}
 		}
 

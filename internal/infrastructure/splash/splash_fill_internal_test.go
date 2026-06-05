@@ -2,6 +2,7 @@ package splash
 
 import (
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/dh-kam/pdf-go/internal/infrastructure/splash/xpath"
@@ -390,4 +391,68 @@ func TestSplashFillRunAALineCount(t *testing.T) {
 	if r != 0 {
 		t.Fatalf("runAALine column 0 unwritten: got R=%02x", r)
 	}
+}
+
+func TestTinyGroupedFillYMinBoundaryTieImprovesAARowCoverage(t *testing.T) {
+	s := newTestFillSplashRGB(t, 200, 200, true)
+	s.groupStack = append(s.groupStack, &groupState{})
+	x := tinyGroupedFillYMinBoundaryTestXPath()
+
+	if !tinyGroupedFillYMinBoundaryTieCandidate(x, 1e-9) {
+		t.Fatalf("setup: expected tiny grouped y-min boundary candidate")
+	}
+	before := renderXPathCoverageAt(t, s, x, 103, 111)
+	if before != 4 {
+		t.Fatalf("coverage before tie: got %d, want 4", before)
+	}
+
+	s.applyTinyGroupedFillYMinBoundaryTie(x)
+
+	after := renderXPathCoverageAt(t, s, x, 103, 111)
+	if after != 8 {
+		t.Fatalf("coverage after tie: got %d, want 8", after)
+	}
+	yMin := x.Segs[0].Y0
+	for i := range x.Segs {
+		seg := &x.Segs[i]
+		if seg.Y0 < yMin {
+			yMin = seg.Y0
+		}
+		if seg.Y1 < yMin {
+			yMin = seg.Y1
+		}
+	}
+	if !(yMin < 447 && math.Nextafter(447, math.Inf(-1)) == yMin) {
+		t.Fatalf("yMin after tie: got %.17g, want nextafter below 447", yMin)
+	}
+	if x.Segs[2].Y0 != 450 || x.Segs[2].Y1 != 450 {
+		t.Fatalf("upper edge moved: got y0=%.17g y1=%.17g", x.Segs[2].Y0, x.Segs[2].Y1)
+	}
+	if x.Segs[0].Flags&xpath.XPathHoriz == 0 {
+		t.Fatalf("lower edge lost horizontal flag: flags=0x%x", x.Segs[0].Flags)
+	}
+}
+
+func tinyGroupedFillYMinBoundaryTestXPath() *xpath.XPath {
+	yMin := 447.0000000000005
+	x := &xpath.XPath{Segs: []xpath.XPathSeg{
+		{X0: 412, Y0: yMin, X1: 424, Y1: yMin},
+		{X0: 424, Y0: yMin, X1: 424, Y1: 450},
+		{X0: 424, Y0: 450, X1: 412, Y1: 450},
+		{X0: 412, Y0: 450, X1: 412, Y1: yMin},
+		{X0: 416, Y0: 448, X1: 420, Y1: 448},
+		{X0: 420, Y0: 448, X1: 416, Y1: 448},
+	}}
+	for i := range x.Segs {
+		recomputeXPathSegDerived(&x.Segs[i])
+	}
+	return x
+}
+
+func renderXPathCoverageAt(t *testing.T, s *Splash, x *xpath.XPath, px, py int) int {
+	t.Helper()
+	scanner := xpath.NewScanner(x, false, 0, 0, s.bitmap.width-1, (s.bitmap.height*splashAASize)-1)
+	rowSize := (s.bitmap.width*splashAASize + 7) >> 3
+	scanner.RenderAALineFullWidth(py, s.aaBuf, s.bitmap.width)
+	return s.aaLineCoverage(px, rowSize)
 }

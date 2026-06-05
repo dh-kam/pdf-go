@@ -8,10 +8,11 @@ import (
 )
 
 type widthMappedFont struct {
-	base         entity.Font
-	widths       map[uint32]float64
-	widthsByCode map[uint32]float64
-	defaultWidth float64
+	base                        entity.Font
+	widths                      map[uint32]float64
+	widthsByCode                map[uint32]float64
+	defaultWidth                float64
+	forceDefaultWidthForMissing bool
 }
 
 type encodedFont struct {
@@ -34,6 +35,15 @@ type type1CCodeToGIDFont struct {
 	cacheBBox    [4]float64
 	cacheUnits   uint16
 	hasCacheBBox bool
+}
+
+type cidToGIDMappedFont struct {
+	base     entity.Font
+	cidToGID map[uint32]uint32
+}
+
+type cidDirectFont struct {
+	base entity.Font
 }
 
 type fontBBoxOverrideFont struct {
@@ -126,6 +136,9 @@ func (f *type1CCodeToGIDFont) BaseFont() entity.Font { return f.base }
 // BaseFont returns the underlying font for unwrapping.
 func (f *fontBBoxOverrideFont) BaseFont() entity.Font { return f.base }
 
+// BaseFont returns the underlying font for unwrapping.
+func (f *cidDirectFont) BaseFont() entity.Font { return f.base }
+
 type glyphIDByNameFont interface {
 	GlyphIDByName(name string) (uint32, bool)
 }
@@ -136,6 +149,10 @@ type encodingNameFont interface {
 
 type freeTypeBoundingBoxFont interface {
 	FreeTypeBoundingBox() (float64, float64, float64, float64, uint16, bool)
+}
+
+type cidToGIDMapFont interface {
+	CIDToGIDMap() (map[uint32]uint32, bool)
 }
 
 func (f *encodedFont) CharCodeToGlyph(code uint32) (uint32, error) {
@@ -274,6 +291,9 @@ func (f *widthMappedFont) GetGlyphWidth(glyph uint32) (float64, error) {
 	}
 
 	if f.defaultWidth > 0 {
+		if f.forceDefaultWidthForMissing {
+			return f.defaultWidth, nil
+		}
 		if _, err := f.base.GetGlyphWidth(glyph); err == nil {
 			width, err := f.base.GetGlyphWidth(glyph)
 			if err == nil {
@@ -620,6 +640,134 @@ func (f *type1CCodeToGIDFont) type1COverrideForGlyph(glyph uint32) (glyphSourceO
 	return override, ok
 }
 
+// BaseFont returns the underlying font for unwrapping.
+func (f *cidToGIDMappedFont) BaseFont() entity.Font { return f.base }
+
+func (f *cidToGIDMappedFont) CharCodeToGlyph(code uint32) (uint32, error) {
+	if f == nil || f.base == nil {
+		return 0, fmt.Errorf("font is nil")
+	}
+	if f.cidToGID != nil {
+		if glyph, ok := f.cidToGID[code]; ok {
+			return glyph, nil
+		}
+	}
+	return 0, nil
+}
+
+func (f *cidToGIDMappedFont) GlyphName(glyph uint32) string {
+	if f == nil || f.base == nil {
+		return ""
+	}
+	return f.base.GlyphName(glyph)
+}
+
+func (f *cidToGIDMappedFont) GetGlyphWidth(glyph uint32) (float64, error) {
+	if f == nil || f.base == nil {
+		return 0, fmt.Errorf("font is nil")
+	}
+	return f.base.GetGlyphWidth(glyph)
+}
+
+func (f *cidToGIDMappedFont) GetBoundingBox() (float64, float64, float64, float64) {
+	if f == nil || f.base == nil {
+		return 0, 0, 0, 0
+	}
+	return f.base.GetBoundingBox()
+}
+
+func (f *cidToGIDMappedFont) RenderGlyph(glyph uint32, size float64) (*entity.GlyphPath, error) {
+	if f == nil || f.base == nil {
+		return nil, fmt.Errorf("font is nil")
+	}
+	return f.base.RenderGlyph(glyph, size)
+}
+
+func (f *cidToGIDMappedFont) IsCIDFont() bool {
+	return true
+}
+
+func (f *cidToGIDMappedFont) IsSymbolic() bool {
+	if f == nil || f.base == nil {
+		return false
+	}
+	return f.base.IsSymbolic()
+}
+
+func (f *cidToGIDMappedFont) UnitsPerEm() uint16 {
+	if f == nil || f.base == nil {
+		return 0
+	}
+	return f.base.UnitsPerEm()
+}
+
+func (f *cidToGIDMappedFont) Name() string {
+	if f == nil || f.base == nil {
+		return ""
+	}
+	return f.base.Name()
+}
+
+func (f *cidDirectFont) CharCodeToGlyph(code uint32) (uint32, error) {
+	if f == nil || f.base == nil {
+		return 0, fmt.Errorf("font is nil")
+	}
+	return code, nil
+}
+
+func (f *cidDirectFont) GlyphName(glyph uint32) string {
+	if f == nil || f.base == nil {
+		return ""
+	}
+	return f.base.GlyphName(glyph)
+}
+
+func (f *cidDirectFont) GetGlyphWidth(glyph uint32) (float64, error) {
+	if f == nil || f.base == nil {
+		return 0, fmt.Errorf("font is nil")
+	}
+	return f.base.GetGlyphWidth(glyph)
+}
+
+func (f *cidDirectFont) GetBoundingBox() (float64, float64, float64, float64) {
+	if f == nil || f.base == nil {
+		return 0, 0, 0, 0
+	}
+	return f.base.GetBoundingBox()
+}
+
+func (f *cidDirectFont) RenderGlyph(glyph uint32, size float64) (*entity.GlyphPath, error) {
+	if f == nil || f.base == nil {
+		return nil, fmt.Errorf("font is nil")
+	}
+	return f.base.RenderGlyph(glyph, size)
+}
+
+func (f *cidDirectFont) IsCIDFont() bool {
+	return true
+}
+
+func (f *cidDirectFont) IsSymbolic() bool {
+	if f == nil || f.base == nil {
+		return false
+	}
+	return f.base.IsSymbolic()
+}
+
+func (f *cidDirectFont) UnitsPerEm() uint16 {
+	if f == nil || f.base == nil {
+		return 0
+	}
+	return f.base.UnitsPerEm()
+}
+
+func (f *cidDirectFont) Name() string {
+	if f == nil || f.base == nil {
+		return ""
+	}
+	return f.base.Name()
+}
+
 func (f *fontBBoxOverrideFont) CharCodeToGlyph(code uint32) (uint32, error) {
 	if f == nil || f.base == nil {
 		return 0, fmt.Errorf("font is nil")
@@ -676,15 +824,20 @@ func (f *fontBBoxOverrideFont) Name() string {
 // CharCodeToGlyph returns the CID directly as the GID (Identity mapping).
 // Per PDF spec, CIDFontType2 with Identity CIDToGIDMap maps CID directly to GID.
 type cidIdentityFont struct {
-	base      entity.Font
-	toUnicode map[uint32]rune // optional CID→Unicode from ToUnicode CMap (for text extraction only)
+	base                entity.Font
+	toUnicode           map[uint32]rune // optional CID->Unicode from ToUnicode CMap.
+	preferToUnicodeCMap bool
 }
 
 func (f *cidIdentityFont) CharCodeToGlyph(code uint32) (uint32, error) {
+	if f != nil && f.preferToUnicodeCMap && f.base != nil && len(f.toUnicode) > 0 {
+		if r, ok := f.toUnicode[code]; ok {
+			if glyph, err := f.base.CharCodeToGlyph(uint32(r)); err == nil {
+				return glyph, nil
+			}
+		}
+	}
 	// For Identity CIDToGIDMap, CID == GID directly.
-	// Do NOT use toUnicode for glyph resolution: toUnicode is for text extraction,
-	// not for glyph rendering. Subsetted TrueType fonts assign glyph slots by CID,
-	// not by Unicode codepoint, so going via Unicode→cmap would yield wrong glyph IDs.
 	return code, nil
 }
 

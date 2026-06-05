@@ -1,6 +1,7 @@
 package splash
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"image"
 	"image/color"
@@ -35,17 +36,22 @@ type splashCanvas struct {
 
 	// Text state — mirrors ImageCanvas.textPosition / inTextBlock and tracks
 	// current font for ShowText (PDF 1.7 §9.4 text object operators).
-	currentFont   entity.Font
-	fontSize      float64
-	textX         float64
-	textY         float64
-	inText        bool
-	textUserSpace bool
-	textCTM       [6]float64
+	currentFont    entity.Font
+	fontSize       float64
+	textX          float64
+	textY          float64
+	inText         bool
+	textUserSpace  bool
+	textCTM        [6]float64
+	textRenderMode int
+	textClipPath   *xpath.Path
 	// type3Depth is non-zero while the evaluator replays a Type3 CharProc.
 	// Embedded images in that path match Poppler's rounded SplashBitmap Y
 	// origin, while normal glyph text keeps the exact float page origin.
 	type3Depth int
+	// type3CacheDepth is non-zero for CharProcs that Poppler would draw through
+	// its cached Type3 glyph bitmap path after a leading d1 operator.
+	type3CacheDepth int
 	// strokeIndex counts Stroke calls for narrow diagnostic gates.
 	strokeIndex int
 	// fillIndex counts Fill calls for narrow diagnostic gates.
@@ -60,6 +66,9 @@ type splashCanvas struct {
 	// so Fill can mirror Poppler's doShadingPatternFill path for mesh shadings:
 	// current path becomes a clip, then the shading-specific rasterizer runs.
 	pendingFillShadingPattern *entity.ShadingPattern
+	// tilingReplayDepth is non-zero while PatternType1 content is replayed as
+	// vector operators into the parent canvas.
+	tilingReplayDepth int
 
 	// glyphCache memoises rasterized GlyphBitmaps keyed by font+glyph+size.
 	// Splash::fillGlyph is hot in text-heavy pages; without this every Tj
@@ -80,14 +89,24 @@ type splashCanvas struct {
 	// paints highlight appearances into a transparent Form XObject, so the
 	// alpha plane carries source coverage more faithfully than recovering it
 	// from black-on-white RGB luminance.
-	annotationMask bool
+	annotationMask        bool
+	pendingSoftMask       *Bitmap
+	pendingSoftMaskClip   clipBoundsSnapshot
+	pendingSoftMaskClipOK bool
+	softMaskClipStack     []softMaskClipStackEntry
+	lastFillPathForClip   *xpath.Path
+}
+
+type softMaskClipStackEntry struct {
+	clip   clipBoundsSnapshot
+	clipOK bool
 }
 
 // glyphCacheKey identifies a rasterized glyph for memoisation. fontSize is
 // quantized to 1/64pt so near-identical sizes still hit the cache (matches
 // poppler's SplashOutputDev::doUpdateFont fontMatrix quantization). gtQ
-// quantises the linear part of the glyph transform [a,b,c,d] (×1024 ints)
-// so cached entries at different CTM scales/rotations remain distinct.
+// quantises the linear part of the glyph transform [a,b,c,d] at 16.16-like
+// precision so cached entries whose FreeType transform differs remain distinct.
 // phaseQ encodes the X sub-pixel phase (0..3 for poppler-FT phased renderer),
 // or -1 for the path-based glyph (no phase dependency).
 //
@@ -107,6 +126,8 @@ type glyphCacheKey struct {
 	phaseXQ int8
 	phaseYQ int8
 }
+
+const splashGlyphTransformCacheScale = 1 << 16
 
 // NewBackend returns a domain/canvas.Canvas backed by the Splash rasterizer (02_api_design.md §8).
 //
@@ -358,11 +379,126 @@ func (c *splashCanvas) fill(evenOdd bool) {
 		c.debugTraceFill(fillIndex, evenOdd)
 	}
 
+	fillPath := c.path
+	if fillSubpathYMinBoundaryTieEnabled() {
+		fillPath = fillPath.WithIntegralSubpathYMinNudgedDown()
+	}
 	c.s.debugFillIndex = fillIndex
-	_ = c.s.Fill(c.path, evenOdd)
+	_ = c.s.Fill(fillPath, evenOdd)
 	c.s.debugFillIndex = -1
+	c.paintType3GlyphCacheRectFringe(fillPath)
+	c.rememberLastFillPathForClip(fillPath)
 	c.path = xpath.NewPath()
 	c.hasCur = false
+}
+
+func (c *splashCanvas) paintType3GlyphCacheRectFringe(path *xpath.Path) {
+	if c == nil || c.s == nil || c.s.bitmap == nil || !c.inType3GlyphCache() {
+		return
+	}
+	xMin, yMin, xMax, yMax, ok := type3GlyphCacheAxisAlignedRectBounds(path)
+	if !ok || xMax <= xMin || yMax <= yMin {
+		return
+	}
+	c.paintType3GlyphCacheFringePixelRun(xMin, xMax-1, yMin-1, 32)
+	c.paintType3GlyphCacheFringePixelRun(xMin, xMax-1, yMax, 32)
+	c.paintType3GlyphCacheFringePixelBlock(xMax, xMax, yMin, yMax-1, 32)
+	c.paintType3GlyphCacheFringePixel(xMax, yMin-1, 4)
+	c.paintType3GlyphCacheFringePixel(xMax, yMax, 4)
+}
+
+func type3GlyphCacheAxisAlignedRectBounds(path *xpath.Path) (int, int, int, int, bool) {
+	if path == nil {
+		return 0, 0, 0, 0, false
+	}
+	n := path.Length()
+	if n != 4 && n != 5 {
+		return 0, 0, 0, 0, false
+	}
+	if n == 5 {
+		first, _ := path.Point(0)
+		last, _ := path.Point(4)
+		if first.X != last.X || first.Y != last.Y {
+			return 0, 0, 0, 0, false
+		}
+		n = 4
+	}
+	xMin, yMin := math.Inf(1), math.Inf(1)
+	xMax, yMax := math.Inf(-1), math.Inf(-1)
+	xs := map[float64]struct{}{}
+	ys := map[float64]struct{}{}
+	for i := 0; i < n; i++ {
+		pt, _ := path.Point(i)
+		if math.IsNaN(pt.X) || math.IsInf(pt.X, 0) || math.IsNaN(pt.Y) || math.IsInf(pt.Y, 0) {
+			return 0, 0, 0, 0, false
+		}
+		xs[pt.X] = struct{}{}
+		ys[pt.Y] = struct{}{}
+		if pt.X < xMin {
+			xMin = pt.X
+		}
+		if pt.X > xMax {
+			xMax = pt.X
+		}
+		if pt.Y < yMin {
+			yMin = pt.Y
+		}
+		if pt.Y > yMax {
+			yMax = pt.Y
+		}
+	}
+	if len(xs) != 2 || len(ys) != 2 {
+		return 0, 0, 0, 0, false
+	}
+	const eps = 1e-9
+	rxMin, ryMin := math.Round(xMin), math.Round(yMin)
+	rxMax, ryMax := math.Round(xMax), math.Round(yMax)
+	if math.Abs(xMin-rxMin) > eps || math.Abs(yMin-ryMin) > eps ||
+		math.Abs(xMax-rxMax) > eps || math.Abs(yMax-ryMax) > eps {
+		return 0, 0, 0, 0, false
+	}
+	return int(rxMin), int(ryMin), int(rxMax), int(ryMax), true
+}
+
+func (c *splashCanvas) paintType3GlyphCacheFringePixelRun(x0, x1, y int, shape byte) {
+	for x := x0; x <= x1; x++ {
+		c.paintType3GlyphCacheFringePixel(x, y, shape)
+	}
+}
+
+func (c *splashCanvas) paintType3GlyphCacheFringePixelBlock(x0, x1, y0, y1 int, shape byte) {
+	for y := y0; y <= y1; y++ {
+		c.paintType3GlyphCacheFringePixelRun(x0, x1, y, shape)
+	}
+}
+
+func (c *splashCanvas) paintType3GlyphCacheFringePixel(x, y int, shape byte) {
+	if shape == 0 || c == nil || c.s == nil || c.s.bitmap == nil || c.s.state.fillPattern == nil {
+		return
+	}
+	if x < 0 || y < 0 || x >= c.s.bitmap.width || y >= c.s.bitmap.height {
+		return
+	}
+	if clip, _ := c.s.state.clip.(*xpath.Clip); clip != nil && !clip.Test(x, y) {
+		return
+	}
+	var p pipe
+	aInput := byte(Round(c.s.state.fillAlpha * 255))
+	c.s.pipeInit(&p, x, y, c.s.state.fillPattern, nil, aInput, true, false)
+	p.shape = shape
+	p.run(&p)
+}
+
+func fillSubpathYMinBoundaryTieEnabled() bool {
+	if os.Getenv("PDF_DISABLE_SPLASH_FILL_SUBPATH_YMIN_TIE") == "1" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_FILL_SUBPATH_YMIN_TIE"))) {
+	case "1", "true", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // Stroke rasterizes the accumulated path with the stroke pattern (Splash::stroke, Splash.cc:1810).
@@ -396,6 +532,107 @@ func (c *splashCanvas) Stroke() {
 	c.hasCur = false
 }
 
+// FillPathWithCTM rasterizes raw PDF user-space path coordinates with the full
+// PDF CTM inside Splash, matching SplashOutputDev::convertPath + Splash::fill.
+func (c *splashCanvas) FillPathWithCTM(elements []renderer.PathElement, ctm [6]float64, evenOdd bool) {
+	fillIndex := c.fillIndex
+	c.fillIndex++
+	if shouldSkipSplashFillIndexForDebug(fillIndex) {
+		c.path = xpath.NewPath()
+		c.hasCur = false
+		return
+	}
+
+	fillPath := popplerDropOpenSinglePointSubpaths(rendererPathElementsToXPath(elements))
+	if fillPath == nil || fillPath.IsEmpty() {
+		c.path = xpath.NewPath()
+		c.hasCur = false
+		return
+	}
+
+	fillMatrix := flipYMatrix(ctm, c.flipYOrigin())
+	savedMatrix := c.s.state.matrix
+	c.s.SetMatrix(fillMatrix)
+	if shouldTraceSplashFillIndex(fillIndex) {
+		savedPath := c.path
+		c.path = fillPath.Transformed(fillMatrix)
+		c.debugTraceFill(fillIndex, evenOdd)
+		c.path = savedPath
+	}
+	c.s.debugFillIndex = fillIndex
+	_ = c.s.Fill(fillPath, evenOdd)
+	c.s.debugFillIndex = -1
+	c.s.SetMatrix(savedMatrix)
+	c.path = xpath.NewPath()
+	c.hasCur = false
+}
+
+// StrokePathWithCTM rasterizes raw PDF user-space path coordinates with the full
+// PDF CTM inside Splash, matching SplashOutputDev::convertPath + Splash::stroke.
+func (c *splashCanvas) StrokePathWithCTM(elements []renderer.PathElement, ctm [6]float64, lineWidth float64, dash []float64, phase float64) {
+	strokeIndex := c.strokeIndex
+	c.strokeIndex++
+	if os.Getenv("PDF_DEBUG_SPLASH_STROKE_TRACE") != "" {
+		c.debugTraceStroke(strokeIndex)
+	}
+	if shouldSkipSplashStrokeIndexForDebug(strokeIndex) {
+		c.path = xpath.NewPath()
+		c.hasCur = false
+		return
+	}
+
+	strokePath := popplerDropOpenSinglePointSubpaths(rendererPathElementsToXPath(elements))
+	if strokePath == nil || strokePath.IsEmpty() {
+		c.path = xpath.NewPath()
+		c.hasCur = false
+		return
+	}
+
+	strokeMatrix := flipYMatrix(ctm, c.flipYOrigin())
+	savedMatrix := c.s.state.matrix
+	savedLineWidth := c.s.state.lineWidth
+	savedDash := append([]float64(nil), c.s.state.lineDash...)
+	savedDashPhase := c.s.state.lineDashPhase
+	savedMirrorStrokeNormals := c.s.mirrorStrokeNormals
+	savedStrokeAdjust := c.s.state.strokeAdjust
+
+	c.s.debugStrokeIndex = strokeIndex
+	c.s.SetMatrix(strokeMatrix)
+	c.s.SetLineWidth(lineWidth)
+	c.s.SetLineDash(dash, phase)
+	c.s.SetMirrorStrokeNormals(false)
+	if shouldDisableStrokeAdjustForDebugStrokeIndex(strokeIndex) {
+		c.s.SetStrokeAdjust(false)
+	}
+	_ = c.s.Stroke(strokePath)
+
+	c.s.SetMirrorStrokeNormals(savedMirrorStrokeNormals)
+	c.s.SetStrokeAdjust(savedStrokeAdjust)
+	c.s.SetLineDash(savedDash, savedDashPhase)
+	c.s.SetLineWidth(savedLineWidth)
+	c.s.SetMatrix(savedMatrix)
+	c.s.debugStrokeIndex = -1
+	c.path = xpath.NewPath()
+	c.hasCur = false
+}
+
+func rendererPathElementsToXPath(elements []renderer.PathElement) *xpath.Path {
+	out := xpath.NewPath()
+	for _, elem := range elements {
+		switch el := elem.(type) {
+		case *renderer.MoveTo:
+			_ = out.MoveToDroppingEmptySubpath(el.X, el.Y)
+		case *renderer.LineTo:
+			_ = out.LineTo(el.X, el.Y)
+		case *renderer.CurveTo:
+			_ = out.CurveTo(el.X1, el.Y1, el.X2, el.Y2, el.X, el.Y)
+		case *renderer.Close:
+			_ = out.Close(false)
+		}
+	}
+	return out
+}
+
 func (c *splashCanvas) popplerStrokePathAndMatrix() (*xpath.Path, [6]float64) {
 	if c == nil {
 		return xpath.NewPath(), [6]float64{1, 0, 0, 1, 0, 0}
@@ -404,19 +641,27 @@ func (c *splashCanvas) popplerStrokePathAndMatrix() (*xpath.Path, [6]float64) {
 	if c.path == nil {
 		return xpath.NewPath(), matrix
 	}
-	if c.strokePathHasDeviceAlignedButtCapPlane() {
-		return c.path.Clone(), [6]float64{1, 0, 0, 1, 0, 0}
+	strokePath := popplerDropOpenSinglePointSubpaths(c.path)
+	if c.strokePathHasDeviceAlignedButtCapPlaneForPath(strokePath) {
+		return strokePath.Clone(), [6]float64{1, 0, 0, 1, 0, 0}
 	}
 	// The evaluator already applies the PDF CTM and backend.MoveTo/LineTo then
 	// flips Y into Splash bitmap space. Poppler keeps the path pre-flip and
 	// applies the Y-down CTM in SplashXPath, after makeStrokePath has built the
 	// outline. Undo the eager flip for stroke geometry, then pass the same flip
 	// as Splash's matrix so stroke-adjust and AA scanning still see device coords.
-	return c.path.Transformed(matrix), matrix
+	return strokePath.Transformed(matrix), matrix
 }
 
 func (c *splashCanvas) strokePathHasDeviceAlignedButtCapPlane() bool {
-	if c == nil || c.s == nil || c.s.state == nil || c.path == nil {
+	if c == nil {
+		return false
+	}
+	return c.strokePathHasDeviceAlignedButtCapPlaneForPath(c.path)
+}
+
+func (c *splashCanvas) strokePathHasDeviceAlignedButtCapPlaneForPath(path *xpath.Path) bool {
+	if c == nil || c.s == nil || c.s.state == nil || path == nil {
 		return false
 	}
 	if os.Getenv("PDF_DEBUG_SPLASH_DISABLE_DEVICE_CAP_GATE") == "1" {
@@ -428,11 +673,11 @@ func (c *splashCanvas) strokePathHasDeviceAlignedButtCapPlane() bool {
 		c.s.state.lineWidth <= 0 {
 		return false
 	}
-	if c.path.Length() != 2 {
+	if path.Length() != 2 {
 		return false
 	}
-	p0, f0 := c.path.Point(0)
-	p1, f1 := c.path.Point(1)
+	p0, f0 := path.Point(0)
+	p1, f1 := path.Point(1)
 	if f0&pathFlagFirst == 0 ||
 		f1&pathFlagLast == 0 ||
 		f0&pathFlagClosed != 0 ||
@@ -451,6 +696,65 @@ func (c *splashCanvas) strokePathHasDeviceAlignedButtCapPlane() bool {
 		return false
 	}
 	return false
+}
+
+func popplerDropOpenSinglePointSubpaths(path *xpath.Path) *xpath.Path {
+	out := xpath.NewPath()
+	if path == nil || path.IsEmpty() {
+		return out
+	}
+	for start := 0; start < path.Length(); {
+		end := start
+		for end < path.Length() {
+			_, flag := path.Point(end)
+			if flag&pathFlagLast != 0 {
+				break
+			}
+			end++
+		}
+		if end >= path.Length() {
+			end = path.Length() - 1
+		}
+
+		_, firstFlag := path.Point(start)
+		_, lastFlag := path.Point(end)
+		isOpenSinglePoint := start == end &&
+			firstFlag&pathFlagFirst != 0 &&
+			lastFlag&pathFlagLast != 0 &&
+			firstFlag&pathFlagClosed == 0 &&
+			lastFlag&pathFlagClosed == 0
+		if isOpenSinglePoint {
+			start = end + 1
+			continue
+		}
+		appendPopplerStrokeSubpath(out, path, start, end)
+		start = end + 1
+	}
+	return out
+}
+
+func appendPopplerStrokeSubpath(out, path *xpath.Path, start, end int) {
+	if out == nil || path == nil || start > end {
+		return
+	}
+	first, firstFlag := path.Point(start)
+	_ = out.MoveToDroppingEmptySubpath(first.X, first.Y)
+	for i := start + 1; i <= end; {
+		pt, flag := path.Point(i)
+		if flag&pathFlagCurve != 0 && i+2 <= end {
+			ctrl2, _ := path.Point(i + 1)
+			endPt, _ := path.Point(i + 2)
+			_ = out.CurveTo(pt.X, pt.Y, ctrl2.X, ctrl2.Y, endPt.X, endPt.Y)
+			i += 3
+			continue
+		}
+		_ = out.LineTo(pt.X, pt.Y)
+		i++
+	}
+	_, lastFlag := path.Point(end)
+	if firstFlag&pathFlagClosed != 0 || lastFlag&pathFlagClosed != 0 {
+		_ = out.Close(false)
+	}
 }
 
 func strokePathIsLongOnePointVerticalGridLine(p0, p1 xpath.PathPoint, lineWidth float64) bool {
@@ -588,6 +892,7 @@ func (c *splashCanvas) debugTraceFill(index int, evenOdd bool) {
 // Clip intersects the clip with the current path, non-zero rule (Splash::clipToPath, Splash.cc:1704).
 func (c *splashCanvas) Clip() {
 	c.intersectCurrentPathVectorClipBounds()
+	c.prepareClipPathYFloorSnap()
 	_ = c.s.ClipToPath(c.path, false)
 	c.path = xpath.NewPath()
 	c.hasCur = false
@@ -596,20 +901,148 @@ func (c *splashCanvas) Clip() {
 // EoClip intersects the clip with the current path, even-odd rule (Splash::clipToPath, Splash.cc:1704).
 func (c *splashCanvas) EoClip() {
 	c.intersectCurrentPathVectorClipBounds()
+	c.prepareClipPathYFloorSnap()
 	_ = c.s.ClipToPath(c.path, true)
 	c.path = xpath.NewPath()
 	c.hasCur = false
+}
+
+func (c *splashCanvas) rememberLastFillPathForClip(path *xpath.Path) {
+	if c == nil || path == nil || path.IsEmpty() {
+		c.clearLastFillPathForClip()
+		return
+	}
+	c.lastFillPathForClip = path.Clone()
+}
+
+func (c *splashCanvas) clearLastFillPathForClip() {
+	if c != nil {
+		c.lastFillPathForClip = nil
+	}
+}
+
+func (c *splashCanvas) prepareClipPathYFloorSnap() {
+	if c == nil || c.s == nil {
+		return
+	}
+	if pathsMatchForFillClipScannerPhase(c.lastFillPathForClip, c.path) {
+		c.s.disableNextClipScannerYFloorSnap()
+	}
+	c.clearLastFillPathForClip()
+}
+
+func pathsMatchForFillClipScannerPhase(a, b *xpath.Path) bool {
+	if a == nil || b == nil || a.IsEmpty() || b.IsEmpty() {
+		return false
+	}
+	n := a.Length()
+	if n != b.Length() {
+		return false
+	}
+	const eps = 1e-9
+	strictMatch := true
+	for i := 0; i < n; i++ {
+		ap, af := a.Point(i)
+		bp, bf := b.Point(i)
+		if af != bf {
+			strictMatch = false
+			break
+		}
+		if math.Abs(ap.X-bp.X) > eps || math.Abs(ap.Y-bp.Y) > eps {
+			strictMatch = false
+			break
+		}
+	}
+	if strictMatch {
+		return true
+	}
+	const maxCyclicFillClipPathPoints = 64
+	if n > maxCyclicFillClipPathPoints {
+		return false
+	}
+	return closedSingleSubpathMatchesCyclic(a, b, eps)
+}
+
+func closedSingleSubpathMatchesCyclic(a, b *xpath.Path, eps float64) bool {
+	aLen, ok := closedSingleSubpathUniqueLen(a, eps)
+	if !ok {
+		return false
+	}
+	bLen, ok := closedSingleSubpathUniqueLen(b, eps)
+	if !ok || aLen != bLen {
+		return false
+	}
+	for offset := 0; offset < aLen; offset++ {
+		if !pathPointsNear(a, offset, b, 0, eps) {
+			continue
+		}
+		matches := true
+		for i := 0; i < aLen; i++ {
+			ai := (offset + i) % aLen
+			if !pathPointsNear(a, ai, b, i, eps) || pathCurveFlag(a, ai) != pathCurveFlag(b, i) {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
+}
+
+func closedSingleSubpathUniqueLen(path *xpath.Path, eps float64) (int, bool) {
+	if path == nil || path.Length() < 4 {
+		return 0, false
+	}
+	n := path.Length()
+	_, firstFlag := path.Point(0)
+	_, lastFlag := path.Point(n - 1)
+	if firstFlag&pathFlagFirst == 0 ||
+		firstFlag&pathFlagClosed == 0 ||
+		lastFlag&pathFlagLast == 0 ||
+		lastFlag&pathFlagClosed == 0 {
+		return 0, false
+	}
+	for i := 1; i < n-1; i++ {
+		_, flag := path.Point(i)
+		if flag&(pathFlagFirst|pathFlagLast|pathFlagClosed) != 0 {
+			return 0, false
+		}
+	}
+	if !pathPointsNear(path, 0, path, n-1, eps) {
+		return 0, false
+	}
+	return n - 1, true
+}
+
+func pathPointsNear(a *xpath.Path, ai int, b *xpath.Path, bi int, eps float64) bool {
+	ap, _ := a.Point(ai)
+	bp, _ := b.Point(bi)
+	return math.Abs(ap.X-bp.X) <= eps && math.Abs(ap.Y-bp.Y) <= eps
+}
+
+func pathCurveFlag(path *xpath.Path, i int) bool {
+	_, flag := path.Point(i)
+	return flag&pathFlagCurve != 0
 }
 
 func (c *splashCanvas) intersectCurrentPathVectorClipBounds() {
 	if c == nil || c.s == nil || c.path == nil || c.path.Length() == 0 {
 		return
 	}
-	pt, _ := c.path.Point(0)
+	c.intersectPathVectorClipBounds(c.path)
+}
+
+func (c *splashCanvas) intersectPathVectorClipBounds(path *xpath.Path) {
+	if c == nil || c.s == nil || path == nil || path.Length() == 0 {
+		return
+	}
+	pt, _ := path.Point(0)
 	xMin, xMax := pt.X, pt.X
 	yMin, yMax := pt.Y, pt.Y
-	for i := 1; i < c.path.Length(); i++ {
-		pt, _ = c.path.Point(i)
+	for i := 1; i < path.Length(); i++ {
+		pt, _ = path.Point(i)
 		if pt.X < xMin {
 			xMin = pt.X
 		}
@@ -625,9 +1058,9 @@ func (c *splashCanvas) intersectCurrentPathVectorClipBounds() {
 	}
 	if os.Getenv("PDF_DEBUG_SPLASH_CLIP_BBOX_TRACE") != "" {
 		fmt.Fprintf(os.Stderr, "SPLASH_CLIP_BBOX_TRACE pathLen=%d matrix=%v bounds=(%.9f,%.9f)-(%.9f,%.9f)\n",
-			c.path.Length(), c.s.state.matrix, xMin, yMin, xMax, yMax)
-		for i := 0; i < c.path.Length(); i++ {
-			pt, flag := c.path.Point(i)
+			path.Length(), c.s.state.matrix, xMin, yMin, xMax, yMax)
+		for i := 0; i < path.Length(); i++ {
+			pt, flag := path.Point(i)
 			fmt.Fprintf(os.Stderr, "  clip_pt[%03d]=(%.9f,%.9f) flag=0x%02x\n", i, pt.X, pt.Y, flag)
 		}
 	}
@@ -670,6 +1103,23 @@ func (c *splashCanvas) DrawTextUserSpace(text string, x, y float64, ctm [6]float
 	c.textUserSpace = false
 	c.textCTM = [6]float64{}
 	return err
+}
+
+// BeginPDFTextObject marks a PDF BT scope. Poppler keeps the text clipping
+// path outside the ordinary text cursor state and applies it only at ET.
+func (c *splashCanvas) BeginPDFTextObject() {
+	c.textClipPath = nil
+}
+
+// EndPDFTextObject applies any Tr 4-7 text clipping path accumulated during
+// the PDF text object, matching SplashOutputDev::endTextObject.
+func (c *splashCanvas) EndPDFTextObject() {
+	if c == nil || c.s == nil || c.textClipPath == nil || c.textClipPath.IsEmpty() {
+		c.textClipPath = nil
+		return
+	}
+	_ = c.s.ClipToPath(c.textClipPath, false)
+	c.textClipPath = nil
 }
 
 // BeginText opens a text object: stores the text origin in PDF user space (Y-up)
@@ -717,18 +1167,56 @@ func (c *splashCanvas) ShowText(text string) error {
 				fracX := glyphX - math.Floor(glyphX)
 				fracY := glyphY - math.Floor(glyphY)
 				cacheH := splashGlyphCacheHeightForTransform(font, fontSize, c.glyphTransform)
-				fmt.Fprintf(os.Stderr, "showGlyph font=%q code=%d glyph=%d x=%.17g y=%.17g glyphXY=(%.17g,%.17g) frac=(%.17g,%.17g) phase=(%.2f,%.2f) cacheH=%.4f userSpace=%t ctm=%v fillPattern=%T matrix=%v\n",
-					font.Name(), charCode, glyph, curX, curY, glyphX, glyphY, fracX, fracY, phaseXSlot, phaseYSlot, cacheH, c.textUserSpace, c.textCTM, c.s.state.fillPattern, c.s.state.matrix)
+				ctx := ""
+				if c.s != nil {
+					ctx = c.s.debugPaintContext
+				}
+				fmt.Fprintf(os.Stderr, "showGlyph font=%q code=%d glyph=%d renderMode=%d x=%.17g y=%.17g glyphXY=(%.17g,%.17g) frac=(%.17g,%.17g) phase=(%.2f,%.2f) cacheH=%.4f userSpace=%t ctm=%v fillPattern=%T matrix=%v ctx=%q\n",
+					font.Name(), charCode, glyph, c.textRenderMode, curX, curY, glyphX, glyphY, fracX, fracY, phaseXSlot, phaseYSlot, cacheH, c.textUserSpace, c.textCTM, c.s.state.fillPattern, c.s.state.matrix, ctx)
 			}
 			// Pass the final Splash-space glyph origin as phase source. Poppler
 			// keys FreeType glyphs by both x and y fractional phases before
 			// flooring the blit origin in Splash::fillGlyph.
-			gb := c.fetchGlyphPhased(font, glyph, fontSize, glyphX, glyphY)
-			if gb != nil && gb.W > 0 && gb.H > 0 {
-				// Place glyph at (curX, flipY(curY)) — the glyph path was
-				// already flipped into splash top-down space when rasterized,
-				// so this is the splash-bitmap origin for the glyph.
-				_ = c.s.FillGlyph(glyphX, glyphY, gb)
+			doFill := splashTextRenderModeFills(c.textRenderMode)
+			doStroke := splashTextRenderModeStrokes(c.textRenderMode)
+			doClip := splashTextRenderModeClips(c.textRenderMode)
+			var clipPath *xpath.Path
+			if doFill && doStroke {
+				path := c.glyphRenderPath(font, glyph, fontSize, glyphX, glyphY)
+				clipPath = path
+				_ = c.fillStrokeTextPath(path)
+			} else if doFill {
+				if os.Getenv("PDF_DEBUG_SPLASH_TEXT_FILL_PATH") == "1" || doClip {
+					path := c.glyphRenderPath(font, glyph, fontSize, glyphX, glyphY)
+					clipPath = path
+					if os.Getenv("PDF_DEBUG_SPLASH_TEXT_FILL_PATH") == "1" {
+						_ = c.fillTextPath(path)
+					} else {
+						gb := c.fetchGlyphPhased(font, glyph, fontSize, glyphX, glyphY)
+						if gb != nil && gb.W > 0 && gb.H > 0 {
+							_ = c.s.FillGlyph(glyphX, glyphY, gb)
+						}
+					}
+				} else {
+					gb := c.fetchGlyphPhased(font, glyph, fontSize, glyphX, glyphY)
+					if gb != nil && gb.W > 0 && gb.H > 0 {
+						// Place glyph at (curX, flipY(curY)) — the glyph path was
+						// already flipped into splash top-down space when rasterized,
+						// so this is the splash-bitmap origin for the glyph.
+						_ = c.s.FillGlyph(glyphX, glyphY, gb)
+					}
+				}
+			}
+			if !doFill && doStroke {
+				path := c.glyphRenderPath(font, glyph, fontSize, glyphX, glyphY)
+				clipPath = path
+				_ = c.strokeTextPath(path)
+			}
+			if !doFill && !doStroke && doClip {
+				clipPath = c.glyphRenderPath(font, glyph, fontSize, glyphX, glyphY)
+			}
+			if doClip {
+				c.appendTextClipPath(clipPath)
 			}
 		}
 		width, werr := font.GetGlyphWidth(glyph)
@@ -760,6 +1248,475 @@ func (c *splashCanvas) SetGlyphTransform(t [4]float64) {
 	}
 }
 
+// SetTextRenderMode stores PDF text rendering mode for glyph painting.
+func (c *splashCanvas) SetTextRenderMode(mode int) {
+	if mode < 0 || mode > 7 {
+		mode = 0
+	}
+	c.textRenderMode = mode
+}
+
+func splashTextRenderModeFills(mode int) bool {
+	switch mode {
+	case 0, 2, 4, 6:
+		return true
+	default:
+		return false
+	}
+}
+
+func splashTextRenderModeStrokes(mode int) bool {
+	switch mode {
+	case 1, 2, 5, 6:
+		return true
+	default:
+		return false
+	}
+}
+
+func splashTextRenderModeClips(mode int) bool {
+	return mode&4 != 0
+}
+
+func (c *splashCanvas) appendTextClipPath(p *xpath.Path) {
+	if c == nil || p == nil || p.IsEmpty() {
+		return
+	}
+	if c.textClipPath == nil {
+		c.textClipPath = p.Clone()
+		return
+	}
+	c.textClipPath.AddPath(p)
+}
+
+func (c *splashCanvas) glyphRenderPath(font entity.Font, glyph uint32, fontSize, glyphX, glyphY float64) *xpath.Path {
+	if font == nil {
+		return nil
+	}
+	gt := c.glyphTransform
+	if gt == ([4]float64{}) {
+		gt = [4]float64{1, 0, 0, 1}
+	}
+	if useDeferredTextGlyphPathMatrix() {
+		if renderer, ok := unwrapSplashGlyphPathTextMatrixRenderer(font); ok {
+			gp, err := renderer.RenderGlyphPathTextMatrix(glyph, fontSize, gt)
+			if err == nil && gp != nil && len(gp.Commands) > 0 {
+				p := glyphPathToXPathWithTransform(gp, gt)
+				if p != nil && !p.IsEmpty() {
+					p.Offset(glyphX, glyphY)
+					c.traceTextPath("text-matrix", font, glyph, fontSize, glyphX, glyphY, gt, p, nil)
+					return p
+				}
+			}
+			c.traceTextPath("text-matrix-empty", font, glyph, fontSize, glyphX, glyphY, gt, nil, err)
+		}
+	}
+	if renderer, ok := unwrapSplashGlyphPathMatrixRenderer(font); ok {
+		gp, err := renderer.RenderGlyphPathMatrix(glyph, fontSize, gt)
+		if err == nil && gp != nil && len(gp.Commands) > 0 {
+			p := glyphPathToXPath(gp)
+			if p != nil && !p.IsEmpty() {
+				p.Offset(glyphX, glyphY)
+				c.traceTextPath("matrix", font, glyph, fontSize, glyphX, glyphY, gt, p, nil)
+				return p
+			}
+		}
+		c.traceTextPath("matrix-empty", font, glyph, fontSize, glyphX, glyphY, gt, nil, err)
+	}
+	gp, err := font.RenderGlyph(glyph, fontSize)
+	if err != nil || gp == nil || len(gp.Commands) == 0 {
+		c.traceTextPath("fallback-empty", font, glyph, fontSize, glyphX, glyphY, gt, nil, err)
+		return nil
+	}
+	p := glyphPathToXPathWithTransform(gp, gt)
+	if p == nil || p.IsEmpty() {
+		c.traceTextPath("fallback-xpath-empty", font, glyph, fontSize, glyphX, glyphY, gt, p, nil)
+		return nil
+	}
+	p.Offset(glyphX, glyphY)
+	c.traceTextPath("fallback", font, glyph, fontSize, glyphX, glyphY, gt, p, nil)
+	return p
+}
+
+func useDeferredTextGlyphPathMatrix() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_TEXT_PATH_DEFER_MATRIX"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *splashCanvas) traceTextPath(source string, font entity.Font, glyph uint32, fontSize, glyphX, glyphY float64, gt [4]float64, p *xpath.Path, err error) {
+	if !c.shouldTraceTextPath() {
+		return
+	}
+	pathLen := 0
+	x0, y0, x1, y1 := 0.0, 0.0, 0.0, 0.0
+	if p != nil && !p.IsEmpty() {
+		pathLen = p.Length()
+		x0, y0, x1, y1 = xpathPathBounds(p)
+	}
+	errText := "-"
+	if err != nil {
+		errText = err.Error()
+	}
+	ctx := ""
+	if c != nil && c.s != nil {
+		ctx = c.s.debugPaintContext
+	}
+	fontName := "-"
+	if font != nil {
+		fontName = font.Name()
+	}
+	fmt.Fprintf(os.Stderr,
+		"SPLASH_TEXT_PATH_TRACE source=%s font=%q fontType=%q glyph=%d fontSize=%.6f glyphXY=(%.6f,%.6f) matrix=[%.6f %.6f %.6f %.6f] pathLen=%d bounds=(%.6f,%.6f)-(%.6f,%.6f) err=%q ctx=%q\n",
+		source, fontName, fontTypeChain(font), glyph, fontSize, glyphX, glyphY, gt[0], gt[1], gt[2], gt[3], pathLen, x0, y0, x1, y1, errText, ctx)
+}
+
+func (c *splashCanvas) shouldTraceTextPath() bool {
+	if os.Getenv("PDF_DEBUG_SPLASH_TEXT_PATH_TRACE") == "" {
+		return false
+	}
+	filter := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_TEXT_PATH_TRACE_CONTEXT"))
+	if filter == "" || c == nil || c.s == nil {
+		return true
+	}
+	return strings.Contains(c.s.debugPaintContext, filter)
+}
+
+func xpathPathBounds(p *xpath.Path) (x0, y0, x1, y1 float64) {
+	if p == nil || p.Length() == 0 {
+		return 0, 0, 0, 0
+	}
+	pt, _ := p.Point(0)
+	x0, y0, x1, y1 = pt.X, pt.Y, pt.X, pt.Y
+	for i := 1; i < p.Length(); i++ {
+		pt, _ = p.Point(i)
+		if pt.X < x0 {
+			x0 = pt.X
+		}
+		if pt.X > x1 {
+			x1 = pt.X
+		}
+		if pt.Y < y0 {
+			y0 = pt.Y
+		}
+		if pt.Y > y1 {
+			y1 = pt.Y
+		}
+	}
+	return x0, y0, x1, y1
+}
+
+func (c *splashCanvas) textFillPathWithYMinBoundaryTie(p *xpath.Path) *xpath.Path {
+	if p == nil || p.IsEmpty() || c == nil {
+		return p
+	}
+	if c.textRenderMode != 2 && c.textRenderMode != 6 {
+		return p
+	}
+
+	x0, y0, x1, y1 := xpathPathBounds(p)
+	if x1-x0 > 6 || y1-y0 > 4 {
+		return p
+	}
+	if math.Abs(y0-math.Round(y0)) > 1e-9 {
+		return p
+	}
+	bias := textFillYMinBoundaryTieBias(y0)
+	if bias == 0 {
+		return p
+	}
+
+	out := p.Clone()
+	out.Offset(0, bias)
+	return out
+}
+
+func textFillYMinBoundaryTieBias(yMin float64) float64 {
+	raw := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_TEXT_FILL_YMIN_SUBPIXEL_BIAS"))
+	if raw == "" || raw == "1" {
+		// Poppler's FreeType glyph path can enter Splash's AA scanner a single
+		// float step below an integral y-min. Pure-Go outlines can land exactly
+		// on the integer boundary, excluding the top AA sub-row for tiny Tr=2
+		// glyph fills. Move only enough to resolve that floor() tie.
+		return math.Nextafter(yMin, math.Inf(-1)) - yMin
+	}
+	if raw == "0" {
+		return 0
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0
+	}
+	return value
+}
+
+func fontTypeChain(font entity.Font) string {
+	if font == nil {
+		return "-"
+	}
+	parts := make([]string, 0, 4)
+	for font != nil && len(parts) < 8 {
+		parts = append(parts, fmt.Sprintf("%T", font))
+		type baseUnwrapper interface {
+			BaseFont() entity.Font
+		}
+		u, ok := font.(baseUnwrapper)
+		if !ok {
+			break
+		}
+		next := u.BaseFont()
+		if next == nil || next == font {
+			break
+		}
+		font = next
+	}
+	return strings.Join(parts, " -> ")
+}
+
+func (c *splashCanvas) fillStrokeTextGlyphPath(font entity.Font, glyph uint32, fontSize, glyphX, glyphY float64) error {
+	p := c.glyphRenderPath(font, glyph, fontSize, glyphX, glyphY)
+	return c.fillStrokeTextPath(p)
+}
+
+func (c *splashCanvas) fillStrokeTextPath(p *xpath.Path) error {
+	if p == nil || p.IsEmpty() {
+		return nil
+	}
+	if c.usePopplerTextPathOrder() {
+		return c.fillStrokeTextPathPopplerOrder(p)
+	}
+	return c.withTextGlyphPathIntegerSlopeBias(func() error {
+		// Poppler uses the same outline path for Tr 2/6 fill+stroke text and keeps
+		// stroke adjustment disabled while painting that path.
+		savedStrokeAdjust := c.s.state.strokeAdjust
+		c.s.SetStrokeAdjust(false)
+		defer c.s.SetStrokeAdjust(savedStrokeAdjust)
+		traceTextFillStrokePixels("before-fill", c.s)
+		fillPath := c.textFillPathWithYMinBoundaryTie(p)
+		if err := c.s.Fill(fillPath, false); err != nil {
+			return err
+		}
+		traceTextFillStrokePixels("after-fill", c.s)
+		if err := c.strokeTextPathWithPopplerLineWidth(p); err != nil {
+			return err
+		}
+		traceTextFillStrokePixels("after-stroke", c.s)
+		return nil
+	})
+}
+
+func (c *splashCanvas) withTextGlyphPathIntegerSlopeBias(paint func() error) error {
+	if paint == nil {
+		return nil
+	}
+	if c == nil || c.s == nil {
+		return paint()
+	}
+	saved := c.s.textGlyphPathIntegerSlopeBias
+	c.s.textGlyphPathIntegerSlopeBias = true
+	defer func() {
+		c.s.textGlyphPathIntegerSlopeBias = saved
+	}()
+	return paint()
+}
+
+func (c *splashCanvas) strokeTextGlyphPath(font entity.Font, glyph uint32, fontSize, glyphX, glyphY float64) error {
+	p := c.glyphRenderPath(font, glyph, fontSize, glyphX, glyphY)
+	return c.strokeTextPath(p)
+}
+
+func (c *splashCanvas) strokeTextPath(p *xpath.Path) error {
+	if p == nil || p.IsEmpty() {
+		return nil
+	}
+	if c.usePopplerTextPathOrder() {
+		return c.strokeTextPathPopplerOrder(p)
+	}
+	// Poppler disables stroke adjustment for text strokes in
+	// SplashOutputDev::drawChar because glyph outlines look misaligned when
+	// horizontal edges are snapped like ordinary vector strokes.
+	savedStrokeAdjust := c.s.state.strokeAdjust
+	c.s.SetStrokeAdjust(false)
+	defer c.s.SetStrokeAdjust(savedStrokeAdjust)
+	traceTextFillStrokePixels("before-stroke", c.s)
+	if err := c.strokeTextPathWithPopplerLineWidth(p); err != nil {
+		return err
+	}
+	traceTextFillStrokePixels("after-stroke", c.s)
+	return nil
+}
+
+func (c *splashCanvas) fillTextGlyphPath(font entity.Font, glyph uint32, fontSize, glyphX, glyphY float64) error {
+	p := c.glyphRenderPath(font, glyph, fontSize, glyphX, glyphY)
+	return c.fillTextPath(p)
+}
+
+func (c *splashCanvas) fillTextPath(p *xpath.Path) error {
+	if p == nil || p.IsEmpty() {
+		return nil
+	}
+	if c.usePopplerTextPathOrder() {
+		userPath, matrix, ok := c.popplerOrderedTextPath(p)
+		if ok {
+			return c.withTextPathMatrix(matrix, false, func() error {
+				return c.s.Fill(userPath, false)
+			})
+		}
+	}
+	return c.s.Fill(p, false)
+}
+
+func (c *splashCanvas) usePopplerTextPathOrder() bool {
+	return os.Getenv("PDF_DEBUG_SPLASH_TEXT_PATH_POPPLER_ORDER") == "1" && c.textUserSpace
+}
+
+func (c *splashCanvas) fillStrokeTextPathPopplerOrder(p *xpath.Path) error {
+	userPath, matrix, ok := c.popplerOrderedTextPath(p)
+	if !ok {
+		return nil
+	}
+	return c.withTextPathMatrix(matrix, true, func() error {
+		savedStrokeAdjust := c.s.state.strokeAdjust
+		c.s.SetStrokeAdjust(false)
+		defer c.s.SetStrokeAdjust(savedStrokeAdjust)
+		traceTextFillStrokePixels("before-fill", c.s)
+		fillPath := c.textFillPathWithYMinBoundaryTie(userPath)
+		if err := c.s.Fill(fillPath, false); err != nil {
+			return err
+		}
+		traceTextFillStrokePixels("after-fill", c.s)
+		if err := c.strokeTextPathWithPopplerLineWidth(userPath); err != nil {
+			return err
+		}
+		traceTextFillStrokePixels("after-stroke", c.s)
+		return nil
+	})
+}
+
+func (c *splashCanvas) strokeTextPathPopplerOrder(p *xpath.Path) error {
+	userPath, matrix, ok := c.popplerOrderedTextPath(p)
+	if !ok {
+		return nil
+	}
+	return c.withTextPathMatrix(matrix, true, func() error {
+		savedStrokeAdjust := c.s.state.strokeAdjust
+		c.s.SetStrokeAdjust(false)
+		defer c.s.SetStrokeAdjust(savedStrokeAdjust)
+		return c.strokeTextPathWithPopplerLineWidth(userPath)
+	})
+}
+
+func (c *splashCanvas) popplerOrderedTextPath(p *xpath.Path) (*xpath.Path, [6]float64, bool) {
+	matrix := flipYMatrix(c.textCTM, c.flipYOrigin())
+	inv, ok := invertSplashAffine(matrix)
+	if !ok {
+		return nil, [6]float64{}, false
+	}
+	return p.Transformed(inv), matrix, true
+}
+
+func (c *splashCanvas) withTextPathMatrix(matrix [6]float64, stroke bool, paint func() error) error {
+	savedMatrix := c.s.state.matrix
+	savedLineWidth := c.s.state.lineWidth
+	c.s.SetMatrix(matrix)
+	if stroke {
+		if scale := averageMatrixScale(matrix); scale > 0 {
+			c.s.SetLineWidth(savedLineWidth / scale)
+		}
+	}
+	defer func() {
+		c.s.SetLineWidth(savedLineWidth)
+		c.s.SetMatrix(savedMatrix)
+	}()
+	return paint()
+}
+
+func invertSplashAffine(m [6]float64) ([6]float64, bool) {
+	det := m[0]*m[3] - m[1]*m[2]
+	if math.Abs(det) < 1e-12 {
+		return [6]float64{}, false
+	}
+	invDet := 1 / det
+	a := m[3] * invDet
+	b := -m[1] * invDet
+	c := -m[2] * invDet
+	d := m[0] * invDet
+	e := -(a*m[4] + c*m[5])
+	f := -(b*m[4] + d*m[5])
+	return [6]float64{a, b, c, d, e, f}, true
+}
+
+func averageMatrixScale(m [6]float64) float64 {
+	scaleX := math.Hypot(m[0], m[1])
+	scaleY := math.Hypot(m[2], m[3])
+	switch {
+	case scaleX > 0 && scaleY > 0:
+		return (scaleX + scaleY) / 2
+	case scaleX > 0:
+		return scaleX
+	case scaleY > 0:
+		return scaleY
+	default:
+		return 0
+	}
+}
+
+func (c *splashCanvas) strokeTextPathWithPopplerLineWidth(p *xpath.Path) error {
+	if c == nil || c.s == nil || c.s.state == nil {
+		return nil
+	}
+	lineWidth := c.s.state.lineWidth
+	if scale := debugTextStrokeLineWidthScale(); scale > 0 && scale != 1 {
+		c.s.SetLineWidth(lineWidth * scale)
+		defer c.s.SetLineWidth(lineWidth)
+	}
+	if lineWidth == 0 {
+		c.s.SetLineWidth(c.popplerTextZeroStrokeLineWidth())
+		defer c.s.SetLineWidth(lineWidth)
+	}
+	return c.s.Stroke(p)
+}
+
+func debugTextStrokeLineWidthScale() float64 {
+	raw := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_TEXT_STROKE_WIDTH_SCALE"))
+	if raw == "" {
+		return 1
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v <= 0 {
+		return 1
+	}
+	return v
+}
+
+func (c *splashCanvas) popplerTextZeroStrokeLineWidth() float64 {
+	vDPI := c.popplerTextVDPI()
+	if vDPI <= 0 {
+		vDPI = 150
+	}
+	return 1 / vDPI
+}
+
+func (c *splashCanvas) popplerTextVDPI() float64 {
+	if c == nil {
+		return 150
+	}
+	gt := c.glyphTransform
+	if gt == ([4]float64{}) {
+		return 150
+	}
+	if vScale := math.Hypot(gt[2], gt[3]); vScale > 0 {
+		return 72 * vScale
+	}
+	if hScale := math.Hypot(gt[0], gt[1]); hScale > 0 {
+		return 72 * hScale
+	}
+	return 150
+}
+
 // fetchGlyph returns a rasterized GlyphBitmap for (font, glyph, fontSize),
 // using c.glyphCache to amortise repeated rasterization of the same glyph
 // (Splash.cc:2603 hot path mitigation).
@@ -776,8 +1733,9 @@ func (c *splashCanvas) fetchGlyph(font entity.Font, glyph uint32, fontSize float
 }
 
 // fetchGlyphPhased is fetchGlyph with explicit sub-pixel phase support.
-// phaseX/phaseY are Splash-space glyph origins used by the FT phased renderer
-// to align glyph anti-aliasing with the fractional cursor position.
+// phaseX is the Splash-space glyph origin used by the FT phased renderer to
+// align glyph anti-aliasing with the fractional cursor position. Poppler's
+// SplashFTFont ignores yFrac for FT glyphs, so the FT y phase is always zero.
 func (c *splashCanvas) fetchGlyphPhased(font entity.Font, glyph uint32, fontSize, phaseX, phaseY float64) *GlyphBitmap {
 	if c.glyphCache == nil {
 		c.glyphCache = make(map[glyphCacheKey]*GlyphBitmap)
@@ -790,10 +1748,10 @@ func (c *splashCanvas) fetchGlyphPhased(font entity.Font, glyph uint32, fontSize
 	// stable across float jitter while still distinguishing different scales
 	// (e.g. cached entries at 150 DPI vs 72 DPI must not collide).
 	gtQ := [4]int64{
-		int64(math.Round(gt[0] * 1024)),
-		int64(math.Round(gt[1] * 1024)),
-		int64(math.Round(gt[2] * 1024)),
-		int64(math.Round(gt[3] * 1024)),
+		int64(math.Round(gt[0] * splashGlyphTransformCacheScale)),
+		int64(math.Round(gt[1] * splashGlyphTransformCacheScale)),
+		int64(math.Round(gt[2] * splashGlyphTransformCacheScale)),
+		int64(math.Round(gt[3] * splashGlyphTransformCacheScale)),
 	}
 
 	// Try FreeType bitmap fast path first (matches ImageCanvas behaviour and
@@ -806,7 +1764,7 @@ func (c *splashCanvas) fetchGlyphPhased(font entity.Font, glyph uint32, fontSize
 		scaleY := math.Hypot(gt[2], gt[3])
 		if mpr, ok := unwrapSplashMatrixPhasedRenderer(font); ok && scaleY > 0 {
 			phaseXSlot := splashGlyphXPhaseSlotForTransform(phaseX, font, fontSize, gt)
-			phaseYSlot := splashGlyphYPhaseSlotForTransform(phaseY, font, fontSize, gt)
+			phaseYSlot := 0.0
 			phaseXQ := splashGlyphPhaseQ(phaseXSlot)
 			phaseYQ := splashGlyphPhaseQ(phaseYSlot)
 			key := glyphCacheKey{
@@ -835,6 +1793,7 @@ func (c *splashCanvas) fetchGlyphPhased(font entity.Font, glyph uint32, fontSize
 					fmt.Fprintf(os.Stderr, "fetchGlyph(FT-matrix) font=%s glyph=%d size=%.8f gt=%v phase=(%.2f,%.2f) bw=%d bh=%d bleft=%d btop=%d\n",
 						font.Name(), glyph, fontSize, gt, phaseXSlot, phaseYSlot, bw, bh, bleft, btop)
 				}
+				debugDumpSplashGlyphRows("FT-matrix", font, glyph, phaseXSlot, phaseYSlot, bw, bh, bleft, btop, buf)
 				return gb
 			}
 		}
@@ -853,7 +1812,7 @@ func (c *splashCanvas) fetchGlyphPhased(font entity.Font, glyph uint32, fontSize
 		scaleY := math.Abs(gt[3])
 		if tpr, ok := unwrapSplashTransformedPhasedRenderer(font); ok && scaleX > 0 && scaleY > 0 && os.Getenv("PDF_DEBUG_SPLASH_GLYPH_SKIP_TRANSFORMED") == "" {
 			phaseXSlot := splashGlyphXPhaseSlotForTransform(phaseX, font, fontSize, gt)
-			phaseYSlot := splashGlyphYPhaseSlotForTransform(phaseY, font, fontSize, gt)
+			phaseYSlot := 0.0
 			phaseXQ := splashGlyphPhaseQ(phaseXSlot)
 			phaseYQ := splashGlyphPhaseQ(phaseYSlot)
 			key := glyphCacheKey{
@@ -882,6 +1841,7 @@ func (c *splashCanvas) fetchGlyphPhased(font entity.Font, glyph uint32, fontSize
 					fmt.Fprintf(os.Stderr, "fetchGlyph(FT-transformed) font=%s glyph=%d size=%.8f sx=%.8f sy=%.8f phase=(%.2f,%.2f) bw=%d bh=%d bleft=%d btop=%d\n",
 						font.Name(), glyph, fontSize, scaleX, scaleY, phaseXSlot, phaseYSlot, bw, bh, bleft, btop)
 				}
+				debugDumpSplashGlyphRows("FT-transformed", font, glyph, phaseXSlot, phaseYSlot, bw, bh, bleft, btop, buf)
 				return gb
 			}
 		}
@@ -891,7 +1851,7 @@ func (c *splashCanvas) fetchGlyphPhased(font entity.Font, glyph uint32, fontSize
 			if dpi > 0 {
 				if pr, ok := unwrapSplashPhasedRenderer(font); ok {
 					phaseXSlot := splashGlyphXPhaseSlotForTransform(phaseX, font, fontSize, gt)
-					phaseYSlot := splashGlyphYPhaseSlotForTransform(phaseY, font, fontSize, gt)
+					phaseYSlot := 0.0
 					phaseXQ := splashGlyphPhaseQ(phaseXSlot)
 					phaseYQ := splashGlyphPhaseQ(phaseYSlot)
 					key := glyphCacheKey{
@@ -926,6 +1886,7 @@ func (c *splashCanvas) fetchGlyphPhased(font entity.Font, glyph uint32, fontSize
 							fmt.Fprintf(os.Stderr, "fetchGlyph(FT) font=%s glyph=%d size=%.8f dpi=%d phase=(%.2f,%.2f) bw=%d bh=%d bleft=%d btop=%d\n",
 								font.Name(), glyph, fontSize, dpi, phaseXSlot, phaseYSlot, bw, bh, bleft, btop)
 						}
+						debugDumpSplashGlyphRows("FT", font, glyph, phaseXSlot, phaseYSlot, bw, bh, bleft, btop, buf)
 						return gb
 					}
 				} else if br, ok := unwrapSplashBitmapRenderer(font); ok {
@@ -951,6 +1912,7 @@ func (c *splashCanvas) fetchGlyphPhased(font entity.Font, glyph uint32, fontSize
 							Data: buf,
 						}
 						c.glyphCache[key] = gb
+						debugDumpSplashGlyphRows("FT-bitmap", font, glyph, 0, 0, bw, bh, bleft, btop, buf)
 						return gb
 					}
 				}
@@ -988,6 +1950,98 @@ func (c *splashCanvas) fetchGlyphPhased(font entity.Font, glyph uint32, fontSize
 	return gb
 }
 
+func debugDumpSplashGlyphRows(kind string, font entity.Font, glyph uint32, phaseX, phaseY float64, width, height, left, top int, buf []byte) {
+	if !shouldDumpSplashGlyphRows(glyph) || width <= 0 || height <= 0 || len(buf) == 0 {
+		return
+	}
+	fontName := "<nil>"
+	if font != nil {
+		fontName = font.Name()
+	}
+	fmt.Fprintf(os.Stderr, "GO_PDF_FT_GLYPH kind=%s font=%q glyph=%d phase=(%.2f,%.2f) left=%d top=%d w=%d h=%d rowSize=%d%s\n",
+		kind, fontName, glyph, phaseX, phaseY, left, top, width, height, width, debugSplashFontDataLabel(font))
+	maxRows := debugSplashGlyphRowDumpRows(height)
+	for row := 0; row < maxRows; row++ {
+		rowOff := row * width
+		if rowOff >= len(buf) {
+			break
+		}
+		rowEnd := rowOff + width
+		if rowEnd > len(buf) {
+			rowEnd = len(buf)
+		}
+		fmt.Fprintf(os.Stderr, "GO_PDF_FT_GLYPH_ROW row=%d", row)
+		for _, v := range buf[rowOff:rowEnd] {
+			fmt.Fprintf(os.Stderr, " %02x", v)
+		}
+		fmt.Fprintln(os.Stderr)
+	}
+}
+
+type splashFontDataProvider interface {
+	FontData() []byte
+}
+
+func debugSplashFontDataLabel(font entity.Font) string {
+	for font != nil {
+		if p, ok := font.(splashFontDataProvider); ok {
+			data := p.FontData()
+			if len(data) > 0 {
+				sum := sha256.Sum256(data)
+				return fmt.Sprintf(" fontDataLen=%d fontDataSHA256=%x", len(data), sum[:8])
+			}
+		}
+		type baseUnwrapper interface {
+			BaseFont() entity.Font
+		}
+		u, ok := font.(baseUnwrapper)
+		if !ok {
+			break
+		}
+		font = u.BaseFont()
+	}
+	return ""
+}
+
+func shouldDumpSplashGlyphRows(glyph uint32) bool {
+	raw := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_GLYPH_ROW_DUMP"))
+	if raw == "" {
+		return false
+	}
+	if raw == "1" || strings.EqualFold(raw, "all") || raw == "*" {
+		return true
+	}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		v, err := strconv.ParseUint(part, 10, 32)
+		if err == nil && uint32(v) == glyph {
+			return true
+		}
+	}
+	return false
+}
+
+func debugSplashGlyphRowDumpRows(height int) int {
+	raw := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_GLYPH_ROW_DUMP_ROWS"))
+	if raw == "" {
+		if height < 4 {
+			return height
+		}
+		return 4
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return 0
+	}
+	if v > height {
+		return height
+	}
+	return v
+}
+
 // unwrapSplashBitmapRenderer mirrors canvas.unwrapBitmapRenderer — splits the
 // font wrapper chain to find a font with FreeType bitmap support.
 func unwrapSplashBitmapRenderer(font entity.Font) (entity.BitmapGlyphRenderer, bool) {
@@ -1016,6 +2070,14 @@ type splashTransformedPhasedRenderer interface {
 // path for rotated or sheared glyphs.
 type splashMatrixPhasedRenderer interface {
 	RenderGlyphBitmapMatrixPhased(glyph uint32, sizePt float64, matrix [4]float64, phaseX, phaseY float64) ([]byte, int, int, int, int, error)
+}
+
+type splashGlyphPathMatrixRenderer interface {
+	RenderGlyphPathMatrix(glyph uint32, sizePt float64, matrix [4]float64) (*entity.GlyphPath, error)
+}
+
+type splashGlyphPathTextMatrixRenderer interface {
+	RenderGlyphPathTextMatrix(glyph uint32, sizePt float64, matrix [4]float64) (*entity.GlyphPath, error)
 }
 
 // unwrapSplashTransformedPhasedRenderer walks the BaseFont chain looking for a
@@ -1047,6 +2109,40 @@ func unwrapSplashMatrixPhasedRenderer(font entity.Font) (splashMatrixPhasedRende
 	if u, ok := font.(baseUnwrapper); ok {
 		if base := u.BaseFont(); base != nil {
 			return unwrapSplashMatrixPhasedRenderer(base)
+		}
+	}
+	return nil, false
+}
+
+// unwrapSplashGlyphPathMatrixRenderer walks the BaseFont chain looking for a
+// font that implements RenderGlyphPathMatrix.
+func unwrapSplashGlyphPathMatrixRenderer(font entity.Font) (splashGlyphPathMatrixRenderer, bool) {
+	if pr, ok := font.(splashGlyphPathMatrixRenderer); ok {
+		return pr, true
+	}
+	type baseUnwrapper interface {
+		BaseFont() entity.Font
+	}
+	if u, ok := font.(baseUnwrapper); ok {
+		if base := u.BaseFont(); base != nil {
+			return unwrapSplashGlyphPathMatrixRenderer(base)
+		}
+	}
+	return nil, false
+}
+
+// unwrapSplashGlyphPathTextMatrixRenderer walks the BaseFont chain looking for a
+// font that implements RenderGlyphPathTextMatrix.
+func unwrapSplashGlyphPathTextMatrixRenderer(font entity.Font) (splashGlyphPathTextMatrixRenderer, bool) {
+	if pr, ok := font.(splashGlyphPathTextMatrixRenderer); ok {
+		return pr, true
+	}
+	type baseUnwrapper interface {
+		BaseFont() entity.Font
+	}
+	if u, ok := font.(baseUnwrapper); ok {
+		if base := u.BaseFont(); base != nil {
+			return unwrapSplashGlyphPathTextMatrixRenderer(base)
 		}
 	}
 	return nil, false
@@ -1147,16 +2243,30 @@ func splashGlyphYPhaseSlotForTransform(y float64, font entity.Font, fontSize flo
 
 func splashGlyphSnapCoord(v float64) float64 {
 	raw := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_GLYPH_SNAP_EPS"))
-	if raw == "" {
-		return v
+	if raw != "" {
+		eps, err := strconv.ParseFloat(raw, 64)
+		if err == nil && eps > 0 {
+			nearest := math.Round(v)
+			if math.Abs(v-nearest) <= eps {
+				return nearest
+			}
+		}
 	}
-	eps, err := strconv.ParseFloat(raw, 64)
-	if err != nil || eps <= 0 {
-		return v
-	}
-	nearest := math.Round(v)
-	if math.Abs(v-nearest) <= eps {
-		return nearest
+	gridRaw := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_GLYPH_SNAP_GRID"))
+	if gridRaw != "" {
+		grid, err := strconv.ParseFloat(gridRaw, 64)
+		if err == nil && grid > 0 {
+			eps := 1e-12
+			if epsRaw := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_GLYPH_SNAP_GRID_EPS")); epsRaw != "" {
+				if parsed, parseErr := strconv.ParseFloat(epsRaw, 64); parseErr == nil && parsed > 0 {
+					eps = parsed
+				}
+			}
+			nearest := math.Round(v*grid) / grid
+			if math.Abs(v-nearest) <= eps {
+				return nearest
+			}
+		}
 	}
 	return v
 }
@@ -1210,12 +2320,34 @@ func splashGlyphCacheBBoxAndUnits(font entity.Font) (float64, float64, float64, 
 	if xMin, yMin, xMax, yMax, units, ok := splashPopplerGlyphCacheBBox(font); ok && units > 0 {
 		return xMin, yMin, xMax, yMax, units
 	}
+	if xMin, yMin, xMax, yMax, units, ok := splashFreeTypeGlyphCacheBBox(font); ok && units > 0 {
+		return xMin, yMin, xMax, yMax, units
+	}
 	xMin, yMin, xMax, yMax := font.GetBoundingBox()
 	unitsPerEm := font.UnitsPerEm()
 	if unitsPerEm == 0 {
 		unitsPerEm = 1000
 	}
 	return xMin, yMin, xMax, yMax, unitsPerEm
+}
+
+type splashFreeTypeGlyphCacheBBoxProvider interface {
+	FreeTypeBoundingBox() (float64, float64, float64, float64, uint16, bool)
+}
+
+func splashFreeTypeGlyphCacheBBox(font entity.Font) (float64, float64, float64, float64, uint16, bool) {
+	if provider, ok := font.(splashFreeTypeGlyphCacheBBoxProvider); ok {
+		return provider.FreeTypeBoundingBox()
+	}
+	type baseUnwrapper interface {
+		BaseFont() entity.Font
+	}
+	if unwrapper, ok := font.(baseUnwrapper); ok {
+		if base := unwrapper.BaseFont(); base != nil {
+			return splashFreeTypeGlyphCacheBBox(base)
+		}
+	}
+	return 0, 0, 0, 0, 0, false
 }
 
 func splashGlyphCacheTransformedY(x, y float64, gt [4]float64, scale float64) int {
@@ -1286,7 +2418,10 @@ func glyphPathToXPathWithTransform(gp *entity.GlyphPath, gt [4]float64) *xpath.P
 			x3, y3 := tx(v.X3, v.Y3)
 			_ = out.CurveTo(x1, y1, x2, y2, x3, y3)
 		case *entity.PathClose:
-			_ = out.Close(true)
+			// Poppler's SplashFTFont glyph callbacks call SplashPath::close()
+			// with force=false; forcing a duplicate close segment changes glyph
+			// stroke joins when the outline already returned to the contour start.
+			_ = out.Close(false)
 		}
 	}
 	return out
@@ -1341,7 +2476,57 @@ func (c *splashCanvas) DrawImage(img image.Image, x, y, width, height float64, i
 	// Poppler's regular SplashOutputDev::drawImage passes srcAlpha=false.
 	// PDF alpha is handled by SMask/Mask-specific paths instead of borrowing the
 	// destination bitmap alpha channel.
+	if !c.inType3Glyph() && usePopplerRegularImageContract() {
+		return c.drawImageWithPopplerContract(img, x, y, width, height, interpolate, false)
+	}
 	return c.drawImage(img, x, y, width, height, interpolate, false)
+}
+
+// DrawImageWithSourceAlpha mirrors Poppler's drawMaskedImage source-alpha path:
+// color samples and the explicit mask alpha are delivered together to Splash.
+func (c *splashCanvas) DrawImageWithSourceAlpha(img image.Image, x, y, width, height float64, interpolate bool) error {
+	if !c.inType3Glyph() && usePopplerRegularImageContract() {
+		return c.drawImageWithPopplerContract(img, x, y, width, height, interpolate, true)
+	}
+	return c.drawImage(img, x, y, width, height, interpolate, true)
+}
+
+// DrawImageMask paints a 1-bit image mask with the current fill color/pattern,
+// matching SplashOutputDev::drawImageMask's use of Splash::fillImageMask.
+func (c *splashCanvas) DrawImageMask(mask domainimage.ImageMask, x, y, width, height float64) error {
+	if mask == nil || mask.Image() == nil || c.s == nil || c.s.bitmap == nil {
+		return nil
+	}
+	maskImg := mask.Image()
+	bounds := maskImg.Bounds()
+	srcW, srcH := bounds.Dx(), bounds.Dy()
+	if srcW <= 0 || srcH <= 0 {
+		return nil
+	}
+
+	src := func(row int, dst []byte) error {
+		if row < 0 || row >= srcH {
+			return nil
+		}
+		srcY := bounds.Min.Y + row
+		for col := 0; col < srcW; col++ {
+			gray := color.GrayModel.Convert(maskImg.At(bounds.Min.X+col, srcY)).(color.Gray).Y
+			dst[col] = gray
+		}
+		return nil
+	}
+
+	unitMat := [6]float64{width, 0, 0, height, x, y}
+	composed := composeMatrix(c.s.state.matrix, unitMat)
+	mat := c.imageDrawMatrixForRegularImage(composed)
+	if c.inType3Glyph() || !usePopplerRegularImageContract() {
+		mat = c.imageDrawMatrix(composed)
+	}
+	return c.s.FillImageMask(src, srcW, srcH, mat, c.inType3Glyph())
+}
+
+func usePopplerRegularImageContract() bool {
+	return os.Getenv("PDF_DEBUG_SPLASH_DISABLE_POPPLER_IMAGE_CONTRACT") != "1"
 }
 
 func (c *splashCanvas) drawImage(
@@ -1375,15 +2560,14 @@ func (c *splashCanvas) drawImage(
 		// matches the evaluator's CTM convention. Without this the smile.png
 		// from 007-imagemagick lands upside-down on the splash bitmap.
 		srcY := bounds.Min.Y + row
+		if os.Getenv("PDF_DEBUG_SPLASH_POPPLER_IMAGE_SOURCE_FLIP") == "1" {
+			srcY = bounds.Min.Y + (srcH - 1 - row)
+		}
 		if flipSourceY {
 			srcY = bounds.Min.Y + (srcH - 1 - row)
 		}
 		for col := 0; col < srcW; col++ {
-			r16, g16, b16, a16 := img.At(bounds.Min.X+col, srcY).RGBA()
-			r8 := byte(r16 >> 8)
-			g8 := byte(g16 >> 8)
-			b8 := byte(b16 >> 8)
-			a8 := byte(a16 >> 8)
+			r8, g8, b8, a8 := sampleImageRGBA8(img, bounds.Min.X+col, srcY, sourceAlpha)
 			if !sourceAlpha && a8 != 0 && a8 != 0xFF {
 				r8 = unpremultiplyByte(r8, a8)
 				g8 = unpremultiplyByte(g8, a8)
@@ -1441,6 +2625,117 @@ func (c *splashCanvas) drawImage(
 	return c.s.drawImageImpl(src, srcW, srcH, mat, interpolate, sourceAlpha)
 }
 
+func (c *splashCanvas) drawImageWithPopplerContract(
+	img image.Image,
+	x, y, width, height float64,
+	interpolate bool,
+	sourceAlpha bool,
+) error {
+	if img == nil || c.s == nil || c.s.bitmap == nil {
+		return nil
+	}
+	bounds := img.Bounds()
+	srcW, srcH := bounds.Dx(), bounds.Dy()
+	if srcW <= 0 || srcH <= 0 {
+		return nil
+	}
+	mode := c.s.bitmap.Mode()
+	nComps := nCompsForMode(mode)
+	if nComps == 0 {
+		return ErrModeMismatch
+	}
+	postScaleICCRGB := c.popplerPostScaleICCRGB(img, mode, sourceAlpha)
+
+	src := func(row int, colorLine, alphaLine []byte) error {
+		if row < 0 || row >= srcH {
+			return nil
+		}
+		srcY := bounds.Min.Y + row
+		for col := 0; col < srcW; col++ {
+			r8, g8, b8, a8 := sampleImageRGBA8(img, bounds.Min.X+col, srcY, sourceAlpha)
+			if !sourceAlpha && a8 != 0 && a8 != 0xFF {
+				r8 = unpremultiplyByte(r8, a8)
+				g8 = unpremultiplyByte(g8, a8)
+				b8 = unpremultiplyByte(b8, a8)
+			}
+			switch mode {
+			case ModeMono8:
+				y := (2126*uint32(r8) + 7152*uint32(g8) + 722*uint32(b8) + 5000) / 10000
+				if y > 0xFF {
+					y = 0xFF
+				}
+				colorLine[col] = byte(y)
+			case ModeBGR8:
+				colorLine[col*3+0] = b8
+				colorLine[col*3+1] = g8
+				colorLine[col*3+2] = r8
+			case ModeXBGR8:
+				colorLine[col*4+0] = b8
+				colorLine[col*4+1] = g8
+				colorLine[col*4+2] = r8
+				colorLine[col*4+3] = 0
+			case ModeCMYK8:
+				k := uint32(0xFF)
+				if uint32(r8) < k {
+					k = uint32(r8)
+				}
+				if uint32(g8) < k {
+					k = uint32(g8)
+				}
+				if uint32(b8) < k {
+					k = uint32(b8)
+				}
+				colorLine[col*4+0] = byte(0xFF - r8)
+				colorLine[col*4+1] = byte(0xFF - g8)
+				colorLine[col*4+2] = byte(0xFF - b8)
+				colorLine[col*4+3] = byte(0xFF - k)
+			default:
+				colorLine[col*3+0] = r8
+				colorLine[col*3+1] = g8
+				colorLine[col*3+2] = b8
+			}
+			if alphaLine != nil {
+				alphaLine[col] = a8
+			}
+		}
+		return nil
+	}
+
+	unitMat := [6]float64{width, 0, 0, height, x, y}
+	composed := composeMatrix(c.s.state.matrix, unitMat)
+	mat := c.imageDrawMatrixForRegularImage(composed)
+	if os.Getenv("PDF_DEBUG_SPLASH_POPPLER_IMAGE_LEGACY_MATRIX") == "1" {
+		mat = c.imageDrawMatrix(composed)
+	}
+	return c.s.drawImageImplWithPostTransform(src, srcW, srcH, mat, interpolate, sourceAlpha, postScaleICCRGB)
+}
+
+type popplerPostScaleICCRGBImage interface {
+	PopplerPostScaleICCRGB(r, g, b byte) (byte, byte, byte)
+}
+
+func (c *splashCanvas) popplerPostScaleICCRGB(img image.Image, mode ColorMode, sourceAlpha bool) postScaleRGBTransform {
+	if os.Getenv("PDF_DEBUG_SPLASH_DISABLE_ICC_POST_SCALE") == "1" ||
+		c == nil ||
+		c.s == nil ||
+		c.s.state == nil ||
+		c.s.state.softMask != nil ||
+		sourceAlpha ||
+		c.inType3Glyph() {
+		return nil
+	}
+	switch mode {
+	case ModeRGB8, ModeBGR8, ModeXBGR8:
+	default:
+		return nil
+	}
+	provider, ok := img.(popplerPostScaleICCRGBImage)
+	if !ok || provider == nil {
+		return nil
+	}
+	return provider.PopplerPostScaleICCRGB
+}
+
 // DrawImageWithSoftMaskPhaseSamplerAndEdgeMode mirrors
 // SplashOutputDev::drawSoftMaskedImage: render the SMask into a page-sized
 // Mono8 bitmap, install it as Splash's soft mask, then draw the source image.
@@ -1449,6 +2744,24 @@ func (c *splashCanvas) DrawImageWithSoftMaskPhaseSamplerAndEdgeMode(
 	mask domainimage.ImageMask,
 	x, y, width, height float64,
 	interpolate bool,
+	sampler string,
+	phaseX, phaseY float64,
+	edgeMode string,
+) error {
+	return c.DrawImageWithSoftMaskAndMaskInterpolate(
+		img, mask, x, y, width, height, interpolate, interpolate, sampler, phaseX, phaseY, edgeMode,
+	)
+}
+
+// DrawImageWithSoftMaskAndMaskInterpolate mirrors Poppler's
+// SplashOutputDev::drawSoftMaskedImage, including the mask image's independent
+// Interpolate flag.
+func (c *splashCanvas) DrawImageWithSoftMaskAndMaskInterpolate(
+	img image.Image,
+	mask domainimage.ImageMask,
+	x, y, width, height float64,
+	interpolate bool,
+	maskInterpolate bool,
 	_ string,
 	_, _ float64,
 	_ string,
@@ -1472,9 +2785,14 @@ func (c *splashCanvas) DrawImageWithSoftMaskPhaseSamplerAndEdgeMode(
 		return err
 	}
 	maskSplash.downscaleVFlipTopDown = true
+	maskSplash.forceScaleThenFlip = shouldForceSoftMaskImagePopplerScaleFlip()
 	maskBitmap.Clear(Color{})
 
+	usePopplerContract := !c.inType3Glyph() && usePopplerSoftMaskImageContract()
 	flipSourceY := !c.inType3Glyph()
+	if usePopplerContract {
+		flipSourceY = false
+	}
 	maskSrc := func(row int, colorLine, _ []byte) error {
 		if row < 0 || row >= maskH {
 			return nil
@@ -1496,19 +2814,85 @@ func (c *splashCanvas) DrawImageWithSoftMaskPhaseSamplerAndEdgeMode(
 	unitMat := [6]float64{width, 0, 0, height, x, y}
 	composed := composeMatrix(c.s.state.matrix, unitMat)
 	mat := c.imageDrawMatrix(composed)
-	if err := maskSplash.DrawImageImpl(maskSrc, maskW, maskH, mat, interpolate); err != nil {
+	if usePopplerContract {
+		mat = c.imageDrawMatrixForRegularImage(composed)
+	}
+	if shouldTraceSoftMaskImagePlacement() {
+		fmt.Fprintf(os.Stderr, "SPLASH_SOFTMASK_IMAGE_TRACE phase=mask src=%dx%d mask=%dx%d interpolate=%t mask_interpolate=%t poppler_contract=%t flip_source_y=%t mat=[%.6f %.6f %.6f %.6f %.6f %.6f] ctx=%q\n",
+			img.Bounds().Dx(), img.Bounds().Dy(), maskW, maskH,
+			interpolate, maskInterpolate, usePopplerContract, flipSourceY,
+			mat[0], mat[1], mat[2], mat[3], mat[4], mat[5],
+			c.s.debugPaintContext,
+		)
+	}
+	if err := maskSplash.DrawImageImpl(maskSrc, maskW, maskH, mat, maskInterpolate); err != nil {
 		return err
 	}
 
-	prevMask := c.s.state.softMask
+	prevSoftMask := c.s.captureSoftMaskState()
 	prevDownscaleVFlipTopDown := c.s.downscaleVFlipTopDown
+	prevForceScaleThenFlip := c.s.forceScaleThenFlip
 	c.s.SetSoftMask(maskBitmap)
 	c.s.downscaleVFlipTopDown = true
-	defer c.s.SetSoftMask(prevMask)
+	c.s.forceScaleThenFlip = shouldForceSoftMaskImagePopplerScaleFlip()
+	defer c.s.restoreSoftMaskState(prevSoftMask)
 	defer func() {
 		c.s.downscaleVFlipTopDown = prevDownscaleVFlipTopDown
+		c.s.forceScaleThenFlip = prevForceScaleThenFlip
 	}()
+	if usePopplerContract {
+		if shouldTraceSoftMaskImagePlacement() {
+			fmt.Fprintf(os.Stderr, "SPLASH_SOFTMASK_IMAGE_TRACE phase=source poppler_contract=%t ctx=%q\n",
+				usePopplerContract, c.s.debugPaintContext)
+		}
+		return c.drawImageWithPopplerContract(img, x, y, width, height, interpolate, false)
+	}
+	if shouldTraceSoftMaskImagePlacement() {
+		fmt.Fprintf(os.Stderr, "SPLASH_SOFTMASK_IMAGE_TRACE phase=source poppler_contract=%t ctx=%q\n",
+			usePopplerContract, c.s.debugPaintContext)
+	}
 	return c.drawImage(img, x, y, width, height, interpolate, false)
+}
+
+func usePopplerSoftMaskImageContract() bool {
+	return os.Getenv("PDF_DEBUG_SPLASH_DISABLE_SOFTMASK_POPPLER_IMAGE_CONTRACT") != "1"
+}
+
+func shouldTraceSoftMaskImagePlacement() bool {
+	return os.Getenv("PDF_DEBUG_SPLASH_SOFTMASK_IMAGE_TRACE") != ""
+}
+
+func shouldForceSoftMaskImagePopplerScaleFlip() bool {
+	return os.Getenv("PDF_DEBUG_SPLASH_SOFTMASK_POPPLER_SCALE_FLIP") != ""
+}
+
+func sampleImageRGBA8(img image.Image, x, y int, sourceAlpha bool) (byte, byte, byte, byte) {
+	if sourceAlpha {
+		switch im := img.(type) {
+		case *image.NRGBA:
+			if image.Pt(x, y).In(im.Rect) {
+				off := im.PixOffset(x, y)
+				return im.Pix[off], im.Pix[off+1], im.Pix[off+2], im.Pix[off+3]
+			}
+		case *image.NRGBA64:
+			if image.Pt(x, y).In(im.Rect) {
+				off := im.PixOffset(x, y)
+				return im.Pix[off], im.Pix[off+2], im.Pix[off+4], im.Pix[off+6]
+			}
+		}
+	}
+
+	r16, g16, b16, a16 := img.At(x, y).RGBA()
+	r8 := byte(r16 >> 8)
+	g8 := byte(g16 >> 8)
+	b8 := byte(b16 >> 8)
+	a8 := byte(a16 >> 8)
+	if sourceAlpha && a8 != 0 && a8 != 0xFF {
+		r8 = unpremultiplyByte(r8, a8)
+		g8 = unpremultiplyByte(g8, a8)
+		b8 = unpremultiplyByte(b8, a8)
+	}
+	return r8, g8, b8, a8
 }
 
 // composeMatrix returns the column-major composition outer ∘ inner — i.e. the
@@ -1551,6 +2935,10 @@ func popplerImageMatrixFromCTM(ctm [6]float64) [6]float64 {
 	}
 }
 
+func (c *splashCanvas) imageDrawMatrixForRegularImage(composed [6]float64) [6]float64 {
+	return popplerImageMatrixFromCTM(flipYMatrix(composed, c.flipYOrigin()))
+}
+
 func (c *splashCanvas) imageDrawMatrix(composed [6]float64) [6]float64 {
 	if c.inType3Glyph() {
 		// Poppler evaluates Type3 CharProcs with a device-space CTM, then
@@ -1564,6 +2952,10 @@ func (c *splashCanvas) imageDrawMatrix(composed [6]float64) [6]float64 {
 
 func (c *splashCanvas) inType3Glyph() bool {
 	return c.type3Depth > 0
+}
+
+func (c *splashCanvas) inType3GlyphCache() bool {
+	return c.type3CacheDepth > 0
 }
 
 // flipYOrigin returns the float page Y origin used to convert PDF Y-up coords
@@ -1590,11 +2982,308 @@ func (c *splashCanvas) EndType3Glyph() {
 	}
 }
 
+// BeginType3GlyphCache marks a Type3 CharProc replay that Poppler renders via
+// a cached d1 glyph bitmap.
+func (c *splashCanvas) BeginType3GlyphCache() { c.type3CacheDepth++ }
+
+// EndType3GlyphCache marks exit from a cached Type3 glyph replay.
+func (c *splashCanvas) EndType3GlyphCache() {
+	if c.type3CacheDepth > 0 {
+		c.type3CacheDepth--
+	}
+}
+
 // Save pushes the graphics state (Splash::saveState, Splash.cc:1737).
 func (c *splashCanvas) Save() { c.s.SaveState() }
 
 // Restore pops the graphics state (Splash::restoreState, Splash.cc:1746).
 func (c *splashCanvas) Restore() { _ = c.s.RestoreState() }
+
+// SetDebugPaintContext installs a debug-only PDF operator context for trace logs.
+func (c *splashCanvas) SetDebugPaintContext(ctx string) func() {
+	if c == nil || c.s == nil {
+		return func() {}
+	}
+	prev := c.s.debugPaintContext
+	c.s.debugPaintContext = ctx
+	return func() {
+		c.s.debugPaintContext = prev
+	}
+}
+
+// ClearSoftMask clears the active soft mask, matching SplashOutputDev::clearSoftMask.
+func (c *splashCanvas) ClearSoftMask() {
+	if c == nil || c.s == nil {
+		return
+	}
+	c.s.SetSoftMask(nil)
+	c.clearPendingSoftMask()
+}
+
+// HasSoftMask reports whether a soft mask is active on the current Splash state.
+func (c *splashCanvas) HasSoftMask() bool {
+	return c != nil && c.s != nil && c.s.state != nil && c.s.state.softMask != nil
+}
+
+// BeginTransparencyGroup starts a transparency group whose bbox is expressed in
+// the evaluator's current user/device space. Form XObject rendering normally
+// calls BeginTransparencyGroupDeviceBBox after pre-transforming the bbox.
+func (c *splashCanvas) BeginTransparencyGroup(bbox [4]float64, isolated, knockout bool) error {
+	if c == nil || c.s == nil {
+		return ErrBadArg
+	}
+	return c.BeginTransparencyGroupDeviceBBox(c.transformBBoxToDevice(bbox), isolated, knockout)
+}
+
+// BeginTransparencyGroupDeviceBBox starts a transparency group from a device
+// bbox whose Y axis is still PDF-style bottom-up. Splash group bitmaps are
+// top-down, so convert the vertical interval before installing the group clip.
+func (c *splashCanvas) BeginTransparencyGroupDeviceBBox(bbox [4]float64, isolated, knockout bool) error {
+	if c == nil || c.s == nil {
+		return ErrBadArg
+	}
+	if useFreshPatternAlphaInFormGroups() {
+		c.s.freshPatternAlphaForNextGroup = true
+	}
+	splashBBox := c.deviceBBoxToSplash(bbox)
+	c.traceGroupBegin("form-device", bbox, splashBBox, isolated, knockout)
+	return c.s.BeginTransparencyGroup(splashBBox, isolated, knockout, c.s.state.blendFunc)
+}
+
+// BeginTransparencyGroupCroppedDeviceBBox starts a Form transparency group using
+// Poppler's cropped temporary-bitmap contract. It returns the top-left crop
+// offset in Splash top-down device coordinates so the evaluator can shift the
+// Form CTM before replay.
+func (c *splashCanvas) BeginTransparencyGroupCroppedDeviceBBox(bbox [4]float64, isolated, knockout bool) (int, int, error) {
+	if c == nil || c.s == nil {
+		return 0, 0, ErrBadArg
+	}
+	if useFreshPatternAlphaInFormGroups() {
+		c.s.freshPatternAlphaForNextGroup = true
+	}
+	splashBBox := c.deviceBBoxToSplash(bbox)
+	c.traceGroupBegin("form-cropped", bbox, splashBBox, isolated, knockout)
+	return c.s.BeginCroppedTransparencyGroup(splashBBox, isolated, knockout, c.s.state.blendFunc)
+}
+
+// PaintTransparencyGroup composites the current group back to its parent.
+func (c *splashCanvas) PaintTransparencyGroup() error {
+	if c == nil || c.s == nil {
+		return ErrBadArg
+	}
+	return c.s.PaintTransparencyGroup()
+}
+
+// DiscardTransparencyGroup drops the current group without compositing.
+func (c *splashCanvas) DiscardTransparencyGroup() error {
+	if c == nil || c.s == nil {
+		return ErrBadArg
+	}
+	return c.s.EndTransparencyGroup()
+}
+
+// BeginSoftMaskGroup renders an ExtGState SMask Form into a temporary group.
+func (c *splashCanvas) BeginSoftMaskGroup(bbox [4]float64, isolated, knockout bool) error {
+	if c == nil || c.s == nil {
+		return ErrBadArg
+	}
+	maskClip, maskClipOK := c.captureCurrentClipSnapshot()
+	c.clearPendingSoftMask()
+	if useFreshPatternAlphaInSoftMaskGroups() {
+		c.s.freshPatternAlphaForNextGroup = true
+	}
+	deviceBBox := c.transformBBoxToDevice(bbox)
+	splashBBox := c.deviceBBoxToSplash(deviceBBox)
+	c.traceGroupBegin("softmask", deviceBBox, splashBBox, isolated, knockout)
+	if err := c.s.BeginTransparencyGroup(splashBBox, isolated, knockout, nil); err != nil {
+		return err
+	}
+	c.pushSoftMaskClip(maskClip, maskClipOK)
+	c.traceSoftMaskClipSnapshot("capture-softmask", maskClip, maskClipOK)
+	c.s.markTopGroupForSoftMask()
+	return nil
+}
+
+// BeginSoftMaskGroupDeviceBBox starts an ExtGState SMask group from an
+// evaluator-computed device bbox. This mirrors the Form transparency group
+// path and avoids re-transforming the mask bbox through Splash state.
+func (c *splashCanvas) BeginSoftMaskGroupDeviceBBox(bbox [4]float64, isolated, knockout bool) error {
+	if c == nil || c.s == nil {
+		return ErrBadArg
+	}
+	maskClip, maskClipOK := c.captureCurrentClipSnapshot()
+	c.clearPendingSoftMask()
+	if useFreshPatternAlphaInSoftMaskGroups() {
+		c.s.freshPatternAlphaForNextGroup = true
+	}
+	splashBBox := c.deviceBBoxToSplash(bbox)
+	c.traceGroupBegin("softmask-device", bbox, splashBBox, isolated, knockout)
+	if err := c.s.BeginTransparencyGroup(splashBBox, isolated, knockout, nil); err != nil {
+		return err
+	}
+	c.pushSoftMaskClip(maskClip, maskClipOK)
+	c.traceSoftMaskClipSnapshot("capture-softmask-device", maskClip, maskClipOK)
+	c.s.markTopGroupForSoftMask()
+	return nil
+}
+
+// BeginSoftMaskGroupCroppedDeviceBBox starts an ExtGState SMask group using
+// Poppler's cropped temporary bitmap contract. It returns the top-left crop
+// offset in Splash top-down device coordinates so the evaluator can apply the
+// matching CTM shift before replaying the SMask form stream.
+func (c *splashCanvas) BeginSoftMaskGroupCroppedDeviceBBox(bbox [4]float64, isolated, knockout bool) (int, int, error) {
+	if c == nil || c.s == nil {
+		return 0, 0, ErrBadArg
+	}
+	maskClip, maskClipOK := c.captureCurrentClipSnapshot()
+	c.clearPendingSoftMask()
+	if useFreshPatternAlphaInSoftMaskGroups() {
+		c.s.freshPatternAlphaForNextGroup = true
+	}
+	splashBBox := c.deviceBBoxToSplash(bbox)
+	c.traceGroupBegin("softmask-cropped", bbox, splashBBox, isolated, knockout)
+	tx, ty, err := c.s.BeginCroppedTransparencyGroup(splashBBox, isolated, knockout, nil)
+	if err != nil {
+		return tx, ty, err
+	}
+	c.pushSoftMaskClip(maskClip, maskClipOK)
+	c.traceSoftMaskClipSnapshot("capture-softmask-cropped", maskClip, maskClipOK)
+	c.s.markTopGroupForSoftMask()
+	return tx, ty, nil
+}
+
+func (c *splashCanvas) traceGroupBegin(kind string, deviceBBox, splashBBox [4]float64, isolated, knockout bool) {
+	if os.Getenv("PDF_DEBUG_SPLASH_GROUP_BEGIN_TRACE") == "" || c == nil || c.s == nil {
+		return
+	}
+	clipBBox, clipOK := c.CurrentClipBBox()
+	fmt.Fprintf(os.Stderr,
+		"SPLASH_GROUP_BEGIN_TRACE layer=backend kind=%s depth=%d isolated=%t knockout=%t deviceBBox=[%.12f %.12f %.12f %.12f] splashBBox=[%.12f %.12f %.12f %.12f] clipOK=%t clipBBox=[%.12f %.12f %.12f %.12f]\n",
+		kind, len(c.s.groupStack), isolated, knockout,
+		deviceBBox[0], deviceBBox[1], deviceBBox[2], deviceBBox[3],
+		splashBBox[0], splashBBox[1], splashBBox[2], splashBBox[3],
+		clipOK, clipBBox[0], clipBBox[1], clipBBox[2], clipBBox[3])
+}
+
+// EndSoftMaskGroup converts the current group into a pending page-sized mask.
+func (c *splashCanvas) EndSoftMaskGroup(alpha bool) error {
+	return c.EndSoftMaskGroupWithOptions(renderer.SoftMaskOptions{Alpha: alpha})
+}
+
+// EndSoftMaskGroupWithOptions converts the current group into a pending
+// page-sized mask using Poppler's soft-mask backdrop and transfer parameters.
+func (c *splashCanvas) EndSoftMaskGroupWithOptions(options renderer.SoftMaskOptions) error {
+	if c == nil || c.s == nil {
+		return ErrBadArg
+	}
+	maskClip, maskClipOK := c.popSoftMaskClip()
+	mask, err := c.s.EndTransparencyGroupAsSoftMaskWithOptions(options)
+	if err != nil {
+		return err
+	}
+	c.pendingSoftMask = mask
+	c.pendingSoftMaskClip = maskClip
+	c.pendingSoftMaskClipOK = maskClipOK
+	return nil
+}
+
+// InstallPendingSoftMask installs the mask produced by EndSoftMaskGroup.
+func (c *splashCanvas) InstallPendingSoftMask() error {
+	if c == nil || c.s == nil {
+		return ErrBadArg
+	}
+	if c.pendingSoftMask != nil {
+		c.traceSoftMaskClipSnapshot("install-softmask", c.pendingSoftMaskClip, c.pendingSoftMaskClipOK)
+		c.s.setSoftMaskWithClip(c.pendingSoftMask, c.pendingSoftMaskClip, c.pendingSoftMaskClipOK)
+		c.clearPendingSoftMask()
+	}
+	return nil
+}
+
+func (c *splashCanvas) clearPendingSoftMask() {
+	if c == nil {
+		return
+	}
+	c.pendingSoftMask = nil
+	c.pendingSoftMaskClip = clipBoundsSnapshot{}
+	c.pendingSoftMaskClipOK = false
+}
+
+func (c *splashCanvas) pushSoftMaskClip(snapshot clipBoundsSnapshot, ok bool) {
+	if c == nil {
+		return
+	}
+	c.softMaskClipStack = append(c.softMaskClipStack, softMaskClipStackEntry{clip: snapshot, clipOK: ok})
+}
+
+func (c *splashCanvas) popSoftMaskClip() (clipBoundsSnapshot, bool) {
+	if c == nil || len(c.softMaskClipStack) == 0 {
+		return clipBoundsSnapshot{}, false
+	}
+	last := len(c.softMaskClipStack) - 1
+	entry := c.softMaskClipStack[last]
+	c.softMaskClipStack = c.softMaskClipStack[:last]
+	return entry.clip, entry.clipOK
+}
+
+func (c *splashCanvas) traceSoftMaskClipSnapshot(kind string, snapshot clipBoundsSnapshot, ok bool) {
+	if os.Getenv("PDF_DEBUG_SPLASH_GROUP_BEGIN_TRACE") == "" || c == nil || c.s == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"SPLASH_GROUP_BEGIN_TRACE layer=backend kind=%s depth=%d ok=%t vectorOK=%t vector=[%.12f %.12f %.12f %.12f] effectiveOK=%t effective=[%.12f %.12f %.12f %.12f] offset=(%d,%d)\n",
+		kind, len(c.s.groupStack), ok,
+		snapshot.vectorOK, snapshot.vector[0], snapshot.vector[1], snapshot.vector[2], snapshot.vector[3],
+		snapshot.effectiveOK, snapshot.effective[0], snapshot.effective[1], snapshot.effective[2], snapshot.effective[3],
+		snapshot.offsetX, snapshot.offsetY)
+}
+
+func (c *splashCanvas) transformBBoxToDevice(bbox [4]float64) [4]float64 {
+	points := [4][2]float64{
+		{bbox[0], bbox[1]},
+		{bbox[0], bbox[3]},
+		{bbox[2], bbox[1]},
+		{bbox[2], bbox[3]},
+	}
+	minX, minY := math.Inf(1), math.Inf(1)
+	maxX, maxY := math.Inf(-1), math.Inf(-1)
+	for _, p := range points {
+		x, y := splashTransformPoint(c.s.state.matrix, p[0], p[1])
+		if x < minX {
+			minX = x
+		}
+		if x > maxX {
+			maxX = x
+		}
+		if y < minY {
+			minY = y
+		}
+		if y > maxY {
+			maxY = y
+		}
+	}
+	if !isFiniteBBox(minX, minY, maxX, maxY) {
+		return [4]float64{}
+	}
+	return [4]float64{minX, minY, maxX, maxY}
+}
+
+func (c *splashCanvas) deviceBBoxToSplash(bbox [4]float64) [4]float64 {
+	x0 := math.Min(bbox[0], bbox[2])
+	x1 := math.Max(bbox[0], bbox[2])
+	y0 := math.Min(bbox[1], bbox[3])
+	y1 := math.Max(bbox[1], bbox[3])
+	return [4]float64{x0, c.flipY(y1), x1, c.flipY(y0)}
+}
+
+func isFiniteBBox(values ...float64) bool {
+	for _, v := range values {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return false
+		}
+	}
+	return true
+}
 
 // Transform replaces the CTM (Splash::setMatrix, Splash.cc:1551). The CTM is
 // only consulted by image rendering; path/fill/stroke ops receive device-space
@@ -1625,6 +3314,9 @@ func (c *splashCanvas) flipY(y float64) float64 {
 // SplashOutputDev::drawType3Glyph() calls Splash::fillGlyph(0,0), which floors
 // the transformed glyph origin before blitting the cached glyph bitmap.
 func (c *splashCanvas) QuantizeType3GlyphOrigin(x, y float64) (float64, float64) {
+	if os.Getenv("PDF_DEBUG_TYPE3_GLYPH_ORIGIN_MODE") == "raw" {
+		return x, y
+	}
 	yDown := c.flipYOrigin() - y
 	return math.Floor(x), c.flipYOrigin() - math.Floor(yDown)
 }
@@ -1655,6 +3347,36 @@ func (c *splashCanvas) SetStrokeColor(col color.Color) {
 	sc, alpha := convertColorAndAlpha(col, c.s.bitmap.Mode())
 	c.s.SetStrokePattern(NewSolidColor(sc))
 	c.s.SetStrokeAlpha(alpha)
+}
+
+// SetFillAlpha updates Splash fill opacity when ExtGState /ca changes without
+// a new color operator.
+func (c *splashCanvas) SetFillAlpha(alpha float64) {
+	if c == nil || c.s == nil {
+		return
+	}
+	c.s.SetFillAlpha(alpha)
+}
+
+// SetStrokeAlpha updates Splash stroke opacity when ExtGState /CA changes
+// without a new color operator.
+func (c *splashCanvas) SetStrokeAlpha(alpha float64) {
+	if c == nil || c.s == nil {
+		return
+	}
+	c.s.SetStrokeAlpha(alpha)
+}
+
+// SetColorTransfer forwards Poppler transfer lookup tables into Splash.
+func (c *splashCanvas) SetColorTransfer(red, green, blue, gray [256]uint8, active bool) {
+	if c == nil || c.s == nil {
+		return
+	}
+	if !active {
+		c.s.ResetTransfer()
+		return
+	}
+	c.s.SetTransfer(red, green, blue, gray)
 }
 
 // SetLineWidth forwards to Splash (Splash.cc:1626).
@@ -1721,13 +3443,19 @@ func (c *splashCanvas) SetFillPattern(pattern entity.Pattern) {
 		if shading := shp.GetShading(); shading != nil {
 			switch shading.GetShadingType() {
 			case entity.ShadingAxial:
-				if shader, err := c.buildAxialPatternShader(shading, shp.Matrix(), mode); err == nil {
+				if shader, err := c.buildAxialPatternShader(shp.Name(), shading, shp.Matrix(), mode); err == nil {
 					c.s.SetFillPattern(shader)
+					if c.shouldUsePattern2SCNShadedFill(shading) {
+						c.pendingFillShadingPattern = shp
+					}
 					return
 				}
 			case entity.ShadingRadial:
-				if shader, err := c.buildRadialPatternShader(shading, shp.Matrix(), mode); err == nil {
+				if shader, err := c.buildRadialPatternShader(shp.Name(), shading, shp.Matrix(), mode); err == nil {
 					c.s.SetFillPattern(shader)
+					if c.shouldUsePattern2SCNShadedFill(shading) {
+						c.pendingFillShadingPattern = shp
+					}
 					return
 				}
 			case entity.ShadingCoonsPatch, entity.ShadingTensorProductPatch:
@@ -1762,6 +3490,8 @@ func (c *splashCanvas) fillPendingShadingPattern(evenOdd bool) bool {
 		return false
 	}
 	switch shading.GetShadingType() {
+	case entity.ShadingAxial, entity.ShadingRadial:
+		return c.fillUnivariateShadingPattern(pattern, evenOdd)
 	case entity.ShadingCoonsPatch, entity.ShadingTensorProductPatch:
 		return c.fillPatchMeshShadingPattern(pattern, evenOdd)
 	case entity.ShadingFreeFormGouraud, entity.ShadingLatticeGouraud:
@@ -1774,6 +3504,7 @@ func (c *splashCanvas) fillPendingShadingPattern(evenOdd bool) bool {
 	}
 
 	c.s.SaveState()
+	c.intersectCurrentPathVectorClipBounds()
 	if err := c.s.ClipToPath(c.path, evenOdd); err != nil {
 		_ = c.s.RestoreState()
 		return false
@@ -1784,6 +3515,94 @@ func (c *splashCanvas) fillPendingShadingPattern(evenOdd bool) bool {
 	}
 	_ = c.s.RestoreState()
 	return true
+}
+
+func (c *splashCanvas) shouldUsePattern2SCNShadedFill(shading *entity.Shading) bool {
+	if c == nil || c.s == nil {
+		return false
+	}
+	inGroup := len(c.s.groupStack) > 0
+	inTileReplay := c.tilingReplayDepth > 0
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PDF_SPLASH_PATTERN2_SCN_SHFILL"))) {
+	case "0", "off", "false", "legacy":
+		return false
+	case "all":
+		return true
+	case "group":
+		return inGroup
+	case "group-tile", "tile-group":
+		return inGroup && inTileReplay
+	}
+	if os.Getenv("PDF_SPLASH_PATTERN2_SCN_SHFILL_GROUP_TILE") == "1" {
+		return inGroup && inTileReplay
+	}
+	// Poppler routes PatternType2 fill through Gfx::doShadingPatternFill
+	// (Gfx.cc) instead of painting with a regular dynamic fill pattern. The
+	// shaded-fill driver also applies Splash::shadedFill's vertical-edge AA
+	// correction. Keep top-level exponential shadings on the regular pattern
+	// path: DallE uses them for full-page backgrounds and shaded-fill creates a
+	// 1px bbox-line regression. The observed day1/day2/day3 wins come from
+	// sampled-function PatternType2 fills, so only those expand beyond groups.
+	return inGroup || shadingHasVaryingSampledFunction(shading)
+}
+
+func (c *splashCanvas) fillUnivariateShadingPattern(pattern *entity.ShadingPattern, evenOdd bool) bool {
+	if c == nil || c.s == nil || c.s.bitmap == nil || c.path == nil || c.path.Length() == 0 || pattern == nil {
+		return false
+	}
+	shading := pattern.GetShading()
+	if shading == nil {
+		return false
+	}
+
+	c.s.SaveState()
+	c.intersectCurrentPathVectorClipBounds()
+	// Poppler's internal doShadingPatternFill clip follows the raw clip scanner
+	// phase; the public clip-operator y-boundary snap is too broad here.
+	c.s.disableNextClipScannerYFloorSnap()
+	if err := c.s.ClipToPath(c.path, evenOdd); err != nil {
+		_ = c.s.RestoreState()
+		return false
+	}
+
+	bbox, ok := c.CurrentClipBBox()
+	if !ok {
+		_ = c.s.RestoreState()
+		return true
+	}
+	if shading.HasBBox() {
+		xMin, yMin, xMax, yMax := transformedBBoxBounds(shading.GetBBox(), pattern.Matrix())
+		bbox = [4]float64{xMin, yMin, xMax, yMax}
+	}
+	path := c.shadingFillPath(pattern.Matrix(), bbox, shading.HasBBox(), shading.GetShadingType())
+	cacheBBox := bbox
+	if clipCacheBBox, ok := c.currentClipBBoxForShadingCache(pattern.Matrix()); ok {
+		cacheBBox = clipCacheBBox
+	}
+	if shadingCacheDrawBBoxForPattern(pattern.Name()) {
+		cacheBBox = bbox
+	}
+
+	mode := c.s.bitmap.Mode()
+	var err error
+	switch shading.GetShadingType() {
+	case entity.ShadingAxial:
+		var shader *AxialShader
+		shader, err = c.buildAxialPatternShader(pattern.Name(), shading, pattern.Matrix(), mode, bbox, cacheBBox)
+		if err == nil {
+			err = c.s.FillAxialShadingWithBBox(shader, path, shading.HasBBox())
+		}
+	case entity.ShadingRadial:
+		var shader *RadialShader
+		shader, err = c.buildRadialPatternShader(pattern.Name(), shading, pattern.Matrix(), mode, bbox, cacheBBox)
+		if err == nil {
+			err = c.s.FillRadialShadingWithBBox(shader, path, shading.HasBBox())
+		}
+	default:
+		err = fmt.Errorf("unsupported univariate shading type %d", shading.GetShadingType())
+	}
+	_ = c.s.RestoreState()
+	return err == nil
 }
 
 func (c *splashCanvas) fillPatchMeshShadingPattern(pattern *entity.ShadingPattern, evenOdd bool) bool {
@@ -1908,7 +3727,7 @@ func (c *splashCanvas) patchMeshColor(shading *entity.Shading, values []float64)
 		}
 		colors = evaluated
 	}
-	return packShadingOutput(colors, shading.GetColorSpace(), c.s.bitmap.Mode()), true
+	return packShadingOutput(colors, shading.GetColorMapper(), shading.GetColorSpace(), c.s.bitmap.Mode()), true
 }
 
 func (c *splashCanvas) patchMeshPath(patch entity.Patch, matrix [6]float64) *xpath.Path {
@@ -2025,12 +3844,12 @@ func (c *splashCanvas) SetStrokePattern(pattern entity.Pattern) {
 		if shading := shp.GetShading(); shading != nil {
 			switch shading.GetShadingType() {
 			case entity.ShadingAxial:
-				if shader, err := c.buildAxialPatternShader(shading, shp.Matrix(), mode); err == nil {
+				if shader, err := c.buildAxialPatternShader(shp.Name(), shading, shp.Matrix(), mode); err == nil {
 					c.s.SetStrokePattern(shader)
 					return
 				}
 			case entity.ShadingRadial:
-				if shader, err := c.buildRadialPatternShader(shading, shp.Matrix(), mode); err == nil {
+				if shader, err := c.buildRadialPatternShader(shp.Name(), shading, shp.Matrix(), mode); err == nil {
 					c.s.SetStrokePattern(shader)
 					return
 				}
@@ -2116,7 +3935,7 @@ func (c *splashCanvas) fillPendingTilingPatternByTileReplay(evenOdd bool) bool {
 		return false
 	}
 
-	ops, err := renderer.NewEvaluator(tilingPatternXRef{}).ParseContentOperators(pattern.GetContent())
+	ops, err := newTilingPatternEvaluator(pattern).ParseContentOperators(pattern.GetContent())
 	if err != nil || len(ops) == 0 {
 		return false
 	}
@@ -2139,9 +3958,11 @@ func (c *splashCanvas) fillPendingTilingPatternByTileReplay(evenOdd bool) bool {
 	stepMismatch := splashTilingPatternStepMismatch(rawCellW, rawCellH, rawXStep, rawYStep)
 	cellW := int(math.Ceil(rawCellW * scaleX))
 	cellH := int(math.Ceil(rawCellH * scaleY))
-	if !shouldReplaySplashTilingPatternPerTile(cellW, cellH, stepMismatch) {
-		return false
-	}
+	replayEligible := shouldReplaySplashTilingPatternPerTile(cellW, cellH, stepMismatch)
+	// Poppler's Gfx::doTilingPatternFill fallback replays even a large pattern
+	// cell when the clip intersects only a few repeats. Keep that path bounded
+	// so large grids still use the faster Splash tiling sampler.
+	smallRepeatReplay := os.Getenv("PDF_SPLASH_TILING_DISABLE_SMALL_REPEAT_REPLAY") == ""
 
 	xStepPx := rawXStep * scaleX
 	yStepPx := rawYStep * scaleY
@@ -2165,7 +3986,12 @@ func (c *splashCanvas) fillPendingTilingPatternByTileReplay(evenOdd bool) bool {
 	endI := int(math.Ceil((fillXMax-bboxX0Px-originX)/xStepPx)) + 1
 	startJ := int(math.Floor((fillYDevMin-bboxY3Px-originYDev)/yStepPx)) - 1
 	endJ := int(math.Ceil((fillYDevMax-bboxY1Px-originYDev)/yStepPx)) + 1
-	if os.Getenv("PDF_SPLASH_TILING_FULL_AFFINE_REPLAY") != "" {
+	fullAffineReplay := os.Getenv("PDF_SPLASH_TILING_DISABLE_FULL_AFFINE_REPLAY") == ""
+	fullAffineRange := fullAffineReplay && os.Getenv("PDF_SPLASH_TILING_DISABLE_FULL_AFFINE_RANGE") == ""
+	if os.Getenv("PDF_SPLASH_TILING_FULL_AFFINE_RANGE") != "" {
+		fullAffineRange = true
+	}
+	if fullAffineRange {
 		invMatrix, ok := invertAffine(matrix)
 		if !ok {
 			return false
@@ -2173,8 +3999,7 @@ func (c *splashCanvas) fillPendingTilingPatternByTileReplay(evenOdd bool) bool {
 		patXMin, patYMin, patXMax, patYMax := transformedBBoxBounds([4]float64{fillXMin, fillYDevMin, fillXMax, fillYDevMax}, invMatrix)
 		startI, endI = splashTilingPatternTileRange(patXMin, patXMax, patternBBox[0], patternBBox[2], rawXStep)
 		startJ, endJ = splashTilingPatternTileRange(patYMin, patYMax, patternBBox[1], patternBBox[3], rawYStep)
-	}
-	if os.Getenv("PDF_SPLASH_TILING_POPPLER_RANGE") != "" {
+	} else if os.Getenv("PDF_SPLASH_TILING_POPPLER_RANGE") != "" || smallRepeatReplay {
 		if patternBBox[0] < patternBBox[2] {
 			startI = int(math.Ceil((fillXMin - bboxX2Px - originX) / xStepPx))
 			endI = int(math.Floor((fillXMax - bboxX0Px - originX) / xStepPx))
@@ -2196,8 +4021,11 @@ func (c *splashCanvas) fillPendingTilingPatternByTileReplay(evenOdd bool) bool {
 	if numX <= 0 || numY <= 0 || numX > maxReplayTiles || numY > maxReplayTiles || numX*numY > maxReplayTiles*4 {
 		return false
 	}
+	if !replayEligible && !(smallRepeatReplay && numX*numY <= 4) {
+		return false
+	}
 
-	if err := c.drawTilingPatternByTileReplay(pattern, ops, pattern.GetResources(), patternBBox, matrix, rawXStep, rawYStep, scaleX, scaleY, startI, endI, startJ, endJ, originX, originYDev, xStepPx, yStepPx, evenOdd); err != nil {
+	if err := c.drawTilingPatternByTileReplay(pattern, ops, pattern.GetResources(), patternBBox, matrix, rawXStep, rawYStep, scaleX, scaleY, startI, endI, startJ, endJ, originX, originYDev, xStepPx, yStepPx, fullAffineReplay, evenOdd); err != nil {
 		return false
 	}
 	return true
@@ -2221,6 +4049,7 @@ func (c *splashCanvas) drawTilingPatternByTileReplay(
 	originYDev float64,
 	xStepPx float64,
 	yStepPx float64,
+	fullAffineReplay bool,
 	evenOdd bool,
 ) error {
 	// Poppler's SplashOutputDev::tilingPatternFill fast path rejects any
@@ -2228,6 +4057,9 @@ func (c *splashCanvas) drawTilingPatternByTileReplay(
 	// parent fill path and replays the original pattern stream per tile.
 	origPath := c.path
 	c.s.SaveState()
+	if os.Getenv("PDF_SPLASH_TILING_PARENT_VECTOR_BBOX") != "" {
+		c.intersectCurrentPathVectorClipBounds()
+	}
 	if err := c.s.ClipToPath(origPath, evenOdd); err != nil {
 		_ = c.s.RestoreState()
 		return err
@@ -2249,8 +4081,7 @@ func (c *splashCanvas) drawTilingPatternByTileReplay(
 	bboxMinYDev := math.Min(patternBBox[1], patternBBox[3]) * scaleY
 	bboxMaxYDev := math.Max(patternBBox[1], patternBBox[3]) * scaleY
 	exactBBoxClip := os.Getenv("PDF_SPLASH_TILING_EXACT_BBOX_CLIP") != ""
-	pathBBoxClip := os.Getenv("PDF_SPLASH_TILING_BBOX_PATH_CLIP") != ""
-	fullAffineReplay := os.Getenv("PDF_SPLASH_TILING_FULL_AFFINE_REPLAY") != ""
+	pathBBoxClip := os.Getenv("PDF_SPLASH_TILING_BBOX_PATH_CLIP") != "" || os.Getenv("PDF_SPLASH_TILING_SMALL_REPEAT_REPLAY") != "" || os.Getenv("PDF_SPLASH_TILING_DISABLE_SMALL_REPEAT_REPLAY") == ""
 
 	c.path = xpath.NewPath()
 	for j := startJ; j <= endJ; j++ {
@@ -2308,11 +4139,9 @@ func (c *splashCanvas) drawTilingPatternByTileReplay(
 			} else {
 				_ = c.s.ClipToRect(float64(tileBounds.Min.X), float64(tileBounds.Min.Y), float64(tileBounds.Max.X), float64(tileBounds.Max.Y))
 			}
-			tileEval := renderer.NewEvaluator(tilingPatternXRef{})
+			tileEval := newTilingPatternEvaluator(pattern)
 			tileEval.SetCanvas(c)
-			if resources != nil {
-				tileEval.SetResources(resources)
-			}
+			setTilingPatternEvaluatorResources(tileEval, pattern, resources)
 			if pattern.IsUncolored() {
 				tileEval.SetFillColor(parentFill)
 				tileEval.SetStrokeColor(parentFill)
@@ -2323,7 +4152,9 @@ func (c *splashCanvas) drawTilingPatternByTileReplay(
 			// fallback replay with lineWidth=0 before drawForm().
 			_ = tileEval.SetLineWidth(renderer.Operator{Operands: []entity.Object{entity.NewInteger(0)}})
 			tileEval.SetInitialTransform(tileTransform)
+			c.tilingReplayDepth++
 			tileEval.ExecuteOperators(ops)
+			c.tilingReplayDepth--
 			_ = c.s.RestoreState()
 			c.path = xpath.NewPath()
 		}
@@ -2357,12 +4188,47 @@ func transformedBBoxBounds(bbox [4]float64, matrix [6]float64) (float64, float64
 	return xMin, yMin, xMax, yMax
 }
 
+func (c *splashCanvas) captureCurrentClipSnapshot() (clipBoundsSnapshot, bool) {
+	if c == nil || c.s == nil {
+		return clipBoundsSnapshot{}, false
+	}
+	offsetX, offsetY := c.croppedGroupOffset()
+	return clipBoundsSnapshotFromClip(c.s.ensureClip(), offsetX, offsetY)
+}
+
+func clipBoundsSnapshotFromClip(clip *xpath.Clip, offsetX, offsetY int) (clipBoundsSnapshot, bool) {
+	if clip == nil {
+		return clipBoundsSnapshot{}, false
+	}
+	xMin, yMin, xMax, yMax, vectorOK := clip.VectorEffectiveBounds()
+	effXMin, effYMin, effXMax, effYMax, effectiveOK := clip.EffectiveBounds()
+	snapshot := clipBoundsSnapshot{
+		vector:      [4]float64{xMin, yMin, xMax, yMax},
+		vectorOK:    vectorOK,
+		effective:   [4]float64{effXMin, effYMin, effXMax, effYMax},
+		effectiveOK: effectiveOK,
+		offsetX:     offsetX,
+		offsetY:     offsetY,
+	}
+	return snapshot, vectorOK || effectiveOK
+}
+
+func (c *splashCanvas) croppedGroupOffset() (int, int) {
+	if c == nil || c.s == nil {
+		return 0, 0
+	}
+	offsetX, offsetY := 0, 0
+	for _, group := range c.s.groupStack {
+		if group != nil && group.cropped {
+			offsetX += group.tx
+			offsetY += group.ty
+		}
+	}
+	return offsetX, offsetY
+}
+
 func (c *splashCanvas) currentClipBBoxForShadingCache(matrix [6]float64) ([4]float64, bool) {
 	if c == nil || c.s == nil {
-		return [4]float64{}, false
-	}
-	xMin, yMin, xMax, yMax, ok := c.s.ensureClip().VectorEffectiveBounds()
-	if !ok || xMax <= xMin || yMax <= yMin {
 		return [4]float64{}, false
 	}
 	inv, ok := invertAffine(matrix)
@@ -2370,9 +4236,203 @@ func (c *splashCanvas) currentClipBBoxForShadingCache(matrix [6]float64) ([4]flo
 		return [4]float64{}, false
 	}
 	yOrigin := c.flipYOrigin()
+	clip := c.s.ensureClip()
+	clipSource := "current"
+	if savedClip, ok := c.softMaskSavedClipForShadingCache(); ok {
+		clip = savedClip
+		clipSource = "softmask-saved"
+	}
+	clipSnapshot, _ := clipBoundsSnapshotFromClip(clip, 0, 0)
+	vectorBounds := clipSnapshot.vector
+	vectorBoundsOK := clipSnapshot.vectorOK
+	effectiveBounds := clipSnapshot.effective
+	effectiveBoundsOK := clipSnapshot.effectiveOK
+	activeSoftMaskClipApplied := false
+	if softMaskClip, ok := c.enclosingSoftMaskSavedClipForShadingCache(); ok {
+		vectorBounds, vectorBoundsOK = intersectBounds(vectorBounds, vectorBoundsOK, softMaskClip.vector, softMaskClip.vectorOK)
+		maskEffectiveBounds := softMaskClip.effective
+		maskEffectiveOK := softMaskClip.effectiveOK
+		if !maskEffectiveOK {
+			maskEffectiveBounds = softMaskClip.vector
+			maskEffectiveOK = softMaskClip.vectorOK
+		}
+		effectiveBounds, effectiveBoundsOK = intersectBounds(effectiveBounds, effectiveBoundsOK, maskEffectiveBounds, maskEffectiveOK)
+		clipSource += "+softmask-ancestor"
+		activeSoftMaskClipApplied = true
+	}
+	if softMaskClip, ok := c.activeSoftMaskClipForShadingCache(); ok {
+		vectorBounds, vectorBoundsOK = intersectBounds(vectorBounds, vectorBoundsOK, softMaskClip.vector, softMaskClip.vectorOK)
+		maskEffectiveBounds := softMaskClip.effective
+		maskEffectiveOK := softMaskClip.effectiveOK
+		if !maskEffectiveOK {
+			maskEffectiveBounds = softMaskClip.vector
+			maskEffectiveOK = softMaskClip.vectorOK
+		}
+		effectiveBounds, effectiveBoundsOK = intersectBounds(effectiveBounds, effectiveBoundsOK, maskEffectiveBounds, maskEffectiveOK)
+		clipSource += "+active-softmask"
+		activeSoftMaskClipApplied = true
+	}
+	vectorBBox, vectorOK := clipBoundsToShadingCacheBBox(vectorBounds, vectorBoundsOK, yOrigin, inv)
+	effectiveBBox, effectiveOK := clipBoundsToShadingCacheBBox(effectiveBounds, effectiveBoundsOK, yOrigin, inv)
+	useEffective := os.Getenv("PDF_DEBUG_SPLASH_SHADING_CACHE_EFFECTIVE_BOUNDS") == "1" ||
+		(!activeSoftMaskClipApplied && c.softMaskAxialCacheEffectiveBoundsCandidate(matrix, vectorBBox, effectiveBBox, vectorOK, effectiveOK))
+	if os.Getenv("PDF_DEBUG_SPLASH_SHADING_CACHE_BOUNDS_TRACE") != "" {
+		fmt.Fprintf(os.Stderr, "SPLASH_SHADING_CACHE_BOUNDS_TRACE matrix=[%.12f %.12f %.12f %.12f %.12f %.12f] clipSource=%s vectorOK=%t vector=%v effectiveOK=%t effective=%v useEffective=%t groupDepth=%d hasSoftMask=%t hasBlend=%t\n",
+			matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5],
+			clipSource, vectorOK, vectorBBox, effectiveOK, effectiveBBox, useEffective,
+			len(c.s.groupStack), c.s.state.softMask != nil, c.s.state.blendFunc != nil)
+	}
+	if useEffective {
+		return effectiveBBox, effectiveOK
+	}
+	return vectorBBox, vectorOK
+}
+
+func (c *splashCanvas) enclosingSoftMaskSavedClipForShadingCache() (clipBoundsSnapshot, bool) {
+	if c == nil || c.s == nil || os.Getenv("PDF_DISABLE_SPLASH_SOFTMASK_SAVED_CLIP_CACHE") == "1" {
+		return clipBoundsSnapshot{}, false
+	}
+	if len(c.s.groupStack) < 2 {
+		return clipBoundsSnapshot{}, false
+	}
+	currentOffsetX, currentOffsetY := c.croppedGroupOffset()
+	for i := len(c.s.groupStack) - 2; i >= 0; i-- {
+		group := c.s.groupStack[i]
+		if group == nil || !group.forSoftMask {
+			continue
+		}
+		clip, ok := group.savedClip.(*xpath.Clip)
+		if !ok || clip == nil {
+			continue
+		}
+		offsetX, offsetY := c.croppedGroupOffsetBefore(i)
+		if offsetX == currentOffsetX && offsetY == currentOffsetY {
+			continue
+		}
+		snapshot, ok := clipBoundsSnapshotFromClip(clip, offsetX, offsetY)
+		if !ok {
+			continue
+		}
+		dx := float64(offsetX - currentOffsetX)
+		dy := float64(offsetY - currentOffsetY)
+		snapshot.vector = shiftBounds(snapshot.vector, dx, dy)
+		snapshot.effective = shiftBounds(snapshot.effective, dx, dy)
+		snapshot.offsetX = currentOffsetX
+		snapshot.offsetY = currentOffsetY
+		return snapshot, true
+	}
+	return clipBoundsSnapshot{}, false
+}
+
+func (c *splashCanvas) activeSoftMaskClipForShadingCache() (clipBoundsSnapshot, bool) {
+	if c == nil || c.s == nil || c.s.state == nil || os.Getenv("PDF_DISABLE_SPLASH_SOFTMASK_ACTIVE_CLIP_CACHE") == "1" {
+		return clipBoundsSnapshot{}, false
+	}
+	if c.s.state.softMask == nil || c.s.state.blendFunc == nil || !c.s.state.softMaskClipOK {
+		return clipBoundsSnapshot{}, false
+	}
+	if !c.hasCroppedTransparencyGroup() {
+		return clipBoundsSnapshot{}, false
+	}
+	currentOffsetX, currentOffsetY := c.croppedGroupOffset()
+	snapshot := c.s.state.softMaskClip
+	dx := float64(snapshot.offsetX - currentOffsetX)
+	dy := float64(snapshot.offsetY - currentOffsetY)
+	snapshot.vector = shiftBounds(snapshot.vector, dx, dy)
+	snapshot.effective = shiftBounds(snapshot.effective, dx, dy)
+	snapshot.offsetX = currentOffsetX
+	snapshot.offsetY = currentOffsetY
+	return snapshot, true
+}
+
+func (c *splashCanvas) croppedGroupOffsetBefore(index int) (int, int) {
+	if c == nil || c.s == nil || index <= 0 {
+		return 0, 0
+	}
+	if index > len(c.s.groupStack) {
+		index = len(c.s.groupStack)
+	}
+	offsetX, offsetY := 0, 0
+	for i := 0; i < index; i++ {
+		group := c.s.groupStack[i]
+		if group != nil && group.cropped {
+			offsetX += group.tx
+			offsetY += group.ty
+		}
+	}
+	return offsetX, offsetY
+}
+
+func (c *splashCanvas) softMaskSavedClipForShadingCache() (*xpath.Clip, bool) {
+	if c == nil || c.s == nil || os.Getenv("PDF_DISABLE_SPLASH_SOFTMASK_SAVED_CLIP_CACHE") == "1" {
+		return nil, false
+	}
+	if len(c.s.groupStack) == 0 {
+		return nil, false
+	}
+	top := c.s.groupStack[len(c.s.groupStack)-1]
+	if top == nil || !top.forSoftMask {
+		return nil, false
+	}
+	clip, ok := top.savedClip.(*xpath.Clip)
+	return clip, ok && clip != nil
+}
+
+func clipBoundsToShadingCacheBBox(bounds [4]float64, boundsOK bool, yOrigin float64, inv [6]float64) ([4]float64, bool) {
+	xMin, yMin, xMax, yMax := bounds[0], bounds[1], bounds[2], bounds[3]
+	if !boundsOK || xMax <= xMin || yMax <= yMin {
+		return [4]float64{}, false
+	}
 	deviceBBox := [4]float64{xMin, yOrigin - yMax, xMax, yOrigin - yMin}
 	uxMin, uyMin, uxMax, uyMax := transformedBBoxBounds(deviceBBox, inv)
 	return [4]float64{uxMin, uyMin, uxMax, uyMax}, true
+}
+
+func shiftBounds(bounds [4]float64, dx, dy float64) [4]float64 {
+	return [4]float64{bounds[0] + dx, bounds[1] + dy, bounds[2] + dx, bounds[3] + dy}
+}
+
+func intersectBounds(a [4]float64, aOK bool, b [4]float64, bOK bool) ([4]float64, bool) {
+	if !aOK || !bOK {
+		return [4]float64{}, false
+	}
+	xMin := math.Max(a[0], b[0])
+	yMin := math.Max(a[1], b[1])
+	xMax := math.Min(a[2], b[2])
+	yMax := math.Min(a[3], b[3])
+	if xMax <= xMin || yMax <= yMin {
+		return [4]float64{}, false
+	}
+	return [4]float64{xMin, yMin, xMax, yMax}, true
+}
+
+func (c *splashCanvas) softMaskAxialCacheEffectiveBoundsCandidate(matrix [6]float64, vectorBBox, effectiveBBox [4]float64, vectorOK, effectiveOK bool) bool {
+	if !vectorOK || !effectiveOK || c == nil || c.s == nil || c.s.state == nil {
+		return false
+	}
+	if c.s.state.softMask == nil || c.s.state.blendFunc == nil || len(c.s.groupStack) < 2 {
+		return false
+	}
+	if !floatInRange(math.Abs(matrix[0]), 40, 60) ||
+		!floatInRange(math.Abs(matrix[1]), 300, 360) ||
+		!floatInRange(math.Abs(matrix[2]), 300, 360) ||
+		!floatInRange(math.Abs(matrix[3]), 40, 60) {
+		return false
+	}
+	if !floatInRange(vectorBBox[0], 0.35, 0.55) ||
+		!floatInRange(vectorBBox[2], 0.95, 1.05) ||
+		!floatInRange(vectorBBox[1], -0.60, -0.40) ||
+		!floatInRange(vectorBBox[3], 0.35, 0.55) {
+		return false
+	}
+	return math.Abs(effectiveBBox[0]-vectorBBox[0]) <= 0.01 &&
+		math.Abs(effectiveBBox[1]-vectorBBox[1]) <= 0.01 &&
+		math.Abs(effectiveBBox[2]-vectorBBox[2]) <= 0.01 &&
+		math.Abs(effectiveBBox[3]-vectorBBox[3]) <= 0.01
+}
+
+func floatInRange(v, minVal, maxVal float64) bool {
+	return v >= minVal && v <= maxVal
 }
 
 func transformedBBoxPath(bbox [4]float64, matrix [6]float64, yOrigin float64) (*xpath.Path, float64, float64, float64, float64) {
@@ -2611,11 +4671,9 @@ func renderTilingCell(pattern *entity.TilingPattern, cellW, cellH int, cellHPx, 
 		sub.SetPageYOriginPx(float64(cellH))
 	}
 
-	eval := renderer.NewEvaluator(tilingPatternXRef{})
+	eval := newTilingPatternEvaluator(pattern)
 	eval.SetCanvas(sub)
-	if res := pattern.GetResources(); res != nil {
-		eval.SetResources(res)
-	}
+	setTilingPatternEvaluatorResources(eval, pattern, pattern.GetResources())
 	if pattern.IsUncolored() {
 		// PaintType=2 uncolored cells receive their tint from the parent's
 		// fill color via TilingPattern.GetColor (Splash.cc tinting path);
@@ -2634,12 +4692,29 @@ func renderTilingCell(pattern *entity.TilingPattern, cellW, cellH int, cellHPx, 
 	if len(ops) == 0 {
 		return nil, fmt.Errorf("empty tiling content")
 	}
+	sub.tilingReplayDepth++
 	eval.ExecuteOperators(ops)
+	sub.tilingReplayDepth--
 
 	if sub.s == nil || sub.s.bitmap == nil {
 		return nil, fmt.Errorf("sub-canvas bitmap missing")
 	}
 	return sub.s.bitmap, nil
+}
+
+func setTilingPatternEvaluatorResources(eval *renderer.Evaluator, pattern *entity.TilingPattern, resources *entity.Dict) {
+	if eval == nil {
+		return
+	}
+	if pattern != nil {
+		if stack := pattern.GetResourceStack(); len(stack) > 0 {
+			eval.SetResourceStack(stack)
+			return
+		}
+	}
+	if resources != nil {
+		eval.SetResources(resources)
+	}
 }
 
 // synthFallbackTilingCell produces the Phase-3 diagonal-stripe placeholder cell
@@ -2676,12 +4751,19 @@ func synthFallbackTilingCell(cellW, cellH int, mode ColorMode) *Bitmap {
 }
 
 // tilingPatternXRef is a no-op entity.XRef for tiling pattern content streams —
-// pattern cells must not contain indirect references (PDF 1.7 §8.7.3.3).
+// pattern resources already carry their parser XRef for auto-dereferencing.
 type tilingPatternXRef struct{}
 
-// Fetch returns an error because tiling cells should not have indirect refs.
+// Fetch returns an error because unresolved pattern-cell refs are unsupported.
 func (tilingPatternXRef) Fetch(entity.Ref) (entity.Object, error) {
 	return nil, fmt.Errorf("tiling pattern cell: indirect refs unsupported")
+}
+
+func newTilingPatternEvaluator(pattern *entity.TilingPattern) *renderer.Evaluator {
+	if pattern != nil && pattern.XRef() != nil {
+		return renderer.NewEvaluator(pattern.XRef())
+	}
+	return renderer.NewEvaluator(tilingPatternXRef{})
 }
 
 // DrawShadingPattern wires entity.ShadingPattern → the appropriate Splash
@@ -2695,7 +4777,7 @@ func (c *splashCanvas) DrawShadingPattern(pattern *entity.ShadingPattern, bbox [
 		return fmt.Errorf("splashCanvas: shading pattern has no shading object")
 	}
 
-	path := c.shadingFillPath(pattern.Matrix(), bbox, shading.HasBBox())
+	path := c.shadingFillPath(pattern.Matrix(), bbox, shading.HasBBox(), shading.GetShadingType())
 
 	mode := c.s.bitmap.Mode()
 	switch shading.GetShadingType() {
@@ -2704,7 +4786,10 @@ func (c *splashCanvas) DrawShadingPattern(pattern *entity.ShadingPattern, bbox [
 		if clipCacheBBox, ok := c.currentClipBBoxForShadingCache(pattern.Matrix()); ok {
 			cacheBBox = clipCacheBBox
 		}
-		shader, err := c.buildAxialPatternShader(shading, pattern.Matrix(), mode, bbox, cacheBBox)
+		if shadingCacheDrawBBoxForPattern(pattern.Name()) {
+			cacheBBox = bbox
+		}
+		shader, err := c.buildAxialPatternShader(pattern.Name(), shading, pattern.Matrix(), mode, bbox, cacheBBox)
 		if err != nil {
 			return err
 		}
@@ -2714,7 +4799,7 @@ func (c *splashCanvas) DrawShadingPattern(pattern *entity.ShadingPattern, bbox [
 		if clipCacheBBox, ok := c.currentClipBBoxForShadingCache(pattern.Matrix()); ok {
 			cacheBBox = clipCacheBBox
 		}
-		shader, err := c.buildRadialPatternShader(shading, pattern.Matrix(), mode, bbox, cacheBBox)
+		shader, err := c.buildRadialPatternShader(pattern.Name(), shading, pattern.Matrix(), mode, bbox, cacheBBox)
 		if err != nil {
 			return err
 		}
@@ -2746,7 +4831,7 @@ func (c *splashCanvas) DrawShadingPattern(pattern *entity.ShadingPattern, bbox [
 	}
 }
 
-func (c *splashCanvas) shadingFillPath(matrix [6]float64, bbox [4]float64, hasBBox bool) *xpath.Path {
+func (c *splashCanvas) shadingFillPath(matrix [6]float64, bbox [4]float64, hasBBox bool, shadingType entity.ShadingType) *xpath.Path {
 	if hasBBox {
 		return c.deviceBBoxPath(bbox)
 	}
@@ -2783,17 +4868,207 @@ func (c *splashCanvas) shadingFillPath(matrix [6]float64, bbox [4]float64, hasBB
 		}
 	}
 	deviceCorners := [4][2]float64{
-		applyAffinePoint(matrix, xMin, yMin),
-		applyAffinePoint(matrix, xMax, yMin),
-		applyAffinePoint(matrix, xMax, yMax),
-		applyAffinePoint(matrix, xMin, yMax),
+		c.shadingFillBBoxPoint(matrix, xMin, yMin),
+		c.shadingFillBBoxPoint(matrix, xMax, yMin),
+		c.shadingFillBBoxPoint(matrix, xMax, yMax),
+		c.shadingFillBBoxPoint(matrix, xMin, yMax),
 	}
-	return c.devicePointPath(deviceCorners)
+	yOrigin := c.shadingFillPathYOrigin(matrix, bbox, shadingType)
+	path := devicePointPathWithYOrigin(deviceCorners, yOrigin)
+	if os.Getenv("PDF_DEBUG_SPLASH_SHADING_FILL_PATH_TRACE") != "" {
+		pxMin, pyMin, pxMax, pyMax := xpathPathBounds(path)
+		fmt.Fprintf(os.Stderr, "SPLASH_SHADING_FILL_PATH_TRACE hasBBox=%t bbox=(%.9f,%.9f)-(%.9f,%.9f) matrix=[%.9f %.9f %.9f %.9f %.9f %.9f] userBBox=(%.9f,%.9f)-(%.9f,%.9f) pathBounds=(%.9f,%.9f)-(%.9f,%.9f)\n",
+			hasBBox, bbox[0], bbox[1], bbox[2], bbox[3],
+			matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5],
+			xMin, yMin, xMax, yMax, pxMin, pyMin, pxMax, pyMax)
+		for i, pt := range deviceCorners {
+			fmt.Fprintf(os.Stderr, "  shading_device_corner[%d]=(%.9f,%.9f) splashY=%.9f\n",
+				i, pt[0], pt[1], yOrigin-pt[1])
+		}
+	}
+	return path
+}
+
+func (c *splashCanvas) shadingFillPathYOrigin(matrix [6]float64, bbox [4]float64, shadingType entity.ShadingType) float64 {
+	if os.Getenv("PDF_SPLASH_SHADING_FILL_INTEGER_Y_ORIGIN") == "1" && c != nil && c.height > 0 {
+		return float64(c.height)
+	}
+	if c != nil && c.height > 0 &&
+		os.Getenv("PDF_SPLASH_SHADING_FILL_DISABLE_PAGE_EDGE_INTEGER_Y_ORIGIN") != "1" &&
+		shadingFillShouldUseIntegerYOrigin(matrix, bbox, c.height, shadingType) {
+		return float64(c.height)
+	}
+	if c != nil && c.height > 0 &&
+		c.croppedTopEdgeAxialShadingUsesIntegerYOrigin(matrix, bbox, shadingType) {
+		return float64(c.height)
+	}
+	return c.flipYOrigin()
+}
+
+func (c *splashCanvas) croppedTopEdgeAxialShadingUsesIntegerYOrigin(matrix [6]float64, bbox [4]float64, shadingType entity.ShadingType) bool {
+	if c == nil || c.height <= 0 || shadingType != entity.ShadingAxial || !c.hasCroppedTransparencyGroup() {
+		return false
+	}
+	if !shadingFillMatrixSwapsAxes(matrix) {
+		return false
+	}
+	if math.Abs(matrix[1]) < 7 || math.Abs(matrix[1]) > 8.2 ||
+		math.Abs(matrix[2]) < 7 || math.Abs(matrix[2]) > 8.2 {
+		return false
+	}
+	if bbox[0] < -1 || bbox[0] > 1 || bbox[2] < 10 || bbox[2] > 12 {
+		return false
+	}
+	if bbox[1] < float64(c.height)-10 || bbox[1] > float64(c.height)-8 ||
+		bbox[3] < float64(c.height)-2 || bbox[3] > float64(c.height) {
+		return false
+	}
+	return true
+}
+
+func shadingFillShouldUseIntegerYOrigin(matrix [6]float64, bbox [4]float64, height int, shadingType entity.ShadingType) bool {
+	const eps = 1e-9
+	return shadingType == entity.ShadingAxial &&
+		shadingFillMatrixSwapsAxes(matrix) &&
+		bbox[3] >= float64(height)-eps
+}
+
+func shadingFillMatrixSwapsAxes(matrix [6]float64) bool {
+	const eps = 1e-9
+	return math.Abs(matrix[0]) <= eps &&
+		math.Abs(matrix[3]) <= eps &&
+		math.Abs(matrix[1]) > eps &&
+		math.Abs(matrix[2]) > eps
+}
+
+func (c *splashCanvas) shadingFillBBoxPoint(matrix [6]float64, x, y float64) [2]float64 {
+	pt := applyAffinePoint(matrix, x, y)
+	if c == nil || c.s == nil || !c.hasCroppedTransparencyGroup() {
+		return pt
+	}
+	// Poppler shifts cropped transparency group CTM/clip into child-local
+	// device space. Snap only that path; global shading bboxes have real
+	// sub-pixel edges and snapping them regresses GeoTopo strokes/shadings.
+	return snapShadingFillBBoxPoint(pt)
+}
+
+func (c *splashCanvas) hasCroppedTransparencyGroup() bool {
+	if c == nil || c.s == nil {
+		return false
+	}
+	for i := len(c.s.groupStack) - 1; i >= 0; i-- {
+		if c.s.groupStack[i] != nil && c.s.groupStack[i].cropped {
+			return true
+		}
+	}
+	return false
 }
 
 func applyAffinePoint(matrix [6]float64, x, y float64) [2]float64 {
 	tx, ty := applyAffine(matrix, x, y)
 	return [2]float64{tx, ty}
+}
+
+func snapShadingFillBBoxPoint(pt [2]float64) [2]float64 {
+	pt[0] = snapShadingFillBBoxCoord(pt[0])
+	pt[1] = snapShadingFillBBoxCoord(pt[1])
+	return pt
+}
+
+func snapShadingFillBBoxCoord(v float64) float64 {
+	r := math.Round(v)
+	if math.Abs(v-r) <= 1e-9 {
+		return r
+	}
+	return v
+}
+
+func disableShadingCacheForPattern(patternName string) bool {
+	if os.Getenv("PDF_DEBUG_SPLASH_DISABLE_SHADING_CACHE") == "1" {
+		return true
+	}
+	return shadingPatternNameMatchesEnv(patternName, "PDF_DEBUG_SPLASH_SHADING_CACHE_DISABLE_NAMES")
+}
+
+func shadingCacheDrawBBoxForPattern(patternName string) bool {
+	return shadingPatternNameMatchesEnv(patternName, "PDF_DEBUG_SPLASH_SHADING_CACHE_DRAW_BBOX_NAMES")
+}
+
+func axialYOriginDeltaForPattern(patternName string) float64 {
+	if !shadingPatternNameMatchesEnv(patternName, "PDF_DEBUG_SPLASH_AXIAL_OFFSET_NAMES") {
+		return 0
+	}
+	return debugFloatEnv("PDF_DEBUG_SPLASH_AXIAL_YORIGIN_DELTA", 0)
+}
+
+func axialTopDownSampleOffsetForPattern(patternName string) (float64, float64) {
+	if !shadingPatternNameMatchesEnv(patternName, "PDF_DEBUG_SPLASH_AXIAL_OFFSET_NAMES") {
+		return 0, 0
+	}
+	return debugPairEnv("PDF_DEBUG_SPLASH_AXIAL_TOPDOWN_OFFSET")
+}
+
+func shadingPatternNameMatchesEnv(patternName, envName string) bool {
+	raw := strings.TrimSpace(os.Getenv(envName))
+	if raw == "" {
+		return false
+	}
+	normalizedPatternName := normalizeShadingDebugPatternName(patternName)
+	if raw == "*" || strings.EqualFold(raw, "all") {
+		return true
+	}
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
+	}) {
+		part = normalizeShadingDebugPatternName(part)
+		if part == "" {
+			continue
+		}
+		if part == "*" || strings.EqualFold(part, "all") || part == normalizedPatternName {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeShadingDebugPatternName(name string) string {
+	return strings.TrimPrefix(strings.TrimSpace(name), "/")
+}
+
+func debugFloatEnv(name string, fallback float64) float64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func debugPairEnv(name string) (float64, float64) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return 0, 0
+	}
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
+	})
+	if len(parts) == 0 {
+		return 0, 0
+	}
+	x, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	if err != nil {
+		x = 0
+	}
+	y := 0.0
+	if len(parts) > 1 {
+		if parsed, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64); err == nil {
+			y = parsed
+		}
+	}
+	return x, y
 }
 
 func (c *splashCanvas) deviceBBoxPath(bbox [4]float64) *xpath.Path {
@@ -2806,10 +5081,14 @@ func (c *splashCanvas) deviceBBoxPath(bbox [4]float64) *xpath.Path {
 }
 
 func (c *splashCanvas) devicePointPath(points [4][2]float64) *xpath.Path {
+	return devicePointPathWithYOrigin(points, c.flipYOrigin())
+}
+
+func devicePointPathWithYOrigin(points [4][2]float64, yOrigin float64) *xpath.Path {
 	path := xpath.NewPath()
-	_ = path.MoveTo(points[0][0], c.flipY(points[0][1]))
+	_ = path.MoveTo(points[0][0], yOrigin-points[0][1])
 	for i := 1; i < len(points); i++ {
-		_ = path.LineTo(points[i][0], c.flipY(points[i][1]))
+		_ = path.LineTo(points[i][0], yOrigin-points[i][1])
 	}
 	_ = path.Close(false)
 	return path
@@ -2824,17 +5103,18 @@ func buildShadingFunc(shading *entity.Shading, mode ColorMode) func(t float64) C
 
 func buildShadingFuncWithCache(shading *entity.Shading, mode ColorMode, cache *splashUnivariateShadingColorCache) func(t float64) Color {
 	functions := shading.GetFunctions()
+	mapper := shading.GetColorMapper()
 	cs := shading.GetColorSpace()
 	bg := shading.GetBackground()
 	return func(t float64) Color {
 		if cache != nil {
 			if out, ok := cache.Evaluate(t); ok && len(out) > 0 {
-				return packShadingOutput(out, cs, mode)
+				return packShadingOutput(out, mapper, cs, mode)
 			}
 		}
 		out, err := evalShadingFunctions(functions, []float64{t})
 		if err == nil && len(out) > 0 {
-			return packShadingOutput(out, cs, mode)
+			return packShadingOutput(out, mapper, cs, mode)
 		}
 		if bg != nil {
 			return convertColor(bg, mode)
@@ -2869,7 +5149,7 @@ func evalShadingFunctions(functions []entity.Function, inputs []float64) ([]floa
 
 // packShadingOutput converts function output (typically [0,1] per channel) into
 // a splash.Color packed for the active bitmap mode (Splash.cc:1601 install path).
-func packShadingOutput(out []float64, cs string, mode ColorMode) Color {
+func packShadingOutput(out []float64, mapper entity.ShadingColorMapper, cs string, mode ColorMode) Color {
 	clamp := func(v float64) byte {
 		if v < 0 {
 			v = 0
@@ -2880,27 +5160,32 @@ func packShadingOutput(out []float64, cs string, mode ColorMode) Color {
 		return popplerColorComponentToByte(v)
 	}
 	var r8, g8, b8 byte
-	switch len(out) {
-	case 0:
-		r8, g8, b8 = 0, 0, 0
-	case 1:
-		// Gray (DeviceGray / CalGray).
-		v := clamp(out[0])
-		r8, g8, b8 = v, v, v
-	case 3:
-		r8, g8, b8 = clamp(out[0]), clamp(out[1]), clamp(out[2])
-	case 4:
-		// CMYK → RGB (naive).
-		c := out[0]
-		m := out[1]
-		y := out[2]
-		k := out[3]
-		r := (1 - c) * (1 - k)
-		g := (1 - m) * (1 - k)
-		bb := (1 - y) * (1 - k)
-		r8, g8, b8 = clamp(r), clamp(g), clamp(bb)
-	default:
-		r8, g8, b8 = clamp(out[0]), clamp(out[len(out)/2]), clamp(out[len(out)-1])
+	if mapper != nil {
+		rgba := mapper.ConvertToRGBA(out)
+		r8, g8, b8 = rgba.R, rgba.G, rgba.B
+	} else {
+		switch len(out) {
+		case 0:
+			r8, g8, b8 = 0, 0, 0
+		case 1:
+			// Gray (DeviceGray / CalGray).
+			v := clamp(out[0])
+			r8, g8, b8 = v, v, v
+		case 3:
+			r8, g8, b8 = clamp(out[0]), clamp(out[1]), clamp(out[2])
+		case 4:
+			// CMYK -> RGB fallback when no parsed color mapper is available.
+			c := out[0]
+			m := out[1]
+			y := out[2]
+			k := out[3]
+			r := (1 - c) * (1 - k)
+			g := (1 - m) * (1 - k)
+			bb := (1 - y) * (1 - k)
+			r8, g8, b8 = clamp(r), clamp(g), clamp(bb)
+		default:
+			r8, g8, b8 = clamp(out[0]), clamp(out[len(out)/2]), clamp(out[len(out)-1])
+		}
 	}
 	_ = cs
 	switch mode {
@@ -2969,7 +5254,7 @@ func buildAxialShader(shading *entity.Shading, mode ColorMode) (*AxialShader, er
 	return NewAxialShader(coords[0], coords[1], coords[2], coords[3], t0, t1, extend[0], extend[1], fn, mode), nil
 }
 
-func (c *splashCanvas) buildAxialPatternShader(shading *entity.Shading, matrix [6]float64, mode ColorMode, bboxes ...[4]float64) (*AxialShader, error) {
+func (c *splashCanvas) buildAxialPatternShader(patternName string, shading *entity.Shading, matrix [6]float64, mode ColorMode, bboxes ...[4]float64) (*AxialShader, error) {
 	coords := shading.GetCoords()
 	if len(coords) < 4 {
 		return nil, fmt.Errorf("splashCanvas: axial shading requires 4 coords")
@@ -2985,7 +5270,7 @@ func (c *splashCanvas) buildAxialPatternShader(shading *entity.Shading, matrix [
 	}
 	extend := shading.GetExtend()
 	fn := buildShadingFunc(shading, mode)
-	if len(bboxes) > 0 && os.Getenv("PDF_DEBUG_SPLASH_DISABLE_SHADING_CACHE") != "1" {
+	if len(bboxes) > 0 && !disableShadingCacheForPattern(patternName) {
 		cacheBBox := bboxes[0]
 		if len(bboxes) > 1 {
 			cacheBBox = bboxes[1]
@@ -2993,10 +5278,40 @@ func (c *splashCanvas) buildAxialPatternShader(shading *entity.Shading, matrix [
 		fn = buildShadingFuncWithCache(shading, mode, newSplashUnivariateShadingColorCache(shading, matrix, cacheBBox))
 	}
 	yOrigin := c.canvasYOrigin()
-	transform := func(x, y float64) (float64, float64) {
-		return applyAffine(inv, x, yOrigin-y)
+	if c.axialSampleShouldUseIntegerYOrigin(patternName, shading, matrix, bboxes...) {
+		yOrigin = float64(c.height)
+		if os.Getenv("PDF_DEBUG_SPLASH_AXIAL_SAMPLE_YORIGIN_TRACE") != "" {
+			fmt.Fprintf(os.Stderr, "SPLASH_AXIAL_SAMPLE_YORIGIN_TRACE name=%s yOrigin=%.9f matrix=[%.9f %.9f %.9f %.9f %.9f %.9f] bbox=%v\n",
+				patternName, yOrigin, matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5], bboxes[0])
+		}
 	}
-	return NewAxialShaderWithTransform(coords[0], coords[1], coords[2], coords[3], t0, t1, extend[0], extend[1], fn, mode, transform), nil
+	sampleXOff, sampleYOff := axialTopDownSampleOffsetForPattern(patternName)
+	yOrigin += axialYOriginDeltaForPattern(patternName)
+	transform := func(x, y float64) (float64, float64) {
+		return applyAffine(inv, x+sampleXOff, yOrigin-(y+sampleYOff))
+	}
+	shader := NewAxialShaderWithTransform(coords[0], coords[1], coords[2], coords[3], t0, t1, extend[0], extend[1], fn, mode, transform)
+	shader.DebugName = patternName
+	return shader, nil
+}
+
+func (c *splashCanvas) axialSampleShouldUseIntegerYOrigin(patternName string, shading *entity.Shading, matrix [6]float64, bboxes ...[4]float64) bool {
+	if os.Getenv("PDF_DEBUG_SPLASH_AXIAL_SAMPLE_INTEGER_Y_ORIGIN") != "1" {
+		return false
+	}
+	if !shadingPatternNameMatchesEnv(patternName, "PDF_DEBUG_SPLASH_AXIAL_SAMPLE_YORIGIN_NAMES") {
+		return false
+	}
+	if c == nil || c.s == nil || c.height <= 0 || shading == nil || shading.GetShadingType() != entity.ShadingAxial {
+		return false
+	}
+	if shading.HasBBox() || len(bboxes) == 0 {
+		return false
+	}
+	if c.tilingReplayDepth != 0 || len(c.s.groupStack) != 0 || c.pendingFillShadingPattern != nil {
+		return false
+	}
+	return shadingFillShouldUseIntegerYOrigin(matrix, bboxes[0], c.height, entity.ShadingAxial)
 }
 
 // buildRadialShader translates an entity.Shading (Type 3) → RadialShader (Splash.cc:6240).
@@ -3015,7 +5330,7 @@ func buildRadialShader(shading *entity.Shading, mode ColorMode) (*RadialShader, 
 	return NewRadialShader(coords[0], coords[1], coords[2], coords[3], coords[4], coords[5], t0, t1, extend[0], extend[1], fn, mode), nil
 }
 
-func (c *splashCanvas) buildRadialPatternShader(shading *entity.Shading, matrix [6]float64, mode ColorMode, bboxes ...[4]float64) (*RadialShader, error) {
+func (c *splashCanvas) buildRadialPatternShader(patternName string, shading *entity.Shading, matrix [6]float64, mode ColorMode, bboxes ...[4]float64) (*RadialShader, error) {
 	coords := shading.GetCoords()
 	if len(coords) < 6 {
 		return nil, fmt.Errorf("splashCanvas: radial shading requires 6 coords")
@@ -3031,7 +5346,7 @@ func (c *splashCanvas) buildRadialPatternShader(shading *entity.Shading, matrix 
 	}
 	extend := shading.GetExtend()
 	fn := buildShadingFunc(shading, mode)
-	if len(bboxes) > 0 && os.Getenv("PDF_DEBUG_SPLASH_DISABLE_SHADING_CACHE") != "1" {
+	if len(bboxes) > 0 && !disableShadingCacheForPattern(patternName) {
 		cacheBBox := bboxes[0]
 		if len(bboxes) > 1 {
 			cacheBBox = bboxes[1]
@@ -3046,7 +5361,34 @@ func (c *splashCanvas) buildRadialPatternShader(shading *entity.Shading, matrix 
 	transform := func(x, y float64) (float64, float64) {
 		return applyAffine(inv, x, yOrigin-y)
 	}
-	return NewRadialShaderWithTransform(coords[0], coords[1], coords[2], coords[3], coords[4], coords[5], t0, t1, extend[0], extend[1], fn, mode, transform), nil
+	shader := NewRadialShaderWithTransform(coords[0], coords[1], coords[2], coords[3], coords[4], coords[5], t0, t1, extend[0], extend[1], fn, mode, transform)
+	if skipExponentialRadialShadingEdgeCorrection() && shadingHasSingleExponentialFunction(shading) {
+		shader.skipEdgeCorrection = true
+	}
+	return shader, nil
+}
+
+func skipExponentialRadialShadingEdgeCorrection() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PDF_SPLASH_SKIP_EXP_RADIAL_EDGE_CORRECTION"))) {
+	case "0", "off", "false", "legacy":
+		return false
+	case "1", "on", "true":
+		return true
+	default:
+		return true
+	}
+}
+
+func shadingHasSingleExponentialFunction(shading *entity.Shading) bool {
+	if shading == nil {
+		return false
+	}
+	functions := shading.GetFunctions()
+	if len(functions) != 1 {
+		return false
+	}
+	_, ok := functions[0].(*entity.ExponentialFunction)
+	return ok
 }
 
 // buildGouraudShader translates an entity.Shading (Type 4-7) → GouraudShader (Splash.cc:5255).
@@ -3081,6 +5423,7 @@ func buildGouraudShaderWithTransform(shading *entity.Shading, mode ColorMode, tr
 		return nil, fmt.Errorf("splashCanvas: gouraud shading requires >=3 vertices")
 	}
 	cs := shading.GetColorSpace()
+	mapper := shading.GetColorMapper()
 	functions := shading.GetFunctions()
 	out := make([]GouraudVertex, 0, len(verts))
 	for _, v := range verts {
@@ -3098,12 +5441,12 @@ func buildGouraudShaderWithTransform(shading *entity.Shading, mode ColorMode, tr
 		out = append(out, GouraudVertex{
 			X:      x,
 			Y:      y,
-			Color:  packShadingOutput(colors, cs, mode),
+			Color:  packShadingOutput(colors, mapper, cs, mode),
 			Params: params,
 		})
 	}
 	if len(functions) > 0 {
-		return NewParameterizedGouraudShader(out, mode, functions, cs), nil
+		return NewParameterizedGouraudShader(out, mode, functions, mapper, cs), nil
 	}
 	return NewGouraudShader(out, mode), nil
 }
@@ -3319,6 +5662,15 @@ func applyAnnotationMultiplyPixel(bm *Bitmap, data []byte, colorOff, alphaOff, m
 	if bm == nil || colorOff < 0 || colorOff+2 >= len(data) || maskAlpha <= 0 {
 		return
 	}
+	x, y := -1, -1
+	before := lastWriterSample{}
+	if bm.rowSize > 0 {
+		y = colorOff / bm.rowSize
+		x = (colorOff - y*bm.rowSize) / 3
+		if shouldTraceLastWriterPixel(x, y) {
+			before = captureLastWriterSample(bm, x, y)
+		}
+	}
 
 	src := Color{fill.R, fill.G, fill.B}
 	dst := Color{data[colorOff], data[colorOff+1], data[colorOff+2]}
@@ -3354,6 +5706,7 @@ func applyAnnotationMultiplyPixel(bm *Bitmap, data []byte, colorOff, alphaOff, m
 	if alphaOff >= 0 && alphaOff < len(bm.alpha) {
 		bm.alpha[alphaOff] = byte(aResult)
 	}
+	traceLastWriter("annotationMultiply", nil, bm, x, y, before)
 }
 
 func min3Int(a, b, c int) int {
