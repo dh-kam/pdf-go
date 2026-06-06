@@ -75,6 +75,7 @@
 - [x] GitHub Actions CI no-CGo validation/build workflow를 정리한다.
 - [x] GitHub Actions 수동 실행 기반 semver tag bump workflow를 추가한다.
 - [x] Tag push 기반 release artifact 빌드 및 GitHub Release 생성 workflow를 추가한다.
-- [ ] Tag release.
-- [ ] Create GitHub release.
-- [ ] Publish Go module.
+- [x] `v0.9.0-poppler24-02-0-202606.1` release tag를 생성한다.
+- [x] `v0.9.0-poppler24-02-0-202606.1` GitHub Release를 생성한다.
+- [x] Go module `github.com/dh-kam/pdf-go@v0.9.0-poppler24-02-0-202606.1`을 publish한다.
+- [x] WebAssembly demo를 GitHub Pages에 publish한다.
