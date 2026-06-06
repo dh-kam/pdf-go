@@ -5,7 +5,7 @@
 
 Go PDF is a PDF parsing, rendering, and text extraction library written in Go. The project ports core PDF.js behavior into a server-side Go implementation and uses Poppler-compatible rendering work as the primary raster accuracy target.
 
-Korean documentation is available in [README.ko.md](README.ko.md).
+Documentation: [English](README.md) | [한국어](README.ko.md)
 
 ## Features
 
@@ -118,7 +118,7 @@ fmt.Println(text)
 make build-no-cgo
 ```
 
-The default no-CGo build writes binaries under `build/linux-amd64/nocgo/` and legacy command aliases under `bin/`.
+The default no-CGo build writes binaries under `build/linux-amd64/default/` and legacy command aliases under `bin/`.
 
 Release packages can be built locally with:
 
@@ -133,18 +133,29 @@ GitHub Actions runs CI on pushes and pull requests. The release flow is tag-driv
 1. Run the `Bump Release Tag` workflow with `dry_run=false`, or push an annotated `v0.9.0-<upstream-slug>-YYYYMM.seq` tag.
 2. The `Release` workflow validates the tag, builds release binaries, packages artifacts, and creates the GitHub Release.
 
-The release tag format is `v<project-semver>-<upstream-slug>-YYYYMM.seq`. For the current Poppler-backed render baseline, the default example is `v0.9.0-poppler24-02-0-202605.1`.
+The release tag format is `v<project-semver>-<upstream-slug>-YYYYMM.seq`. For the current Poppler-backed render baseline, the default example is `v0.9.0-poppler24-02-0-202606.1`.
 
 Useful local gates:
 
 ```bash
 make release-ci
 make release-build
-make release-package RELEASE_VERSION=v0.9.0-poppler24-02-0-202605.1
+make release-package RELEASE_VERSION=v0.9.0-poppler24-02-0-202606.1
 ```
+
+## Coverage
+
+The current no-CGo coverage snapshot from `make coverage-core-no-cgo` is:
+
+- Overall no-CGo coverage: `61.4%`.
+- Core no-CGo coverage: `68.3%`.
+- Core coverage target: `80.0%`.
+
+The core gate is below target and currently fails at the threshold check after generating coverage profiles.
 
 ## Documentation
 
+- [Korean README](README.ko.md)
 - [Architecture](docs/architecture.md)
 - [API](docs/api.md)
 - [Features](docs/features.md)

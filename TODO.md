@@ -179,6 +179,9 @@ Korean localization: [TODO.ko.md](TODO.ko.md).
 
 ## Execution System
 
+- [x] Make no-CGo coverage package discovery ignore generated `tmp/` probes and local untracked experiments by deriving package gates from tracked Go source directories.
+- [x] Refresh stale PNG predictor and raw CMYK unit fixtures so no-CGo unit coverage can run against the current Poppler-aligned implementation.
+- [ ] Raise no-CGo core coverage from `68.3%` to the `80.0%` gate target, or document and justify a narrower gate definition.
 - [ ] Document the image-mapping contract for CTM application, sampler phase, and coordinate conversion, then reuse it across all render paths.
 - [ ] Include fixed failing-page fixtures in the `goal98` rerun template.
 - [ ] Preserve the comparison HTML layout with Poppler, ours, XOR, and secondary sorting by `failure_type`.

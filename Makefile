@@ -69,9 +69,12 @@ all_for_variant=$(foreach os,$(OS_LIST),$(foreach arch,$(ARCH_LIST),$(call build
 all_for_os_arch=$(foreach var,$(BUILD_VARIANTS),$(call build_stamp,$(1),$(2),$(var)))
 all_for_os_variant=$(foreach arch,$(ARCH_LIST),$(call build_stamp,$(1),$(arch),$(2)))
 all_for_arch_variant=$(foreach os,$(OS_LIST),$(call build_stamp,$(os),$(1),$(2)))
-GO_PACKAGES_NO_TMP=$(shell $(GOCMD) list ./... | grep -v '^github.com/dh-kam/pdf-go/tmp$$' | grep -v '^github.com/dh-kam/pdf-go/tmp/' | grep -v '^github.com/dh-kam/pdf-go/cmd$$' | grep -v '^github.com/dh-kam/pdf-go/test$$' | sed 's|^github.com/dh-kam/pdf-go|.|')
+# Release/package gates use tracked Go files so generated probes and local experiments do not change validation scope.
+GO_PACKAGE_DIRS=$(shell (git ls-files '*.go' 2>/dev/null || find . -path './.git' -prune -o -path './bin' -prune -o -path './build' -prune -o -path './dist' -prune -o -path './tmp' -prune -o -name '*.go' -type f -print) | sed 's|^\./||' | xargs -r dirname | sort -u | sed 's|^|./|')
+GO_PACKAGES_NO_TMP=$(shell $(GOCMD) list -e -f '{{if not .Error}}{{.ImportPath}}{{end}}' $(GO_PACKAGE_DIRS) | grep -v '^$$' | grep -v '^github.com/dh-kam/pdf-go/tmp$$' | grep -v '^github.com/dh-kam/pdf-go/tmp/' | grep -v '^github.com/dh-kam/pdf-go/cmd$$' | grep -v '^github.com/dh-kam/pdf-go/test$$' | sed 's|^github.com/dh-kam/pdf-go|.|')
 GO_PACKAGES_NO_TMP_NO_INTEG=$(shell echo "$(GO_PACKAGES_NO_TMP)" | tr ' ' '\n' | grep -v '^\./test/integration/pdf$$' | tr '\n' ' ')
 GO_PACKAGES_NO_TMP_NO_E2E=$(shell echo "$(GO_PACKAGES_NO_TMP)" | tr ' ' '\n' | grep -v '^\./test/e2e$$' | tr '\n' ' ')
+GO_PACKAGES_NO_TMP_NO_E2E_NO_INTEG=$(shell echo "$(GO_PACKAGES_NO_TMP)" | tr ' ' '\n' | grep -v '^\./test/e2e$$' | grep -v '^\./test/integration/' | tr '\n' ' ')
 GO_PACKAGES_RELEASE?=./cmd/pdfcompare ./cmd/pdfinfo ./cmd/pdfrender ./cmd/pdftext ./cmd/pdfwasm ./pkg/pdf
 GO_FORMAT_PATHS_RELEASE?=cmd/pdfcompare cmd/pdfinfo cmd/pdfrender cmd/pdftext cmd/pdfwasm pkg/pdf
 GOAL98_OUT?=$(CURDIR)/tmp/goal98_final_after_porting_complete_v2
@@ -318,7 +321,7 @@ coverage-show: test
 # Generate and show coverage report without CGo dependencies
 coverage-no-cgo:
 	@echo "Running coverage (no CGo)..."
-	$(NO_CGO_ENV) $(GOTEST) $(NO_CGO_TAG_FLAGS) -coverpkg=./internal/...,./pkg/... -coverprofile=coverage_no_cgo.txt $(GO_PACKAGES_NO_TMP_NO_E2E)
+	$(NO_CGO_ENV) $(GOTEST) $(NO_CGO_TAG_FLAGS) -coverpkg=./internal/...,./pkg/... -coverprofile=coverage_no_cgo.txt $(GO_PACKAGES_NO_TMP_NO_E2E_NO_INTEG)
 	@TOTAL="$$( $(GOCMD) tool cover -func=coverage_no_cgo.txt | awk '/^total:/ {print $$3}' )"; \
 	echo "Coverage total (no CGo): $$TOTAL"
 

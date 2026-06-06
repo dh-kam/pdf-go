@@ -170,11 +170,10 @@ func TestPNGPredictor_Decode_None(t *testing.T) {
 	predictor, err := stream.GetPredictor(11) // Predictor 11 = PNG None
 	require.NoError(t, err)
 
-	// PNG None filter: no transformation
-	// With predictor type 11, NO filter byte is included
+	// PDF PNG prediction stores one filter byte before each row.
 	data := []byte{
-		1, 2, 3, 4, // Row 1
-		5, 6, 7, 8, // Row 2
+		0, 1, 2, 3, 4, // Row 1
+		0, 5, 6, 7, 8, // Row 2
 	}
 	expected := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 
@@ -187,11 +186,8 @@ func TestPNGPredictor_Decode_Sub(t *testing.T) {
 	predictor, err := stream.GetPredictor(12) // Predictor 12 = PNG Sub
 	require.NoError(t, err)
 
-	// PNG Sub filter: each byte is the difference from the previous byte in the same row
-	// Original: [1,2,3,4]
-	// Encoded:  [1,1,1,1] (differences: 1, 2-1=1, 3-2=1, 4-3=1)
-	// With predictor type 12, NO filter byte is included
-	data := []byte{1, 1, 1, 1}
+	// Original: [1,2,3,4], encoded with Sub filter as [1,1,1,1].
+	data := []byte{1, 1, 1, 1, 1}
 	expected := []byte{1, 2, 3, 4}
 
 	result, err := predictor.Decode(data, 4, 1, 8)
@@ -204,14 +200,9 @@ func TestPNGPredictor_Decode_Sub_MultiColor(t *testing.T) {
 	require.NoError(t, err)
 
 	// RGB data with Sub filter (columns=2, colors=3, bpc=8)
-	// bytesPerSample = 1, bytesPerRow = 2*3*1 = 6
-	// With predictor type 12, NO filter byte is included
-	// PNG Sub filter: result[i] = data[i] + result[i-bytesPerSample] for i >= bytesPerSample
-	// For bytesPerSample=1, this becomes: result[i] = data[i] + result[i-1]
-	//
-	// Simple test: all zeros after first byte
-	data := []byte{10, 0, 0, 0, 0, 0}
-	expected := []byte{10, 10, 10, 10, 10, 10}
+	// The PNG left reference distance is one pixel, so RGB uses a 3-byte stride.
+	data := []byte{1, 10, 20, 30, 30, 30, 30}
+	expected := []byte{10, 20, 30, 40, 50, 60}
 
 	result, err := predictor.Decode(data, 2, 3, 8)
 	require.NoError(t, err)
@@ -222,13 +213,11 @@ func TestPNGPredictor_Decode_Up(t *testing.T) {
 	predictor, err := stream.GetPredictor(13) // Predictor 13 = PNG Up
 	require.NoError(t, err)
 
-	// PNG Up filter: each byte is the difference from the corresponding byte in the previous row
-	// With predictor type 13, the filter byte is NOT included in the data
 	// Row 1: [1, 2, 3, 4] (no prior row, so treated as None)
 	// Row 2: [4, 5, 6, 7] (differences from row 1: 5-1=4, 7-2=5, 9-3=6, 11-4=7)
 	data := []byte{
-		1, 2, 3, 4, // Row 1
-		4, 5, 6, 7, // Row 2
+		2, 1, 2, 3, 4, // Row 1
+		2, 4, 5, 6, 7, // Row 2
 	}
 	expected := []byte{1, 2, 3, 4, 5, 7, 9, 11}
 
@@ -241,27 +230,12 @@ func TestPNGPredictor_Decode_Average(t *testing.T) {
 	predictor, err := stream.GetPredictor(14) // Predictor 14 = PNG Average
 	require.NoError(t, err)
 
-	// PNG Average filter: average of left and up bytes
-	// With predictor type 14, the filter byte is NOT included in the data
 	// Simple test: all zeros except first byte of each row
 	data := []byte{
-		10, 0, 0, 0, // Row 1
-		0, 0, 0, 0, // Row 2
+		3, 10, 0, 0, 0, // Row 1
+		3, 0, 0, 0, 0, // Row 2
 	}
-	// Row 1: [10, 10, 5, 2] (10, 10+avg(10,0)=15, 0+avg(15,0)=7, 0+avg(7,0)=3)
-	// Wait, let me recalculate. The formula is: result[i] = data[i] + avg(left, up)
-	// For first row (no up): result[i] = data[i] + avg(left, 0) = data[i] + left/2
-	//   result[0] = 10 + avg(0, 0) = 10
-	//   result[1] = 0 + avg(10, 0) = 5
-	//   result[2] = 0 + avg(5, 0) = 2
-	//   result[3] = 0 + avg(2, 0) = 1
-	// For second row (with up): result[i] = data[i] + avg(left, up)
-	//   result[4] = 0 + avg(0, 10) = 5
-	//   result[5] = 0 + avg(5, 5) = 5
-	//   result[6] = 0 + avg(5, 2) = 3
-	//   result[7] = 0 + avg(3, 1) = 2
-	// But wait, I need to use integer division
-	// Let me just use a simpler test
+	// Average uses integer division: Raw(x) = Encoded(x) + floor((left + up) / 2).
 	expected := []byte{10, 5, 2, 1, 5, 5, 3, 2}
 
 	result, err := predictor.Decode(data, 4, 1, 8)
@@ -273,11 +247,10 @@ func TestPNGPredictor_Decode_Paeth(t *testing.T) {
 	predictor, err := stream.GetPredictor(15) // Predictor 15 = PNG Paeth
 	require.NoError(t, err)
 
-	// PNG Paeth filter: uses Paeth predictor
-	// With predictor type 15, the filter byte is NOT included in the data
+	// PNG Paeth filter uses the filter byte stored at the start of each row.
 	data := []byte{
-		10, 20, 30, 40, // Row 1
-		15, 25, 35, 45, // Row 2
+		4, 10, 20, 30, 40, // Row 1
+		4, 15, 25, 35, 45, // Row 2
 	}
 	// The exact result depends on the Paeth algorithm
 	// Just verify it doesn't error and returns correct length
@@ -521,11 +494,10 @@ func TestPNGPredictor_RGBImage(t *testing.T) {
 	// Each pixel is R,G,B
 
 	// Simple test: 2 pixels with values that decode cleanly
-	// With predictor type 12 (Sub), no filter byte is included
-	// bytesPerSample = 1, so each byte is predicted from the previous byte
+	// The row filter byte selects Sub, and RGB uses a 3-byte left stride.
 	// Original: [10, 20, 30, 40, 50, 60]
-	// Encoded (Sub): [10, 10, 10, 10, 10, 10] (differences)
-	data := []byte{10, 10, 10, 10, 10, 10}
+	// Encoded (Sub): [10, 20, 30, 30, 30, 30] after the filter byte.
+	data := []byte{1, 10, 20, 30, 30, 30, 30}
 	expected := []byte{10, 20, 30, 40, 50, 60}
 
 	predictor, err := stream.GetPredictor(12) // PNG Sub
@@ -564,13 +536,13 @@ func TestPNGPredictor_SingleColumn(t *testing.T) {
 	predictor, err := stream.GetPredictor(12) // PNG Sub
 	require.NoError(t, err)
 
-	// Single column data - with predictor type 12, no filter byte is included
+	// Single-column Sub rows still include one filter byte per row.
 	// columns=1, colors=1, bpc=8 -> bytesPerRow=1
-	// With PNG Sub filter and bytesPerSample=1, each row has only 1 byte
+	// With PNG Sub filter and bytesPerPixel=1, each row has only 1 byte,
 	// so there's no "left" byte to predict from within the row
 	// 4 rows of data: [10, 10, 10, 10]
 	// Decoded: [10, 10, 10, 10] (unchanged)
-	data := []byte{10, 10, 10, 10}
+	data := []byte{1, 10, 1, 10, 1, 10, 1, 10}
 	expected := []byte{10, 10, 10, 10}
 
 	result, err := predictor.Decode(data, 1, 1, 8)
@@ -596,9 +568,8 @@ func TestPNGPredictor_16BitSamples(t *testing.T) {
 
 	// 16-bit samples (2 bytes per sample)
 	// 2 columns, 1 color = 4 bytes per row
-	// With predictor type 11, no filter byte is included
 	data := []byte{
-		0x00, 0x01, 0x00, 0x02, // Row 1
+		0, 0x00, 0x01, 0x00, 0x02, // Row 1
 	}
 	expected := []byte{0x00, 0x01, 0x00, 0x02}
 

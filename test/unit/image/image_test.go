@@ -326,7 +326,7 @@ func TestDecoder_DecodeRawCMYK(t *testing.T) {
 	r, g, b, _ := img.RGBAAt(0, 0).RGBA()
 	// Cyan (C=255, M=0, Y=0, K=0) with the Poppler-compatible CMYK matrix.
 	assert.Equal(t, uint32(0), r)
-	assert.Equal(t, uint32(0xADAD), g)
+	assert.Equal(t, uint32(0xACAC), g)
 	assert.Equal(t, uint32(0xEFEF), b)
 }
 

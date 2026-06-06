@@ -79,6 +79,9 @@
 - [ ] 포트폴리오용 병목 백로그를 역할별 수행 계획과 월보 템플릿으로 문서화한다.
 
 ## 실행 체계
+- [x] no-CGo coverage package discovery가 generated `tmp/` probe와 local untracked experiment에 흔들리지 않도록 tracked Go source directory 기준으로 package gate를 산출한다.
+- [x] PNG predictor 및 raw CMYK unit fixture를 현재 Poppler-aligned 구현 기준으로 갱신해 no-CGo unit coverage가 실행되게 한다.
+- [ ] no-CGo core coverage를 현재 `68.3%`에서 `80.0%` gate target까지 올리거나, 더 좁은 gate 정의를 문서화하고 정당화한다.
 - [ ] 이미지 매핑 계약을 CTM 적용, 샘플러 phase, 좌표계 변환 기준으로 문서화하고 렌더 경로 전체에서 동일하게 사용한다.
 - [ ] 실패 페이지 고정 fixture를 `goal98` 재실행 템플릿에 포함한다.
 - [ ] 비교 HTML의 poppler/ours/xor 구조와 `failure_type` 2차 정렬을 유지한다.
