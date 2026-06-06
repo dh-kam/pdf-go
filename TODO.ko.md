@@ -1,6 +1,10 @@
 # Go PDF Rendering Library - TODO Checklist
 
 ## Poppler Splash Exact100 후속 점검
+- [ ] `B`/`B*`/`b`/`b*` fill-and-stroke operator의 stroke 절반을 기본화하기 전에 `PDF_DEBUG_SPLASH_POPPLER_ORDER_FILL_STROKE_PATH=1`을 별도 평가한다. broad gate는 focus/286을 통과했지만 path-heavy 문서의 성능 위험이 있다.
+- [ ] Poppler 호환 cropped group geometry, backdrop, transfer, performance parity가 검증될 때까지 ExtGState `/SMask` Form-mask 렌더링은 `GO_PDF_ENABLE_EXTGSTATE_SMASK=1` 뒤에 유지한다.
+- [ ] Poppler version/path 중 `Page::display`에서 page `/Group`을 render group으로 감싸는 근거가 확인되기 전까지 page-level transparency group 렌더링은 비활성화 상태로 유지한다.
+- [ ] 현재 2nd-corpus 경로에서는 djpeg-go DCTDecode를 기본 비활성화로 유지한다. JPEG A/B subset은 `-pure-go-jpeg`에서 `27/380`에서 `24/380` exact100으로 회귀했다.
 - [ ] `GeoTopo p39` 22px stroke AA overlap 잔차를 Poppler `Splash::makeStrokePath()` 및 `Splash::pipeRunAARGB8()` 경로 기준으로 재검토한다.
 - [ ] `GeoTopo p55` pattern/fill/stroke 잔차를 image/soft-mask가 아닌 segment stroke 및 tiling pattern 축으로 재분해한다.
 - [ ] `GeoTopo p55`, `p23`, `p44`, `p97`을 함께 보면서 Poppler `strokeNarrow`와 `strokeWide` 분기 조건을 더 좁힌다.
@@ -43,6 +47,14 @@
 - [x] 장시간 검증이 필요한 full-corpus Poppler exact100 HTML 생성은 `-timeout-sec 0`으로 실행 가능하게 유지한다.
 - [x] pure Go PDF 렌더링을 브라우저에서 사용할 수 있도록 WebAssembly facade와 Worker 기반 demo를 추가한다.
 - [x] Browser WebAssembly demo 기본값을 Splash로 바꾸고 CDP에서 확인 가능한 runtime log를 노출한다.
+
+## FreeType-Go 업스트림 Workflow
+- [ ] 확인된 FreeType parity gap마다 `freetype-go`에서 최소 fixture로 재현하고, 정확한 API 입력, pure Go 함수, 관측 delta를 기록한다.
+- [ ] 확인된 `freetype-go` 결함은 먼저 `/workspace/freetype-go`에서 수정하고 검증한 뒤, `pdf-go`가 upstream 가능한 동작을 소비하도록 갱신한다.
+- [ ] 확인된 각 gap에 대해 pure Go mismatch, fixture/page evidence, proposed fix를 포함한 GitHub issue를 `dh-kam/freetype-go`에 열고, 필요하면 implementation note를 issue comment로 남긴다.
+- [ ] `freetype-go` 작업 전에는 `git fetch origin`을 실행하고, local worktree가 clean이거나 변경분이 안전하게 commit/stash된 경우에만 `git pull --rebase`를 실행한다.
+- [ ] `GeoTopo-komprimiert.pdf` no-CGo Splash exact100을 맞추는 과정에서 확인한 raw CFF Type1C Encoding charmap 및 FontBBox parity gap을 upstream한다.
+- [ ] 변환된 TrueType glyph coverage parity를 위해 FreeType `ftgrays.c`의 `gray_render_line` / `gray_render_scanline`을 port 또는 upstream한 뒤 `Invoice-INV-6214322-202602-0001.pdf`와 receipt focus set을 재확인한다.
 
 ## 렌더링 정확도 개선
 - [ ] `pdf.js` fixture와 기존 sample fixture를 합쳐 render mismatch 상위 문서부터 98%+까지 반복 개선한다.
