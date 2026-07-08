@@ -5,9 +5,81 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/dh-kam/pdf-go/internal/infrastructure/splash/xpath"
 )
+
+const (
+	maxPooledImageScaleLineBytes = 1 << 20
+	maxPooledImageScaleUint32s   = 1 << 20
+	maxPooledImageScaleRuns      = 1 << 18
+)
+
+var imageScaleBufferPool = sync.Pool{
+	New: func() any {
+		return &imageScaleBuffers{}
+	},
+}
+
+type imageScaleBuffers struct {
+	line    []byte
+	pix     []uint32
+	xStarts []int
+	xSteps  []int
+}
+
+func acquireImageScaleBuffers(lineLen, pixLen, runLen int) *imageScaleBuffers {
+	b := imageScaleBufferPool.Get().(*imageScaleBuffers)
+	if cap(b.line) < lineLen {
+		b.line = make([]byte, lineLen)
+	} else {
+		b.line = b.line[:lineLen]
+	}
+	if cap(b.pix) < pixLen {
+		b.pix = make([]uint32, pixLen)
+	} else {
+		b.pix = b.pix[:pixLen]
+	}
+	if cap(b.xStarts) < runLen {
+		b.xStarts = make([]int, runLen)
+	} else {
+		b.xStarts = b.xStarts[:runLen]
+	}
+	if cap(b.xSteps) < runLen {
+		b.xSteps = make([]int, runLen)
+	} else {
+		b.xSteps = b.xSteps[:runLen]
+	}
+	return b
+}
+
+func releaseImageScaleBuffers(b *imageScaleBuffers) {
+	if b == nil {
+		return
+	}
+	if cap(b.line) > maxPooledImageScaleLineBytes {
+		b.line = nil
+	} else {
+		b.line = b.line[:0]
+	}
+	if cap(b.pix) > maxPooledImageScaleUint32s {
+		b.pix = nil
+	} else {
+		b.pix = b.pix[:0]
+	}
+	if cap(b.xStarts) > maxPooledImageScaleRuns {
+		b.xStarts = nil
+	} else {
+		b.xStarts = b.xStarts[:0]
+	}
+	if cap(b.xSteps) > maxPooledImageScaleRuns {
+		b.xSteps = nil
+	} else {
+		b.xSteps = b.xSteps[:0]
+	}
+	imageScaleBufferPool.Put(b)
+}
 
 // imgCoordMungeLower mirrors imgCoordMungeLower (Splash.cc:108).
 func imgCoordMungeLower(x float64) int { return Floor(x) }
@@ -33,8 +105,15 @@ func imgCoordMungeUpperC(x float64, glyphMode bool) int {
 
 // isImageInterpolationRequired mirrors isImageInterpolationRequired (Splash.cc:3940).
 func isImageInterpolationRequired(srcW, srcH, dstW, dstH int, interpolate bool) bool {
+	return isImageInterpolationRequiredWithOptions(srcW, srcH, dstW, dstH, interpolate, false)
+}
+
+func isImageInterpolationRequiredWithOptions(srcW, srcH, dstW, dstH int, interpolate bool, disableRequired bool) bool {
 	if interpolate || srcW == 0 || srcH == 0 {
 		return true
+	}
+	if disableRequired {
+		return false
 	}
 	if dstW/srcW >= 4 || dstH/srcH >= 4 {
 		return false
@@ -63,18 +142,19 @@ func (s *Splash) DrawImageImpl(src ImageSource, w, h int, mat [6]float64, interp
 }
 
 func (s *Splash) drawImageImpl(src ImageSource, w, h int, mat [6]float64, interpolate bool, sourceAlpha bool) error {
-	return s.drawImageImplWithPostTransform(src, w, h, mat, interpolate, sourceAlpha, nil)
+	return s.drawImageImplWithPostTransformOptions(src, w, h, mat, interpolate, sourceAlpha, nil, imageDrawOptions{})
 }
 
 type postScaleRGBTransform func(r, g, b byte) (byte, byte, byte)
 
-func (s *Splash) drawImageImplWithPostTransform(
+func (s *Splash) drawImageImplWithPostTransformOptions(
 	src ImageSource,
 	w, h int,
 	mat [6]float64,
 	interpolate bool,
 	sourceAlpha bool,
 	postTransform postScaleRGBTransform,
+	options imageDrawOptions,
 ) error {
 	if s.bitmap == nil || s.bitmap.data == nil {
 		return ErrBadArg
@@ -86,6 +166,21 @@ func (s *Splash) drawImageImplWithPostTransform(
 	if w <= 0 || h <= 0 {
 		return ErrZeroImage
 	}
+	if debugSplashImageDrawTrace {
+		fmt.Fprintf(os.Stderr, "DEBUG: drawImageImpl w=%d h=%d mat=%v interpolate=%t\n", w, h, mat, interpolate)
+		fmt.Fprintf(os.Stderr, "IMGSTATE w=%d h=%d x0=%.2f y0=%.2f fillAlpha=%.4f blendSet=%t groupDepth=%d\n",
+			w, h, mat[4], mat[5], s.state.fillAlpha, s.state.blendFunc != nil, len(s.groupStack))
+		if os.Getenv("PDF_DEBUG_EVAL_GS") != "" {
+			for gi := range s.groupStack {
+				g := s.groupStack[gi]
+				bm := 0
+				if g.blendMode != nil {
+					bm = 1
+				}
+				fmt.Fprintf(os.Stderr, "  GRPSTACK[%d] savedFA=%.4f savedBlendSet=%t isolated=%t\n", gi, g.savedFillAlpha, bm != 0, g.isolated)
+			}
+		}
+	}
 	// singular-matrix check (Splash.cc:3541).
 	det := mat[0]*mat[3] - mat[1]*mat[2]
 	if math.Abs(det) < 1e-6 {
@@ -93,6 +188,12 @@ func (s *Splash) drawImageImplWithPostTransform(
 	}
 
 	minorAxisZero := mat[1] == 0 && mat[2] == 0
+	axisAlignedScale := mat[0] > 0 && minorAxisZero && mat[3] != 0
+	// Axis-aligned interpolated images can use the scale-only paths below
+	// instead of buffering the full source image in the affine rasterizer.
+	if interpolate && !axisAlignedScale {
+		return s.arbitraryTransformImage(src, w, h, mat, interpolate, sourceAlpha, postTransform)
+	}
 
 	// scaling only (Splash.cc:3548).
 	if mat[0] > 0 && minorAxisZero && mat[3] > 0 {
@@ -106,13 +207,30 @@ func (s *Splash) drawImageImplWithPostTransform(
 		if y0 == y1 {
 			y1++
 		}
+		dstW := x1 - x0
+		dstH := y1 - y0
+		if debugSplashImageDrawTrace {
+			fmt.Fprintf(os.Stderr, "drawImage (scaling only): mat=%v x0=%d y0=%d x1=%d y1=%d dstW=%d dstH=%d interpolate=%v\n", mat, x0, y0, x1, y1, dstW, dstH, interpolate)
+		}
+		if isIntegerAligned2xDownscaleNoFlip(mat, w, h) {
+			dstW := w / 2
+			dstH := h / 2
+			x0 := int(math.Round(mat[4]))
+			y0 := int(math.Round(mat[5]))
+			clipRes := s.testRect(x0, y0, x0+dstW-1, y0+dstH-1)
+			if clipRes == xpath.ClipAllOutside {
+				return nil
+			}
+			return s.drawIntegerAligned2xDownscale(src, w, h, dstW, dstH, x0, y0, clipRes, sourceAlpha, postTransform)
+		}
 		clipRes := s.testRect(x0, y0, x1-1, y1-1)
 		if clipRes == xpath.ClipAllOutside {
 			return nil
 		}
-		dstW := x1 - x0
-		dstH := y1 - y0
-		scaled, err := s.scaleImageWithSourceAlpha(src, w, h, dstW, dstH, interpolate, sourceAlpha)
+		if s.canDrawYdownXdownDirect(w, h, dstW, dstH, interpolate, sourceAlpha, postTransform, clipRes) {
+			return s.drawYdownXdownDirect(src, w, h, dstW, dstH, x0, y0, clipRes, options.popplerFixedScaleAverage)
+		}
+		scaled, err := s.scaleImageWithSourceAlphaOptions(src, w, h, dstW, dstH, interpolate, sourceAlpha, options)
 		if err != nil {
 			return err
 		}
@@ -122,7 +240,31 @@ func (s *Splash) drawImageImplWithPostTransform(
 
 	// scaling plus vertical flip (Splash.cc:3581).
 	if mat[0] > 0 && minorAxisZero && mat[3] < 0 {
-		forcePopplerScaleThenFlip := s.forceScaleThenFlip || os.Getenv("PDF_DEBUG_SPLASH_DISABLE_TOPDOWN_VFLIP_SCALE") == "1"
+		x0 := imgCoordMungeLower(mat[4])
+		y0 := imgCoordMungeLower(mat[3] + mat[5])
+		x1 := imgCoordMungeUpper(mat[0] + mat[4])
+		y1 := imgCoordMungeUpper(mat[5])
+		if x0 == x1 {
+			if mat[4]+mat[0]*0.5 < float64(x0) {
+				x0--
+			} else {
+				x1++
+			}
+		}
+		if y0 == y1 {
+			if mat[5]+mat[1]*0.5 < float64(y0) {
+				y0--
+			} else {
+				y1++
+			}
+		}
+		dstW := x1 - x0
+		dstH := y1 - y0
+		if debugSplashImageDrawTrace {
+			fmt.Fprintf(os.Stderr, "drawImage (scaling+vflip): mat=%v x0=%d y0=%d x1=%d y1=%d dstW=%d dstH=%d interpolate=%v\n", mat, x0, y0, x1, y1, dstW, dstH, interpolate)
+		}
+		forcePopplerScaleThenFlip := s.forceScaleThenFlip || options.forceScaleThenFlip ||
+			debugSplashDisableTopdownVFlipScale
 		// Integer-aligned 2× downscale fastpath (2026-04-27, Path A).
 		// When both axes are exact 2× integer downscales at integer device
 		// origins (e.g. 150 DPI on a 3.84pt page → 16-pixel image scaled to
@@ -144,30 +286,10 @@ func (s *Splash) drawImageImplWithPostTransform(
 			}
 			return s.drawIntegerAligned2xDownscaleVFlip(src, w, h, dstW, dstH, x0, y0, clipRes, sourceAlpha, postTransform)
 		}
-		x0 := imgCoordMungeLower(mat[4])
-		y0 := imgCoordMungeLower(mat[3] + mat[5])
-		x1 := imgCoordMungeUpper(mat[0] + mat[4])
-		y1 := imgCoordMungeUpper(mat[5])
-		if x0 == x1 {
-			if mat[4]+mat[0]*0.5 < float64(x0) {
-				x0--
-			} else {
-				x1++
-			}
-		}
-		if y0 == y1 {
-			if mat[5]+mat[1]*0.5 < float64(y0) {
-				y0--
-			} else {
-				y1++
-			}
-		}
 		clipRes := s.testRect(x0, y0, x1-1, y1-1)
 		if clipRes == xpath.ClipAllOutside {
 			return nil
 		}
-		dstW := x1 - x0
-		dstH := y1 - y0
 		// Yup×Yup bilinear path: with the standard "closure-flip + scale + vertFlip"
 		// pair the bilinear's last-row clamp lands on the wrong end of the dst
 		// bitmap (the kernel iterates ySrc up to srcH-yStep with clamp, so the
@@ -182,31 +304,41 @@ func (s *Splash) drawImageImplWithPostTransform(
 		// post-vertFlip — produces the same end-to-end orientation but with
 		// the bilinear blend distributed top-to-bottom matching pdftoppm.
 		// Memory bilinear_yflip_2026_04_27.
-		if !forcePopplerScaleThenFlip && dstW >= w && dstH >= h && isImageInterpolationRequired(w, h, dstW, dstH, interpolate) {
-			scaled := NewBitmap(dstW, dstH, s.bitmap.mode, sourceAlpha)
-			if scaled.data == nil {
-				return ErrZeroImage
-			}
+		if !forcePopplerScaleThenFlip && dstW >= w && dstH >= h &&
+			isImageInterpolationRequiredWithOptions(w, h, dstW, dstH, interpolate, shouldDisableRequiredInterpolationForImage(options, w, h)) {
 			topDownSrc := func(row int, color, alpha []byte) error {
 				// Closure delivers row k as stdlib row (srcH-1-k); rewrap so
 				// row k → stdlib row k (top-down).
 				return src(h-1-row, color, alpha)
 			}
-			if err := s.scaleImageYupXupBilinear(topDownSrc, w, h, dstW, dstH, scaled); err != nil {
+			if s.canDrawYupXupBilinearDirect(w, h, dstW, dstH, sourceAlpha, postTransform, clipRes) {
+				return s.drawYupXupBilinearDirect(topDownSrc, w, h, dstW, dstH, x0, y0, options)
+			}
+			scaled := NewBitmap(dstW, dstH, s.bitmap.mode, sourceAlpha)
+			if scaled.data == nil {
+				return ErrZeroImage
+			}
+			if err := s.scaleImageYupXupBilinearWithOptions(topDownSrc, w, h, dstW, dstH, scaled, options); err != nil {
 				return err
 			}
 			s.applyPostScaleRGBTransform(scaled, postTransform)
 			return s.blitImage(scaled, x0, y0, clipRes)
 		}
 		if !forcePopplerScaleThenFlip && dstW >= w && dstH >= h {
+			topDownSrc := func(row int, color, alpha []byte) error {
+				return src(h-1-row, color, alpha)
+			}
+			if s.canDrawCenterMappedNearestDirect(w, h, dstW, dstH, sourceAlpha, options, clipRes) {
+				return s.drawCenterMappedNearestDirect(topDownSrc, w, h, dstW, dstH, x0, y0, clipRes, postTransform)
+			}
+			if s.canDrawYupXupDirect(w, h, dstW, dstH, sourceAlpha, postTransform, clipRes, options) {
+				return s.drawYupXupDirect(topDownSrc, w, h, dstW, dstH, x0, y0, clipRes)
+			}
 			scaled := NewBitmap(dstW, dstH, s.bitmap.mode, sourceAlpha)
 			if scaled.data == nil {
 				return ErrZeroImage
 			}
-			topDownSrc := func(row int, color, alpha []byte) error {
-				return src(h-1-row, color, alpha)
-			}
-			if err := s.scaleImageYupXup(topDownSrc, w, h, dstW, dstH, scaled); err != nil {
+			if err := s.scaleImageYupXupWithOptions(topDownSrc, w, h, dstW, dstH, scaled, options); err != nil {
 				return err
 			}
 			s.applyPostScaleRGBTransform(scaled, postTransform)
@@ -216,22 +348,32 @@ func (s *Splash) drawImageImplWithPostTransform(
 		// top-down display order. For Y-down downscales, scaling that stream
 		// directly matches Poppler's row grouping; scaling then vert-flipping
 		// shifts high-resolution Flate images such as GeoTopo p31.
-		disableTopDownDownscale := os.Getenv("PDF_DEBUG_SPLASH_DISABLE_TOPDOWN_DOWNSCALE") == "1"
+		disableTopDownDownscale := options.disableTopDownDownscale ||
+			debugSplashDisableTopdownDownscale
 		if !forcePopplerScaleThenFlip && (s.downscaleVFlipTopDown || (!sourceAlpha && !disableTopDownDownscale)) && dstW < w && dstH < h {
+			topDownSrc := func(row int, color, alpha []byte) error {
+				return src(h-1-row, color, alpha)
+			}
+			if s.canDrawYdownXdownDirect(w, h, dstW, dstH, interpolate, sourceAlpha, postTransform, clipRes) {
+				return s.drawYdownXdownDirect(topDownSrc, w, h, dstW, dstH, x0, y0, clipRes, options.popplerFixedScaleAverage)
+			}
 			scaled := NewBitmap(dstW, dstH, s.bitmap.mode, sourceAlpha)
 			if scaled.data == nil {
 				return ErrZeroImage
 			}
-			topDownSrc := func(row int, color, alpha []byte) error {
-				return src(h-1-row, color, alpha)
-			}
-			if err := s.scaleImageYdownXdown(topDownSrc, w, h, dstW, dstH, scaled); err != nil {
+			if err := s.scaleImageYdownXdown(topDownSrc, w, h, dstW, dstH, scaled, options.popplerFixedScaleAverage); err != nil {
 				return err
 			}
 			s.applyPostScaleRGBTransform(scaled, postTransform)
 			return s.blitImage(scaled, x0, y0, clipRes)
 		}
-		scaled, err := s.scaleImageWithSourceAlpha(src, w, h, dstW, dstH, interpolate, sourceAlpha)
+		if s.canDrawYupXdownVFlipDirect(w, h, dstW, dstH, interpolate, sourceAlpha, postTransform, clipRes) {
+			return s.drawYupXdownVFlipDirect(src, w, h, dstW, dstH, x0, y0, clipRes, options.popplerFixedScaleAverage)
+		}
+		if s.canDrawYdownXdownScaleThenVFlipDirect(w, h, dstW, dstH, interpolate, sourceAlpha, clipRes) {
+			return s.drawYdownXdownScaleThenVFlipDirect(src, w, h, dstW, dstH, x0, y0, clipRes, options.popplerFixedScaleAverage, postTransform)
+		}
+		scaled, err := s.scaleImageWithSourceAlphaOptions(src, w, h, dstW, dstH, interpolate, sourceAlpha, options)
 		if err != nil {
 			return err
 		}
@@ -257,6 +399,21 @@ func isIntegerAligned2xDownscale(mat [6]float64, w, h int) bool {
 	dstW := float64(w / 2)
 	dstH := float64(h / 2)
 	if mat[0] != dstW || mat[3] != -dstH {
+		return false
+	}
+	if !isNearlyIntegerCoord(mat[4]) || !isNearlyIntegerCoord(mat[5]) {
+		return false
+	}
+	return true
+}
+
+func isIntegerAligned2xDownscaleNoFlip(mat [6]float64, w, h int) bool {
+	if w <= 0 || h <= 0 || w%2 != 0 || h%2 != 0 {
+		return false
+	}
+	dstW := float64(w / 2)
+	dstH := float64(h / 2)
+	if mat[0] != dstW || mat[3] != dstH {
 		return false
 	}
 	if !isNearlyIntegerCoord(mat[4]) || !isNearlyIntegerCoord(mat[5]) {
@@ -373,6 +530,79 @@ func (s *Splash) drawIntegerAligned2xDownscaleVFlip(
 	return s.blitImage(scaled, dstX, dstY, clipRes)
 }
 
+func (s *Splash) drawIntegerAligned2xDownscale(
+	src ImageSource,
+	srcW, srcH, dstW, dstH, dstX, dstY int,
+	clipRes xpath.ClipResult,
+	sourceAlpha bool,
+	postTransform postScaleRGBTransform,
+) error {
+	nComps := nCompsForMode(s.bitmap.mode)
+	hasAlpha := sourceAlpha
+
+	rows := make([][]byte, srcH)
+	var alphaRows [][]byte
+	if hasAlpha {
+		alphaRows = make([][]byte, srcH)
+	}
+	for rowIdx := 0; rowIdx < srcH; rowIdx++ {
+		row := make([]byte, srcW*nComps)
+		var alpha []byte
+		if hasAlpha {
+			alpha = make([]byte, srcW)
+		}
+		if err := src(rowIdx, row, alpha); err != nil {
+			return err
+		}
+		rows[rowIdx] = row
+		if hasAlpha {
+			alphaRows[rowIdx] = alpha
+		}
+	}
+
+	scaled := NewBitmap(dstW, dstH, s.bitmap.mode, hasAlpha)
+	if scaled.data == nil {
+		return ErrZeroImage
+	}
+	bpp := bytesPerPixel(scaled.mode)
+
+	for dy := 0; dy < dstH; dy++ {
+		ry0, ry1 := popplerRange1D(dy, dstH, srcH)
+		for dx := 0; dx < dstW; dx++ {
+			rx0, rx1 := popplerRange1D(dx, dstW, srcW)
+			var pix [splashMaxColorComps]uint32
+			var aSum uint32
+			count := uint32((ry1 - ry0) * (rx1 - rx0))
+			if count == 0 {
+				continue
+			}
+			for sy := ry0; sy < ry1; sy++ {
+				row := rows[sy]
+				for sx := rx0; sx < rx1; sx++ {
+					base := sx * nComps
+					for c := 0; c < nComps; c++ {
+						pix[c] += uint32(row[base+c])
+					}
+					if hasAlpha {
+						aSum += uint32(alphaRows[sy][sx])
+					}
+				}
+			}
+			for c := 0; c < nComps; c++ {
+				pix[c] /= count
+			}
+			off := (dy*dstW + dx) * bpp
+			writePixel(scaled.data, off, scaled.mode, pix[:])
+			if hasAlpha {
+				scaled.alpha[dy*dstW+dx] = byte(aSum / count)
+			}
+		}
+	}
+
+	s.applyPostScaleRGBTransform(scaled, postTransform)
+	return s.blitImage(scaled, dstX, dstY, clipRes)
+}
+
 // popplerRange1D mirrors canvas.popplerSourceRange1D
 // (image_canvas_image_fastpath.go:113) — Poppler's asymmetric 2× downscale
 // grouping. Returns [start, end) source indices for destination index j.
@@ -413,25 +643,34 @@ func (s *Splash) scaleImage(src ImageSource, srcW, srcH, dstW, dstH int, interpo
 }
 
 func (s *Splash) scaleImageWithSourceAlpha(src ImageSource, srcW, srcH, dstW, dstH int, interpolate bool, sourceAlpha bool) (*Bitmap, error) {
+	return s.scaleImageWithSourceAlphaOptions(src, srcW, srcH, dstW, dstH, interpolate, sourceAlpha, imageDrawOptions{})
+}
+
+func (s *Splash) scaleImageWithSourceAlphaOptions(src ImageSource, srcW, srcH, dstW, dstH int, interpolate bool, sourceAlpha bool, options imageDrawOptions) (*Bitmap, error) {
 	dest := NewBitmap(dstW, dstH, s.bitmap.mode, sourceAlpha)
 	if dest.data == nil || srcW <= 0 || srcH <= 0 {
 		return nil, ErrZeroImage
 	}
 	var err error
+	// Match Poppler's Splash::scaleImage dispatch (Splash.cc:3962-3977): a downscale
+	// (scaledHeight < srcHeight) ALWAYS uses the box-average scaler regardless of the
+	// interpolate flag; interpolate is consulted only in the pure-upscale case via
+	// isImageInterpolationRequired. Routing interpolate=true downscales to bilinear
+	// (the old leading `if interpolate` branch) diverges from Poppler.
 	if dstH < srcH {
 		if dstW < srcW {
-			err = s.scaleImageYdownXdown(src, srcW, srcH, dstW, dstH, dest)
+			err = s.scaleImageYdownXdown(src, srcW, srcH, dstW, dstH, dest, options.popplerFixedScaleAverage)
 		} else {
-			err = s.scaleImageYdownXup(src, srcW, srcH, dstW, dstH, dest)
+			err = s.scaleImageYdownXup(src, srcW, srcH, dstW, dstH, dest, options.popplerFixedScaleAverage)
 		}
 	} else {
 		if dstW < srcW {
-			err = s.scaleImageYupXdown(src, srcW, srcH, dstW, dstH, dest)
+			err = s.scaleImageYupXdown(src, srcW, srcH, dstW, dstH, dest, options.popplerFixedScaleAverage)
 		} else {
-			if isImageInterpolationRequired(srcW, srcH, dstW, dstH, interpolate) {
-				err = s.scaleImageYupXupBilinear(src, srcW, srcH, dstW, dstH, dest)
+			if isImageInterpolationRequiredWithOptions(srcW, srcH, dstW, dstH, interpolate, shouldDisableRequiredInterpolationForImage(options, srcW, srcH)) {
+				err = s.scaleImageYupXupBilinearWithOptions(src, srcW, srcH, dstW, dstH, dest, options)
 			} else {
-				err = s.scaleImageYupXup(src, srcW, srcH, dstW, dstH, dest)
+				err = s.scaleImageYupXupWithOptions(src, srcW, srcH, dstW, dstH, dest, options)
 			}
 		}
 	}
@@ -439,6 +678,37 @@ func (s *Splash) scaleImageWithSourceAlpha(src ImageSource, srcW, srcH, dstW, ds
 		return nil, err
 	}
 	return dest, nil
+}
+
+func popplerScaleFixedDivisor(denom int) uint32 {
+	if denom <= 0 {
+		return 0
+	}
+	return uint32((1 << 23) / denom)
+}
+
+func popplerScaleFixedAverage(sum uint32, divisor uint32) uint32 {
+	return (sum * divisor) >> 23
+}
+
+func splashScaleAverage(sum uint32, denom int, usePopplerFixed bool) uint32 {
+	if denom <= 0 {
+		return 0
+	}
+	// Always use Poppler's fixed-point averaging for consistency with C FreeType.
+	// The old integer division (sum/denom) produces different results than
+	// Poppler's (sum * ((1<<23)/denom)) >> 23 approach.
+	return popplerScaleFixedAverage(sum, popplerScaleFixedDivisor(denom))
+}
+
+func shouldDisableRequiredInterpolationForImage(options imageDrawOptions, srcW, srcH int) bool {
+	if !options.disableRequiredInterpolation {
+		return false
+	}
+	// Thin image strips still match Poppler better through Splash's required
+	// interpolation fallback; large explicit-nearest surfaces match sparse
+	// overlay PDFs better when the explicit nearest request is honored.
+	return srcW >= 300 && srcH >= 200
 }
 
 // readImageRow pulls one source row (color + optional alpha) (Splash.h:50-55).
@@ -451,7 +721,7 @@ func (s *Splash) readImageRow(src ImageSource, srcW int, color, alpha []byte, ro
 }
 
 // scaleImageYdownXdown — both axes shrink (Splash.cc:3990).
-func (s *Splash) scaleImageYdownXdown(src ImageSource, srcW, srcH, dstW, dstH int, dest *Bitmap) error {
+func (s *Splash) scaleImageYdownXdown(src ImageSource, srcW, srcH, dstW, dstH int, dest *Bitmap, usePopplerFixedAverage bool) error {
 	nComps := nCompsForMode(s.bitmap.mode)
 	hasAlpha := dest.alpha != nil
 
@@ -460,8 +730,10 @@ func (s *Splash) scaleImageYdownXdown(src ImageSource, srcW, srcH, dstW, dstH in
 	xp := srcW / dstW
 	xq := srcW % dstW
 
-	lineBuf := make([]byte, srcW*nComps)
-	pixBuf := make([]uint32, srcW*nComps)
+	buffers := acquireImageScaleBuffers(srcW*nComps, srcW*nComps, 0)
+	defer releaseImageScaleBuffers(buffers)
+	lineBuf := buffers.line
+	pixBuf := buffers.pix
 	var alphaLine []byte
 	var alphaPix []uint32
 	if hasAlpha {
@@ -508,23 +780,19 @@ func (s *Splash) scaleImageYdownXdown(src ImageSource, srcW, srcH, dstW, dstH in
 		}
 
 		xt := 0
-		d0 := uint32((1 << 23) / (yStep * xp))
-		d1 := uint32((1 << 23) / (yStep * (xp + 1)))
 		xx := 0
 		xxa := 0
 		for x := 0; x < dstW; x++ {
 			var xStep int
-			var d uint32
 			xt += xq
 			if xt >= dstW {
 				xt -= dstW
 				xStep = xp + 1
-				d = d1
 			} else {
 				xStep = xp
-				d = d0
 			}
 			srcX0 := xx / nComps
+			denom := xStep * yStep
 
 			var pix [splashMaxColorComps]uint32
 			for i := 0; i < xStep; i++ {
@@ -535,13 +803,13 @@ func (s *Splash) scaleImageYdownXdown(src ImageSource, srcW, srcH, dstW, dstH in
 			}
 			rawPix := pix
 			for c := 0; c < nComps; c++ {
-				pix[c] = (pix[c] * d) >> 23
+				pix[c] = splashScaleAverage(pix[c], denom, usePopplerFixedAverage)
 			}
-			if s.shouldTraceImageScalePixel(x, y) {
+			if imageScaleTracePixelsEnabled && s.shouldTraceImageScalePixel(x, y) {
 				fmt.Fprintf(os.Stderr,
-					"SPLASH_SCALE_TRACE op=scaleImageYdownXdown dst=(%d,%d) srcX=[%d,%d] srcY=[%d,%d] src=%dx%d dstSize=%dx%d step=(%d,%d) bresenham=(xp=%d xq=%d yp=%d yq=%d xt=%d yt=%d d=%d) raw=(%d,%d,%d) out=(%d,%d,%d)%s\n",
+					"SPLASH_SCALE_TRACE op=scaleImageYdownXdown dst=(%d,%d) srcX=[%d,%d] srcY=[%d,%d] src=%dx%d dstSize=%dx%d step=(%d,%d) bresenham=(xp=%d xq=%d yp=%d yq=%d xt=%d yt=%d denom=%d) raw=(%d,%d,%d) out=(%d,%d,%d)%s\n",
 					x, y, srcX0, srcX0+xStep-1, srcY0, srcY0+yStep-1,
-					srcW, srcH, dstW, dstH, xStep, yStep, xp, xq, yp, yq, xt, yt, d,
+					srcW, srcH, dstW, dstH, xStep, yStep, xp, xq, yp, yq, xt, yt, denom,
 					rawPix[0], rawPix[1], rawPix[2], pix[0], pix[1], pix[2],
 					imageTraceContextForSplash(s))
 			}
@@ -553,7 +821,7 @@ func (s *Splash) scaleImageYdownXdown(src ImageSource, srcW, srcH, dstW, dstH in
 					a += alphaPix[xxa]
 					xxa++
 				}
-				a = (a * d) >> 23
+				a = splashScaleAverage(a, denom, usePopplerFixedAverage)
 				dest.alpha[destAlphaOff] = byte(a)
 				destAlphaOff++
 			}
@@ -562,8 +830,553 @@ func (s *Splash) scaleImageYdownXdown(src ImageSource, srcW, srcH, dstW, dstH in
 	return nil
 }
 
+func (s *Splash) canDrawYdownXdownDirect(
+	srcW, srcH, dstW, dstH int,
+	interpolate bool,
+	sourceAlpha bool,
+	postTransform postScaleRGBTransform,
+	clipRes xpath.ClipResult,
+) bool {
+	return s != nil &&
+		s.bitmap != nil &&
+		s.bitmap.mode == ModeRGB8 &&
+		!interpolate &&
+		!sourceAlpha &&
+		postTransform == nil &&
+		clipRes != xpath.ClipAllOutside &&
+		dstW > 0 &&
+		dstH > 0 &&
+		dstW < srcW &&
+		dstH < srcH
+}
+
+func (s *Splash) drawYdownXdownDirect(
+	src ImageSource,
+	srcW, srcH, dstW, dstH int,
+	xDest, yDest int,
+	clipRes xpath.ClipResult,
+	usePopplerFixedAverage bool,
+) error {
+	return s.drawYdownXdownDirectWithOptions(src, srcW, srcH, dstW, dstH, xDest, yDest, clipRes, usePopplerFixedAverage, nil, false, "drawYdownXdownDirect")
+}
+
+func (s *Splash) canDrawYdownXdownScaleThenVFlipDirect(
+	srcW, srcH, dstW, dstH int,
+	interpolate bool,
+	sourceAlpha bool,
+	clipRes xpath.ClipResult,
+) bool {
+	return s != nil &&
+		s.bitmap != nil &&
+		s.bitmap.mode == ModeRGB8 &&
+		!interpolate &&
+		!sourceAlpha &&
+		clipRes != xpath.ClipAllOutside &&
+		dstW > 0 &&
+		dstH > 0 &&
+		dstW < srcW &&
+		dstH < srcH
+}
+
+func (s *Splash) drawYdownXdownScaleThenVFlipDirect(
+	src ImageSource,
+	srcW, srcH, dstW, dstH int,
+	xDest, yDest int,
+	clipRes xpath.ClipResult,
+	usePopplerFixedAverage bool,
+	postTransform postScaleRGBTransform,
+) error {
+	return s.drawYdownXdownDirectWithOptions(src, srcW, srcH, dstW, dstH, xDest, yDest, clipRes, usePopplerFixedAverage, postTransform, true, "drawYdownXdownScaleThenVFlipDirect")
+}
+
+func (s *Splash) drawYdownXdownDirectWithOptions(
+	src ImageSource,
+	srcW, srcH, dstW, dstH int,
+	xDest, yDest int,
+	clipRes xpath.ClipResult,
+	usePopplerFixedAverage bool,
+	postTransform postScaleRGBTransform,
+	vFlip bool,
+	traceOp string,
+) error {
+	const nComps = 3
+	yp := srcH / dstH
+	yq := srcH % dstH
+
+	buffers := acquireImageScaleBuffers(srcW*nComps, dstW*nComps, dstW)
+	lineBuf := buffers.line
+	pixBuf := buffers.pix
+	xStarts := buffers.xStarts
+	xSteps := buffers.xSteps
+	fillXDownRuns(xStarts, xSteps, srcW, dstW)
+
+	alphaIn := byte(Round(s.state.fillAlpha * 255))
+	p := imagePipePool.Get().(*pipe)
+	clip, _ := s.state.clip.(*xpath.Clip)
+	useClipAA := clipRes != xpath.ClipAllInside && s.vectorAA && clip != nil
+	s.pipeInit(p, xDest, yDest, nil, &Color{}, alphaIn, useClipAA, false)
+	rowSize := 0
+	aaLen := 0
+	if useClipAA {
+		rowSize = (s.bitmap.width*splashAASize + 7) >> 3
+		aaLen = rowSize * splashAASize
+		if len(s.aaBuf) < aaLen {
+			s.aaBuf = make([]byte, aaLen)
+		}
+	}
+
+	yt := 0
+	rowIdx := 0
+	for y := 0; y < dstH; y++ {
+		var yStep int
+		yt += yq
+		if yt >= dstH {
+			yt -= dstH
+			yStep = yp + 1
+		} else {
+			yStep = yp
+		}
+		srcY0 := rowIdx
+
+		for j := range pixBuf {
+			pixBuf[j] = 0
+		}
+		for i := 0; i < yStep; i++ {
+			if err := s.readImageRow(src, srcW, lineBuf, nil, rowIdx); err != nil {
+				*p = pipe{}
+				imagePipePool.Put(p)
+				releaseImageScaleBuffers(buffers)
+				return err
+			}
+			rowIdx++
+			for x, xStep := range xSteps {
+				srcOff := xStarts[x] * nComps
+				pixOff := x * nComps
+				for col := 0; col < xStep; col++ {
+					pixBuf[pixOff] += uint32(lineBuf[srcOff])
+					pixBuf[pixOff+1] += uint32(lineBuf[srcOff+1])
+					pixBuf[pixOff+2] += uint32(lineBuf[srcOff+2])
+					srcOff += nComps
+				}
+			}
+		}
+
+		dy := yDest + y
+		if vFlip {
+			dy = yDest + dstH - 1 - y
+		}
+		if dy < 0 || dy >= s.bitmap.height {
+			continue
+		}
+		if useClipAA {
+			fillBitmapBytes(s.aaBuf[:aaLen], 0xff)
+			clip.ClipAALine(dy, s.aaBuf, 0, s.bitmap.width-1)
+		}
+		if clipRes == xpath.ClipAllInside {
+			s.pipeSetXY(p, xDest, dy)
+		}
+		for x, xStep := range xSteps {
+			denom := xStep * yStep
+			pixOff := x * nComps
+			var c Color
+			c[0] = byte(splashScaleAverage(pixBuf[pixOff], denom, usePopplerFixedAverage))
+			c[1] = byte(splashScaleAverage(pixBuf[pixOff+1], denom, usePopplerFixedAverage))
+			c[2] = byte(splashScaleAverage(pixBuf[pixOff+2], denom, usePopplerFixedAverage))
+			if postTransform != nil {
+				c[0], c[1], c[2] = postTransform(c[0], c[1], c[2])
+			}
+
+			dx := xDest + x
+			if dx < 0 || dx >= s.bitmap.width {
+				continue
+			}
+			shape := byte(255)
+			if clipRes != xpath.ClipAllInside && clip != nil {
+				if useClipAA {
+					t := s.aaCoverageAt(dx, rowSize)
+					t = adjustClippedImageLowAACoverageForDebug(t)
+					if t == 0 {
+						continue
+					}
+					shape = byte(Div255(int(s.aaGamma[t]) * 255))
+					if shape == 0 {
+						continue
+					}
+					p.shape = shape
+				} else if !clip.Test(dx, dy) {
+					// Poppler's non-AA clipped image blit uses the per-pixel
+					// point test (state->clip->test, Splash.cc:5010/5027) —
+					// TestSpan can never report AllOutside from a path
+					// scanner, so span-culling silently ignored path clips.
+					continue
+				}
+			}
+			p.cSrc = c
+			if clipRes != xpath.ClipAllInside {
+				s.pipeSetXY(p, dx, dy)
+			}
+			if shouldTraceImagePixel(dx, dy) {
+				traceImagePixelBefore(p, traceOp, dx, dy, xStarts[x], srcY0, c, shape)
+			}
+			p.run(p)
+			if shouldTraceImagePixel(dx, dy) {
+				traceImagePixelAfter(p, traceOp, dx, dy)
+			}
+		}
+	}
+	*p = pipe{}
+	imagePipePool.Put(p)
+	releaseImageScaleBuffers(buffers)
+	return nil
+}
+
+func (s *Splash) canDrawYupXdownVFlipDirect(
+	srcW, srcH, dstW, dstH int,
+	interpolate bool,
+	sourceAlpha bool,
+	postTransform postScaleRGBTransform,
+	clipRes xpath.ClipResult,
+) bool {
+	return s != nil &&
+		s.bitmap != nil &&
+		s.bitmap.mode == ModeRGB8 &&
+		!interpolate &&
+		!sourceAlpha &&
+		postTransform == nil &&
+		clipRes != xpath.ClipAllOutside &&
+		srcW > 0 &&
+		srcH > 0 &&
+		dstW > 0 &&
+		dstH > 0 &&
+		dstW < srcW &&
+		dstH >= srcH
+}
+
+func (s *Splash) drawYupXdownVFlipDirect(
+	src ImageSource,
+	srcW, srcH, dstW, dstH, xDest, yDest int,
+	clipRes xpath.ClipResult,
+	usePopplerFixedAverage bool,
+) error {
+	xStart := make([]int, dstW)
+	xStep := make([]int, dstW)
+	fillXDownRuns(xStart, xStep, srcW, dstW)
+
+	yMap := make([]int, dstH)
+	fillYupVFlipMap(yMap, srcH, dstH)
+
+	lineBuf := make([]byte, srcW*3)
+	rowBuf := make([]byte, dstW*3)
+	lastSrcY := -1
+	readLine := func(scaledY int) (int, error) {
+		srcY := yMap[scaledY]
+		if srcY == lastSrcY {
+			return srcY, nil
+		}
+		if err := s.readImageRow(src, srcW, lineBuf, nil, srcY); err != nil {
+			return srcY, err
+		}
+		for x := 0; x < dstW; x++ {
+			start := xStart[x] * 3
+			step := xStep[x]
+			var r, g, b uint32
+			for i := 0; i < step; i++ {
+				off := start + i*3
+				r += uint32(lineBuf[off])
+				g += uint32(lineBuf[off+1])
+				b += uint32(lineBuf[off+2])
+			}
+			out := x * 3
+			rowBuf[out] = byte(splashScaleAverage(r, step, usePopplerFixedAverage))
+			rowBuf[out+1] = byte(splashScaleAverage(g, step, usePopplerFixedAverage))
+			rowBuf[out+2] = byte(splashScaleAverage(b, step, usePopplerFixedAverage))
+		}
+		lastSrcY = srcY
+		return srcY, nil
+	}
+	sample := func(x int) Color {
+		off := x * 3
+		return Color{rowBuf[off], rowBuf[off+1], rowBuf[off+2]}
+	}
+	return s.blitMappedRGBDirect(dstW, dstH, xDest, yDest, clipRes, readLine, sample, xStart)
+}
+
+func fillXDownRuns(xStart, xStep []int, srcW, dstW int) {
+	xp := srcW / dstW
+	xq := srcW % dstW
+	xt := 0
+	xx := 0
+	for x := 0; x < dstW; x++ {
+		step := xp
+		xt += xq
+		if xt >= dstW {
+			xt -= dstW
+			step++
+		}
+		xStart[x] = xx
+		xStep[x] = step
+		xx += step
+	}
+}
+
+func fillYupVFlipMap(dstToSrc []int, srcH, dstH int) {
+	yp := dstH / srcH
+	yq := dstH % srcH
+	yt := 0
+	rawY := 0
+	for srcY := 0; srcY < srcH && rawY < dstH; srcY++ {
+		step := yp
+		yt += yq
+		if yt >= srcH {
+			yt -= srcH
+			step++
+		}
+		for i := 0; i < step && rawY < dstH; i++ {
+			dstToSrc[dstH-1-rawY] = srcY
+			rawY++
+		}
+	}
+	for rawY < dstH {
+		dstToSrc[dstH-1-rawY] = srcH - 1
+		rawY++
+	}
+}
+
+func (s *Splash) canDrawYupXupDirect(
+	srcW, srcH, dstW, dstH int,
+	sourceAlpha bool,
+	postTransform postScaleRGBTransform,
+	clipRes xpath.ClipResult,
+	options imageDrawOptions,
+) bool {
+	return s != nil &&
+		s.bitmap != nil &&
+		s.bitmap.mode == ModeRGB8 &&
+		!sourceAlpha &&
+		postTransform == nil &&
+		clipRes == xpath.ClipAllInside &&
+		srcW > 0 &&
+		srcH > 0 &&
+		dstW > 0 &&
+		dstH > 0 &&
+		dstW >= srcW &&
+		dstH >= srcH &&
+		!shouldUseCenterMappedNearestUpscaleForImage(options, srcW, srcH)
+}
+
+func (s *Splash) drawYupXupDirect(
+	src ImageSource,
+	srcW, srcH, dstW, dstH, xDest, yDest int,
+	clipRes xpath.ClipResult,
+) error {
+	xMap := make([]int, dstW)
+	fillNearestUpscaleMap(xMap, srcW, dstW, false, 0)
+	yMap := make([]int, dstH)
+	fillNearestUpscaleMap(yMap, srcH, dstH, false, 0)
+
+	lineBuf := make([]byte, srcW*3)
+	lastSrcY := -1
+	readLine := func(scaledY int) (int, error) {
+		srcY := yMap[scaledY]
+		if srcY == lastSrcY {
+			return srcY, nil
+		}
+		if err := s.readImageRow(src, srcW, lineBuf, nil, srcY); err != nil {
+			return srcY, err
+		}
+		lastSrcY = srcY
+		return srcY, nil
+	}
+	sample := func(x int) Color {
+		off := xMap[x] * 3
+		return Color{lineBuf[off], lineBuf[off+1], lineBuf[off+2]}
+	}
+	return s.blitMappedRGBDirect(dstW, dstH, xDest, yDest, clipRes, readLine, sample, xMap)
+}
+
+func (s *Splash) canDrawYupXupBilinearDirect(
+	srcW, srcH, dstW, dstH int,
+	sourceAlpha bool,
+	postTransform postScaleRGBTransform,
+	clipRes xpath.ClipResult,
+) bool {
+	return s != nil &&
+		s.bitmap != nil &&
+		s.bitmap.mode == ModeRGB8 &&
+		!sourceAlpha &&
+		postTransform == nil &&
+		// The direct blit performs no clip tests at all, so it is only valid
+		// when the destination rect is entirely inside the clip. Partial
+		// clips (e.g. a sub-pixel sliver path clip) must fall through to
+		// scaleImage+blitImage, whose clipped blitters honor path scanners.
+		clipRes == xpath.ClipAllInside &&
+		srcW > 0 &&
+		srcH > 0 &&
+		dstW > 0 &&
+		dstH > 0 &&
+		dstW >= srcW &&
+		dstH >= srcH
+}
+
+func (s *Splash) drawYupXupBilinearDirect(
+	src ImageSource,
+	srcW, srcH, dstW, dstH, xDest, yDest int,
+	options imageDrawOptions,
+) error {
+	const nComps = 3
+	srcBuf := make([]byte, (srcW+1)*nComps)
+	lineBuf1 := make([]byte, dstW*nComps)
+	lineBuf2 := make([]byte, dstW*nComps)
+	// Poppler origin phase (see scaleImageYupXupBilinearWithOptions).
+	expandPlan := newPopplerOriginExpandRowPlan(srcW, dstW)
+
+	yStep := float64(srcH) / float64(dstH)
+	ySrc := 0.0
+	currentSrcRow := -1
+	rowIdx := 0
+
+	if err := s.readImageRow(src, srcW, srcBuf[:srcW*nComps], nil, rowIdx); err != nil {
+		return err
+	}
+	rowIdx++
+	expandRowWithPlan(srcBuf, lineBuf2, nComps, expandPlan)
+
+	alphaIn := byte(Round(s.state.fillAlpha * 255))
+	p := imagePipePool.Get().(*pipe)
+	s.pipeInit(p, xDest, yDest, nil, &Color{}, alphaIn, false, false)
+	defer func() {
+		*p = pipe{}
+		imagePipePool.Put(p)
+	}()
+
+	for y := 0; y < dstH; y++ {
+		ySrcClamped := ySrc
+		if ySrcClamped < 0 {
+			ySrcClamped = 0
+		}
+		yInt, yFrac := math.Modf(ySrcClamped)
+		for int(yInt) > currentSrcRow {
+			currentSrcRow++
+			copy(lineBuf1, lineBuf2)
+			if currentSrcRow < srcH-1 {
+				if err := s.readImageRow(src, srcW, srcBuf[:srcW*nComps], nil, rowIdx); err != nil {
+					return err
+				}
+				rowIdx++
+				expandRowWithPlan(srcBuf, lineBuf2, nComps, expandPlan)
+			}
+		}
+
+		yWeight0 := 1.0 - yFrac
+		s.pipeSetXY(p, xDest, yDest+y)
+		srcOff := 0
+		for x := 0; x < dstW; x++ {
+			c := Color{
+				byte(float64(lineBuf1[srcOff])*yWeight0 + float64(lineBuf2[srcOff])*yFrac),
+				byte(float64(lineBuf1[srcOff+1])*yWeight0 + float64(lineBuf2[srcOff+1])*yFrac),
+				byte(float64(lineBuf1[srcOff+2])*yWeight0 + float64(lineBuf2[srcOff+2])*yFrac),
+			}
+			dx := xDest + x
+			dy := yDest + y
+			p.cSrc = c
+			if shouldTraceImagePixel(dx, dy) {
+				traceImagePixelBefore(p, "drawYupXupBilinearDirect", dx, dy, x, y, c, 255)
+			}
+			p.run(p)
+			if shouldTraceImagePixel(dx, dy) {
+				traceImagePixelAfter(p, "drawYupXupBilinearDirect", dx, dy)
+			}
+			srcOff += nComps
+		}
+		ySrc += yStep
+	}
+	return nil
+}
+
+func (s *Splash) blitMappedRGBDirect(
+	dstW, dstH, xDest, yDest int,
+	clipRes xpath.ClipResult,
+	readLine func(int) (int, error),
+	sample func(int) Color,
+	xMap []int,
+) error {
+	x0, y0 := 0, 0
+	x1, y1 := dstW, dstH
+	clip, _ := s.state.clip.(*xpath.Clip)
+	if clipRes != xpath.ClipAllInside {
+		if clip != nil && clip.HasPathClip() {
+			x0, x1 = dstW, dstW
+			y0, y1 = dstH, dstH
+		} else if clip != nil {
+			clipXMin, clipYMin, clipXMax, clipYMax := clip.Bounds()
+			if t := Ceil(clipXMin) - xDest; t > x0 {
+				x0 = t
+			}
+			if t := Ceil(clipYMin) - yDest; t > y0 {
+				y0 = t
+			}
+			if t := Floor(clipXMax) - xDest; t < x1 {
+				x1 = t
+			}
+			if t := Floor(clipYMax) - yDest; t < y1 {
+				y1 = t
+			}
+		} else {
+			if t := -xDest; t > x0 {
+				x0 = t
+			}
+			if t := -yDest; t > y0 {
+				y0 = t
+			}
+			if t := s.bitmap.width - xDest; t < x1 {
+				x1 = t
+			}
+			if t := s.bitmap.height - yDest; t < y1 {
+				y1 = t
+			}
+		}
+	}
+	if x0 > x1 {
+		x1 = x0
+	}
+	if y0 > y1 {
+		y1 = y0
+	}
+
+	if x0 < x1 && y0 < y1 {
+		if err := s.blitCenterMappedNearestDirectRect(x0, y0, x1, y1, xDest, yDest, readLine, sample, xMap); err != nil {
+			return err
+		}
+	}
+
+	if clipRes == xpath.ClipAllInside {
+		return nil
+	}
+	if y0 > 0 {
+		if err := s.blitCenterMappedNearestDirectClipped(0, 0, xDest, yDest, dstW, y0, readLine, sample, xMap); err != nil {
+			return err
+		}
+	}
+	if y1 < dstH {
+		if err := s.blitCenterMappedNearestDirectClipped(0, y1, xDest, yDest+y1, dstW, dstH-y1, readLine, sample, xMap); err != nil {
+			return err
+		}
+	}
+	if x0 > 0 && y0 < y1 {
+		if err := s.blitCenterMappedNearestDirectClipped(0, y0, xDest, yDest+y0, x0, y1-y0, readLine, sample, xMap); err != nil {
+			return err
+		}
+	}
+	if x1 < dstW && y0 < y1 {
+		if err := s.blitCenterMappedNearestDirectClipped(x1, y0, xDest+x1, yDest+y0, dstW-x1, y1-y0, readLine, sample, xMap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // scaleImageYdownXup — Y shrinks, X grows (Splash.cc:4230).
-func (s *Splash) scaleImageYdownXup(src ImageSource, srcW, srcH, dstW, dstH int, dest *Bitmap) error {
+func (s *Splash) scaleImageYdownXup(src ImageSource, srcW, srcH, dstW, dstH int, dest *Bitmap, usePopplerFixedAverage bool) error {
 	nComps := nCompsForMode(s.bitmap.mode)
 	hasAlpha := dest.alpha != nil
 
@@ -572,8 +1385,10 @@ func (s *Splash) scaleImageYdownXup(src ImageSource, srcW, srcH, dstW, dstH int,
 	xp := dstW / srcW
 	xq := dstW % srcW
 
-	lineBuf := make([]byte, srcW*nComps)
-	pixBuf := make([]uint32, srcW*nComps)
+	buffers := acquireImageScaleBuffers(srcW*nComps, srcW*nComps, 0)
+	defer releaseImageScaleBuffers(buffers)
+	lineBuf := buffers.line
+	pixBuf := buffers.pix
 	var alphaLine []byte
 	var alphaPix []uint32
 	if hasAlpha {
@@ -619,7 +1434,6 @@ func (s *Splash) scaleImageYdownXup(src ImageSource, srcW, srcH, dstW, dstH int,
 		}
 
 		xt := 0
-		d := uint32((1 << 23) / yStep)
 		for x := 0; x < srcW; x++ {
 			var xStep int
 			xt += xq
@@ -631,13 +1445,13 @@ func (s *Splash) scaleImageYdownXup(src ImageSource, srcW, srcH, dstW, dstH int,
 			}
 			var pix [splashMaxColorComps]uint32
 			for c := 0; c < nComps; c++ {
-				pix[c] = (pixBuf[x*nComps+c] * d) >> 23
+				pix[c] = splashScaleAverage(pixBuf[x*nComps+c], yStep, usePopplerFixedAverage)
 			}
 			for i := 0; i < xStep; i++ {
 				storeScaledPixel(dest.data, &destOff, dest.mode, pix[:])
 			}
 			if hasAlpha {
-				a := (alphaPix[x] * d) >> 23
+				a := splashScaleAverage(alphaPix[x], yStep, usePopplerFixedAverage)
 				for i := 0; i < xStep; i++ {
 					dest.alpha[destAlphaOff] = byte(a)
 					destAlphaOff++
@@ -649,7 +1463,7 @@ func (s *Splash) scaleImageYdownXup(src ImageSource, srcW, srcH, dstW, dstH int,
 }
 
 // scaleImageYupXdown — Y grows, X shrinks (Splash.cc:4382).
-func (s *Splash) scaleImageYupXdown(src ImageSource, srcW, srcH, dstW, dstH int, dest *Bitmap) error {
+func (s *Splash) scaleImageYupXdown(src ImageSource, srcW, srcH, dstW, dstH int, dest *Bitmap, usePopplerFixedAverage bool) error {
 	nComps := nCompsForMode(s.bitmap.mode)
 	hasAlpha := dest.alpha != nil
 	bpp := bytesPerPixel(dest.mode)
@@ -659,7 +1473,9 @@ func (s *Splash) scaleImageYupXdown(src ImageSource, srcW, srcH, dstW, dstH int,
 	xp := srcW / dstW
 	xq := srcW % dstW
 
-	lineBuf := make([]byte, srcW*nComps)
+	buffers := acquireImageScaleBuffers(srcW*nComps, 0, 0)
+	defer releaseImageScaleBuffers(buffers)
+	lineBuf := buffers.line
 	var alphaLine []byte
 	if hasAlpha {
 		alphaLine = make([]byte, srcW)
@@ -682,22 +1498,18 @@ func (s *Splash) scaleImageYupXdown(src ImageSource, srcW, srcH, dstW, dstH int,
 		}
 
 		xt := 0
-		d0 := uint32((1 << 23) / xp)
-		d1 := uint32((1 << 23) / (xp + 1))
 		xx := 0
 		xxa := 0
 		for x := 0; x < dstW; x++ {
 			var xStep int
-			var d uint32
 			xt += xq
 			if xt >= dstW {
 				xt -= dstW
 				xStep = xp + 1
-				d = d1
 			} else {
 				xStep = xp
-				d = d0
 			}
+
 			var pix [splashMaxColorComps]uint32
 			for i := 0; i < xStep; i++ {
 				for c := 0; c < nComps; c++ {
@@ -706,7 +1518,7 @@ func (s *Splash) scaleImageYupXdown(src ImageSource, srcW, srcH, dstW, dstH int,
 				}
 			}
 			for c := 0; c < nComps; c++ {
-				pix[c] = (pix[c] * d) >> 23
+				pix[c] = splashScaleAverage(pix[c], xStep, usePopplerFixedAverage)
 			}
 			for i := 0; i < yStep; i++ {
 				off := destRowBase + (i*dstW+x)*bpp
@@ -718,7 +1530,7 @@ func (s *Splash) scaleImageYupXdown(src ImageSource, srcW, srcH, dstW, dstH int,
 					a += uint32(alphaLine[xxa])
 					xxa++
 				}
-				a = (a * d) >> 23
+				a = splashScaleAverage(a, xStep, usePopplerFixedAverage)
 				for i := 0; i < yStep; i++ {
 					dest.alpha[destAlphaRowBase+i*dstW+x] = byte(a)
 				}
@@ -743,7 +1555,9 @@ func (s *Splash) scaleImageYupXup(src ImageSource, srcW, srcH, dstW, dstH int, d
 	xp := dstW / srcW
 	xq := dstW % srcW
 
-	lineBuf := make([]byte, srcW*nComps)
+	buffers := acquireImageScaleBuffers(srcW*nComps, 0, 0)
+	defer releaseImageScaleBuffers(buffers)
+	lineBuf := buffers.line
 	var alphaLine []byte
 	if hasAlpha {
 		alphaLine = make([]byte, srcW)
@@ -804,27 +1618,517 @@ func (s *Splash) scaleImageYupXup(src ImageSource, srcW, srcH, dstW, dstH int, d
 	return nil
 }
 
+func (s *Splash) scaleImageYupXupWithOptions(src ImageSource, srcW, srcH, dstW, dstH int, dest *Bitmap, options imageDrawOptions) error {
+	if shouldUseCenterMappedNearestUpscaleForImage(options, srcW, srcH) {
+		return s.scaleImageYupXupCenterMapped(src, srcW, srcH, dstW, dstH, dest)
+	}
+	return s.scaleImageYupXup(src, srcW, srcH, dstW, dstH, dest)
+}
+
+func shouldUseCenterMappedNearestUpscaleForImage(options imageDrawOptions, srcW, srcH int) bool {
+	if !options.centerMappedNearestUpscale {
+		return false
+	}
+	return srcW >= 300 && srcH >= 200
+}
+
+func (s *Splash) canDrawCenterMappedNearestDirect(srcW, srcH, dstW, dstH int, sourceAlpha bool, options imageDrawOptions, clipRes xpath.ClipResult) bool {
+	return s != nil &&
+		s.bitmap != nil &&
+		s.bitmap.mode == ModeRGB8 &&
+		!sourceAlpha &&
+		clipRes != xpath.ClipAllOutside &&
+		dstW >= srcW &&
+		dstH >= srcH &&
+		shouldUseCenterMappedNearestUpscaleForImage(options, srcW, srcH) &&
+		!isImageInterpolationRequiredWithOptions(srcW, srcH, dstW, dstH, false, shouldDisableRequiredInterpolationForImage(options, srcW, srcH))
+}
+
+func (s *Splash) drawCenterMappedNearestDirect(
+	src ImageSource,
+	srcW, srcH, dstW, dstH, xDest, yDest int,
+	clipRes xpath.ClipResult,
+	postTransform postScaleRGBTransform,
+) error {
+	if dstW <= 0 || dstH <= 0 || srcW <= 0 || srcH <= 0 {
+		return ErrZeroImage
+	}
+	lineBuf := make([]byte, srcW*3)
+	xMap := make([]int, dstW)
+	fillNearestUpscaleMap(xMap, srcW, dstW, true, 0)
+
+	lastSrcY := -1
+	readLine := func(y int) (int, error) {
+		srcY := centerMappedNearestSourceIndex(y, srcH, dstH)
+		if srcY != lastSrcY {
+			if err := s.readImageRow(src, srcW, lineBuf, nil, srcY); err != nil {
+				return srcY, err
+			}
+			lastSrcY = srcY
+		}
+		return srcY, nil
+	}
+	sample := func(x int) Color {
+		srcOff := xMap[x] * 3
+		c := Color{lineBuf[srcOff], lineBuf[srcOff+1], lineBuf[srcOff+2]}
+		if postTransform != nil {
+			c[0], c[1], c[2] = postTransform(c[0], c[1], c[2])
+		}
+		return c
+	}
+
+	x0, y0 := 0, 0
+	x1, y1 := dstW, dstH
+	clip, _ := s.state.clip.(*xpath.Clip)
+	if clipRes != xpath.ClipAllInside {
+		if clip != nil && clip.HasPathClip() {
+			x0, x1 = dstW, dstW
+			y0, y1 = dstH, dstH
+		} else if clip != nil {
+			clipXMin, clipYMin, clipXMax, clipYMax := clip.Bounds()
+			if t := Ceil(clipXMin) - xDest; t > x0 {
+				x0 = t
+			}
+			if t := Ceil(clipYMin) - yDest; t > y0 {
+				y0 = t
+			}
+			if t := Floor(clipXMax) - xDest; t < x1 {
+				x1 = t
+			}
+			if t := Floor(clipYMax) - yDest; t < y1 {
+				y1 = t
+			}
+		} else {
+			if t := -xDest; t > x0 {
+				x0 = t
+			}
+			if t := -yDest; t > y0 {
+				y0 = t
+			}
+			if t := s.bitmap.width - xDest; t < x1 {
+				x1 = t
+			}
+			if t := s.bitmap.height - yDest; t < y1 {
+				y1 = t
+			}
+		}
+	}
+	if x0 > x1 {
+		x1 = x0
+	}
+	if y0 > y1 {
+		y1 = y0
+	}
+
+	if x0 < x1 && y0 < y1 {
+		if err := s.blitCenterMappedNearestDirectRect(x0, y0, x1, y1, xDest, yDest, readLine, sample, xMap); err != nil {
+			return err
+		}
+	}
+
+	if clipRes == xpath.ClipAllInside {
+		return nil
+	}
+	if y0 > 0 {
+		if err := s.blitCenterMappedNearestDirectClipped(0, 0, xDest, yDest, dstW, y0, readLine, sample, xMap); err != nil {
+			return err
+		}
+	}
+	if y1 < dstH {
+		if err := s.blitCenterMappedNearestDirectClipped(0, y1, xDest, yDest+y1, dstW, dstH-y1, readLine, sample, xMap); err != nil {
+			return err
+		}
+	}
+	if x0 > 0 && y0 < y1 {
+		if err := s.blitCenterMappedNearestDirectClipped(0, y0, xDest, yDest+y0, x0, y1-y0, readLine, sample, xMap); err != nil {
+			return err
+		}
+	}
+	if x1 < dstW && y0 < y1 {
+		if err := s.blitCenterMappedNearestDirectClipped(x1, y0, xDest+x1, yDest+y0, dstW-x1, y1-y0, readLine, sample, xMap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Splash) blitCenterMappedNearestDirectRect(
+	x0, y0, x1, y1, xDest, yDest int,
+	readLine func(int) (int, error),
+	sample func(int) Color,
+	xMap []int,
+) error {
+	alphaIn := byte(Round(s.state.fillAlpha * 255))
+	p := imagePipePool.Get().(*pipe)
+	s.pipeInit(p, xDest+x0, yDest+y0, nil, &Color{}, alphaIn, false, false)
+	for y := y0; y < y1; y++ {
+		srcY, err := readLine(y)
+		if err != nil {
+			*p = pipe{}
+			imagePipePool.Put(p)
+			return err
+		}
+		s.pipeSetXY(p, xDest+x0, yDest+y)
+		for x := x0; x < x1; x++ {
+			c := sample(x)
+			p.cSrc = c
+			dx := xDest + x
+			dy := yDest + y
+			if shouldTraceImagePixel(dx, dy) {
+				traceImagePixelBefore(p, "drawCenterMappedNearestDirect", dx, dy, xMap[x], srcY, c, 255)
+			}
+			p.run(p)
+			if shouldTraceImagePixel(dx, dy) {
+				traceImagePixelAfter(p, "drawCenterMappedNearestDirect", dx, dy)
+			}
+		}
+	}
+	*p = pipe{}
+	imagePipePool.Put(p)
+	return nil
+}
+
+func (s *Splash) blitCenterMappedNearestDirectClipped(
+	xSrc, ySrc, xDest, yDest, w, h int,
+	readLine func(int) (int, error),
+	sample func(int) Color,
+	xMap []int,
+) error {
+	if w <= 0 || h <= 0 {
+		return nil
+	}
+	if s.vectorAA {
+		return s.blitCenterMappedNearestDirectClippedAA(xSrc, ySrc, xDest, yDest, w, h, readLine, sample, xMap)
+	}
+	return s.blitCenterMappedNearestDirectClippedNoAA(xSrc, ySrc, xDest, yDest, w, h, readLine, sample, xMap)
+}
+
+func (s *Splash) blitCenterMappedNearestDirectClippedAA(
+	xSrc, ySrc, xDest, yDest, w, h int,
+	readLine func(int) (int, error),
+	sample func(int) Color,
+	xMap []int,
+) error {
+	clip, _ := s.state.clip.(*xpath.Clip)
+	if clip == nil {
+		return nil
+	}
+	_, clipYMin, _, clipYMax := clip.IntBounds()
+	alphaIn := byte(Round(s.state.fillAlpha * 255))
+	var p pipe
+	s.pipeInit(&p, xDest, yDest, nil, &Color{}, alphaIn, true, false)
+	spanGate := debugSplashImageClipSpanGate
+	fullWidthClip := !debugSplashDisableFullWidthAabuf || debugSplashImageClipFullWidth
+
+	rowSize := (s.bitmap.width*splashAASize + 7) >> 3
+	aaLen := rowSize * splashAASize
+	if len(s.aaBuf) < aaLen {
+		s.aaBuf = make([]byte, aaLen)
+	}
+
+	for y := 0; y < h; y++ {
+		scaledY := ySrc + y
+		dy := yDest + y
+		if dy < clipYMin || dy > clipYMax || dy < 0 || dy >= s.bitmap.height {
+			continue
+		}
+		srcY, err := readLine(scaledY)
+		if err != nil {
+			return err
+		}
+		fillBitmapBytes(s.aaBuf[:aaLen], 0xff)
+		if fullWidthClip {
+			_, _ = clip.ClipAALineFullWidth(dy, s.aaBuf, 0, s.bitmap.width-1, s.bitmap.width)
+		} else {
+			clip.ClipAALine(dy, s.aaBuf, 0, s.bitmap.width-1)
+		}
+
+		for x := 0; x < w; x++ {
+			scaledX := xSrc + x
+			dx := xDest + x
+			if dx < 0 || dx >= s.bitmap.width {
+				continue
+			}
+			t := -1
+			if spanGate {
+				switch clip.TestSpan(dx, dx, dy) {
+				case xpath.ClipAllOutside:
+					continue
+				case xpath.ClipAllInside:
+					t = splashAASize * splashAASize
+				}
+			}
+			if t < 0 {
+				t = s.aaCoverageAt(dx, rowSize)
+			}
+			t = adjustClippedImageLowAACoverageForDebug(t)
+			if t == 0 {
+				continue
+			}
+			shape := byte(s.aaGamma[t])
+			if shape == 0 {
+				continue
+			}
+			c := sample(scaledX)
+			p.cSrc = c
+			p.shape = shape
+			s.pipeSetXY(&p, dx, dy)
+			if shouldTraceImagePixel(dx, dy) {
+				traceImagePixelBefore(&p, "drawCenterMappedNearestDirectClippedAA", dx, dy, xMap[scaledX], srcY, c, shape)
+			}
+			p.run(&p)
+			if shouldTraceImagePixel(dx, dy) {
+				traceImagePixelAfter(&p, "drawCenterMappedNearestDirectClippedAA", dx, dy)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Splash) blitCenterMappedNearestDirectClippedNoAA(
+	xSrc, ySrc, xDest, yDest, w, h int,
+	readLine func(int) (int, error),
+	sample func(int) Color,
+	xMap []int,
+) error {
+	clip, _ := s.state.clip.(*xpath.Clip)
+	if clip == nil {
+		return nil
+	}
+	alphaIn := byte(Round(s.state.fillAlpha * 255))
+	var p pipe
+	s.pipeInit(&p, xDest, yDest, nil, &Color{}, alphaIn, false, false)
+	for y := 0; y < h; y++ {
+		scaledY := ySrc + y
+		dy := yDest + y
+		if dy < 0 || dy >= s.bitmap.height {
+			continue
+		}
+		srcY, err := readLine(scaledY)
+		if err != nil {
+			return err
+		}
+		for x := 0; x < w; x++ {
+			scaledX := xSrc + x
+			dx := xDest + x
+			if dx < 0 || dx >= s.bitmap.width || !clip.Test(dx, dy) {
+				continue
+			}
+			c := sample(scaledX)
+			p.cSrc = c
+			s.pipeSetXY(&p, dx, dy)
+			if shouldTraceImagePixel(dx, dy) {
+				traceImagePixelBefore(&p, "drawCenterMappedNearestDirectClippedNoAA", dx, dy, xMap[scaledX], srcY, c, 255)
+			}
+			p.run(&p)
+			if shouldTraceImagePixel(dx, dy) {
+				traceImagePixelAfter(&p, "drawCenterMappedNearestDirectClippedNoAA", dx, dy)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Splash) scaleImageYupXupCenterMapped(src ImageSource, srcW, srcH, dstW, dstH int, dest *Bitmap) error {
+	return s.scaleImageYupXupMapped(src, srcW, srcH, dstW, dstH, dest, true, true, 0)
+}
+
+func (s *Splash) scaleImageYupXupMapped(src ImageSource, srcW, srcH, dstW, dstH int, dest *Bitmap, centerX, centerY bool, yDelta int) error {
+	nComps := nCompsForMode(s.bitmap.mode)
+	hasAlpha := dest.alpha != nil
+	bpp := bytesPerPixel(dest.mode)
+	buffers := acquireImageScaleBuffers(srcW*nComps, 0, 0)
+	defer releaseImageScaleBuffers(buffers)
+	lineBuf := buffers.line
+	var alphaLine []byte
+	if hasAlpha {
+		alphaLine = make([]byte, srcW)
+	}
+	xMap := make([]int, dstW)
+	fillNearestUpscaleMap(xMap, srcW, dstW, centerX, 0)
+	yMap := make([]int, dstH)
+	fillNearestUpscaleMap(yMap, srcH, dstH, centerY, yDelta)
+	lastSrcY := -1
+	for y := 0; y < dstH; y++ {
+		srcY := yMap[y]
+		if srcY != lastSrcY {
+			if err := s.readImageRow(src, srcW, lineBuf, alphaLine, srcY); err != nil {
+				return err
+			}
+			lastSrcY = srcY
+		}
+		destOff := y * dstW * bpp
+		destAlphaOff := y * dstW
+		for x := 0; x < dstW; x++ {
+			srcX := xMap[x]
+			var pix [splashMaxColorComps]uint32
+			for c := 0; c < nComps; c++ {
+				pix[c] = uint32(lineBuf[srcX*nComps+c])
+			}
+			writePixel(dest.data, destOff, dest.mode, pix[:])
+			destOff += bpp
+			if hasAlpha {
+				dest.alpha[destAlphaOff] = alphaLine[srcX]
+				destAlphaOff++
+			}
+		}
+	}
+	return nil
+}
+
+func fillNearestUpscaleMap(dstToSrc []int, srcSize, dstSize int, center bool, delta int) {
+	if len(dstToSrc) == 0 {
+		return
+	}
+	if center {
+		for dst := range dstToSrc {
+			src := centerMappedNearestSourceIndex(dst, srcSize, dstSize) + delta
+			if src < 0 {
+				src = 0
+			} else if src >= srcSize {
+				src = srcSize - 1
+			}
+			dstToSrc[dst] = src
+		}
+		return
+	}
+	if srcSize <= 0 {
+		for dst := range dstToSrc {
+			dstToSrc[dst] = 0
+		}
+		return
+	}
+	xp := dstSize / srcSize
+	xq := dstSize % srcSize
+	xt := 0
+	dst := 0
+	for src := 0; src < srcSize && dst < len(dstToSrc); src++ {
+		step := xp
+		xt += xq
+		if xt >= srcSize {
+			xt -= srcSize
+			step++
+		}
+		for i := 0; i < step && dst < len(dstToSrc); i++ {
+			v := src + delta
+			if v < 0 {
+				v = 0
+			} else if v >= srcSize {
+				v = srcSize - 1
+			}
+			dstToSrc[dst] = v
+			dst++
+		}
+	}
+	for dst < len(dstToSrc) {
+		dstToSrc[dst] = srcSize - 1
+		dst++
+	}
+}
+
+func centerMappedNearestSourceIndex(dst, srcSize, dstSize int) int {
+	if srcSize <= 1 || dstSize <= 1 {
+		return 0
+	}
+	src := ((2*dst + 1) * srcSize) / (2 * dstSize)
+	if src < 0 {
+		return 0
+	}
+	if src >= srcSize {
+		return srcSize - 1
+	}
+	return src
+}
+
 // expandRow expands one srcWidth row to scaledWidth via linear interpolation
 // (Splash.cc:4697). srcBuf must have one extra pixel of slack at index srcWidth.
 func expandRow(srcBuf, dstBuf []byte, srcWidth, scaledWidth, nComps int) {
+	expandRowWithPlan(srcBuf, dstBuf, nComps, newExpandRowPlan(srcWidth, scaledWidth))
+}
+
+type expandRowPlan struct {
+	srcWidth    int
+	scaledWidth int
+	srcIndex    []int
+	frac        []float64
+}
+
+func newExpandRowPlan(srcWidth, scaledWidth int) expandRowPlan {
+	if srcWidth == 0 || scaledWidth == 0 {
+		return expandRowPlan{}
+	}
+	xStep := float64(srcWidth) / float64(scaledWidth)
+	return newExpandRowPlanWithStart(srcWidth, scaledWidth, 0.5*xStep-0.5)
+}
+
+func newPopplerOriginExpandRowPlan(srcWidth, scaledWidth int) expandRowPlan {
+	return newExpandRowPlanWithStart(srcWidth, scaledWidth, 0)
+}
+
+func newExpandRowPlanWithStart(srcWidth, scaledWidth int, xSrc float64) expandRowPlan {
+	if srcWidth == 0 || scaledWidth == 0 {
+		return expandRowPlan{}
+	}
+	xStep := float64(srcWidth) / float64(scaledWidth)
+	plan := expandRowPlan{
+		srcWidth:    srcWidth,
+		scaledWidth: scaledWidth,
+		srcIndex:    make([]int, scaledWidth),
+		frac:        make([]float64, scaledWidth),
+	}
+	for x := 0; x < scaledWidth; x++ {
+		xSrcClamped := xSrc
+		if xSrcClamped < 0 {
+			xSrcClamped = 0
+		}
+		xInt, xFrac := math.Modf(xSrcClamped)
+		plan.srcIndex[x] = int(xInt)
+		plan.frac[x] = xFrac
+		xSrc += xStep
+	}
+	return plan
+}
+
+func expandRowWithPlan(srcBuf, dstBuf []byte, nComps int, plan expandRowPlan) {
+	srcWidth := plan.srcWidth
+	scaledWidth := plan.scaledWidth
 	if srcWidth == 0 || scaledWidth == 0 {
 		return
 	}
-	xStep := float64(srcWidth) / float64(scaledWidth)
-	xSrc := 0.0
 	// pad slot equal to last pixel (Splash.cc:4707).
 	for i := 0; i < nComps; i++ {
 		srcBuf[srcWidth*nComps+i] = srcBuf[(srcWidth-1)*nComps+i]
 	}
 	for x := 0; x < scaledWidth; x++ {
-		xInt, xFrac := math.Modf(xSrc)
-		p := int(xInt)
-		for c := 0; c < nComps; c++ {
-			a := float64(srcBuf[nComps*p+c])
-			b := float64(srcBuf[nComps*(p+1)+c])
-			dstBuf[nComps*x+c] = byte(a*(1.0-xFrac) + b*xFrac)
+		xFrac := plan.frac[x]
+		xWeight0 := 1.0 - xFrac
+		p := plan.srcIndex[x]
+		srcOff := nComps * p
+		dstOff := nComps * x
+		switch nComps {
+		case 1:
+			a := float64(srcBuf[srcOff])
+			b := float64(srcBuf[srcOff+1])
+			dstBuf[dstOff] = byte(a*xWeight0 + b*xFrac)
+		case 3:
+			nextOff := srcOff + 3
+			a := float64(srcBuf[srcOff])
+			b := float64(srcBuf[nextOff])
+			dstBuf[dstOff] = byte(a*xWeight0 + b*xFrac)
+			a = float64(srcBuf[srcOff+1])
+			b = float64(srcBuf[nextOff+1])
+			dstBuf[dstOff+1] = byte(a*xWeight0 + b*xFrac)
+			a = float64(srcBuf[srcOff+2])
+			b = float64(srcBuf[nextOff+2])
+			dstBuf[dstOff+2] = byte(a*xWeight0 + b*xFrac)
+		default:
+			nextOff := srcOff + nComps
+			for c := 0; c < nComps; c++ {
+				a := float64(srcBuf[srcOff+c])
+				b := float64(srcBuf[nextOff+c])
+				dstBuf[dstOff+c] = byte(a*xWeight0 + b*xFrac)
+			}
 		}
-		xSrc += xStep
 	}
 }
 
@@ -835,6 +2139,10 @@ func expandRow(srcBuf, dstBuf []byte, srcWidth, scaledWidth, nComps int) {
 // valid) data, providing the row of "padding" the interpolation needs. This
 // matches Splash.cc:4771 and is required by memory bilinear_lastrow_clamp_2026_04_26.
 func (s *Splash) scaleImageYupXupBilinear(src ImageSource, srcW, srcH, dstW, dstH int, dest *Bitmap) error {
+	return s.scaleImageYupXupBilinearWithOptions(src, srcW, srcH, dstW, dstH, dest, imageDrawOptions{})
+}
+
+func (s *Splash) scaleImageYupXupBilinearWithOptions(src ImageSource, srcW, srcH, dstW, dstH int, dest *Bitmap, options imageDrawOptions) error {
 	if srcW < 1 || srcH < 1 {
 		return ErrZeroImage
 	}
@@ -851,6 +2159,10 @@ func (s *Splash) scaleImageYupXupBilinear(src ImageSource, srcW, srcH, dstW, dst
 		alphaLineBuf1 = make([]byte, dstW)
 		alphaLineBuf2 = make([]byte, dstW)
 	}
+	// Poppler's scaleImageYupXupBilinear uses origin phase (Splash.cc:4700/4747:
+	// xSrc=0, ySrc=0). Center phase (0.5*step-0.5) diverges for non-trivial
+	// scales, so origin phase is the unconditional default.
+	expandPlan := newPopplerOriginExpandRowPlan(srcW, dstW)
 
 	yStep := float64(srcH) / float64(dstH)
 	ySrc := 0.0
@@ -861,14 +2173,18 @@ func (s *Splash) scaleImageYupXupBilinear(src ImageSource, srcW, srcH, dstW, dst
 		return err
 	}
 	rowIdx++
-	expandRow(srcBuf, lineBuf2, srcW, dstW, nComps)
+	expandRowWithPlan(srcBuf, lineBuf2, nComps, expandPlan)
 	if hasAlpha {
-		expandRow(alphaSrcBuf, alphaLineBuf2, srcW, dstW, 1)
+		expandRowWithPlan(alphaSrcBuf, alphaLineBuf2, 1, expandPlan)
 	}
 
 	for y := 0; y < dstH; y++ {
-		yInt, yFrac := math.Modf(ySrc)
-		if int(yInt) > currentSrcRow {
+		ySrcClamped := ySrc
+		if ySrcClamped < 0 {
+			ySrcClamped = 0
+		}
+		yInt, yFrac := math.Modf(ySrcClamped)
+		for int(yInt) > currentSrcRow {
 			currentSrcRow++
 			// promote line2 → line1
 			copy(lineBuf1, lineBuf2)
@@ -884,26 +2200,43 @@ func (s *Splash) scaleImageYupXupBilinear(src ImageSource, srcW, srcH, dstW, dst
 					return err
 				}
 				rowIdx++
-				expandRow(srcBuf, lineBuf2, srcW, dstW, nComps)
+				expandRowWithPlan(srcBuf, lineBuf2, nComps, expandPlan)
 				if hasAlpha {
-					expandRow(alphaSrcBuf, alphaLineBuf2, srcW, dstW, 1)
+					expandRowWithPlan(alphaSrcBuf, alphaLineBuf2, 1, expandPlan)
 				}
 			}
 		}
 
-		for x := 0; x < dstW; x++ {
-			var pix [splashMaxColorComps]uint32
-			for i := 0; i < nComps; i++ {
-				a := float64(lineBuf1[x*nComps+i])
-				b := float64(lineBuf2[x*nComps+i])
-				pix[i] = uint32(byte(a*(1.0-yFrac) + b*yFrac))
+		yWeight0 := 1.0 - yFrac
+		if dest.mode == ModeRGB8 {
+			dstOff := y * dstW * 3
+			for x := 0; x < dstW; x++ {
+				srcOff := x * 3
+				dest.data[dstOff] = byte(float64(lineBuf1[srcOff])*yWeight0 + float64(lineBuf2[srcOff])*yFrac)
+				dest.data[dstOff+1] = byte(float64(lineBuf1[srcOff+1])*yWeight0 + float64(lineBuf2[srcOff+1])*yFrac)
+				dest.data[dstOff+2] = byte(float64(lineBuf1[srcOff+2])*yWeight0 + float64(lineBuf2[srcOff+2])*yFrac)
+				if hasAlpha {
+					a := float64(alphaLineBuf1[x])
+					b := float64(alphaLineBuf2[x])
+					dest.alpha[y*dstW+x] = byte(a*yWeight0 + b*yFrac)
+				}
+				dstOff += 3
 			}
-			off := (y*dstW + x) * bpp
-			writePixel(dest.data, off, dest.mode, pix[:])
-			if hasAlpha {
-				a := float64(alphaLineBuf1[x])
-				b := float64(alphaLineBuf2[x])
-				dest.alpha[y*dstW+x] = byte(a*(1.0-yFrac) + b*yFrac)
+		} else {
+			for x := 0; x < dstW; x++ {
+				var pix [splashMaxColorComps]uint32
+				for i := 0; i < nComps; i++ {
+					a := float64(lineBuf1[x*nComps+i])
+					b := float64(lineBuf2[x*nComps+i])
+					pix[i] = uint32(byte(a*yWeight0 + b*yFrac))
+				}
+				off := (y*dstW + x) * bpp
+				writePixel(dest.data, off, dest.mode, pix[:])
+				if hasAlpha {
+					a := float64(alphaLineBuf1[x])
+					b := float64(alphaLineBuf2[x])
+					dest.alpha[y*dstW+x] = byte(a*yWeight0 + b*yFrac)
+				}
 			}
 		}
 		ySrc += yStep
@@ -1088,11 +2421,11 @@ func (s *Splash) blitImage(scaled *Bitmap, xDest, yDest int, clipRes xpath.ClipR
 
 	if x0 < x1 && y0 < y1 {
 		alphaIn := byte(Round(s.state.fillAlpha * 255))
-		var p pipe
-		s.pipeInit(&p, xDest+x0, yDest+y0, nil, &Color{}, alphaIn, hasAlpha, false)
+		p := imagePipePool.Get().(*pipe)
+		s.pipeInit(p, xDest+x0, yDest+y0, nil, &Color{}, alphaIn, hasAlpha, false)
 
 		for y := y0; y < y1; y++ {
-			s.pipeSetXY(&p, xDest+x0, yDest+y)
+			s.pipeSetXY(p, xDest+x0, yDest+y)
 			srcOff := (y*w + x0) * srcBpp
 			var aOff int
 			if hasAlpha {
@@ -1114,15 +2447,17 @@ func (s *Splash) blitImage(scaled *Bitmap, xDest, yDest int, clipRes xpath.ClipR
 				dy := yDest + y
 				p.cSrc = c
 				if shouldTraceImagePixel(dx, dy) {
-					traceImagePixelBefore(&p, "blitImage", dx, dy, x, y, c, shape)
+					traceImagePixelBefore(p, "blitImage", dx, dy, x, y, c, shape)
 				}
-				p.run(&p)
+				p.run(p)
 				if shouldTraceImagePixel(dx, dy) {
-					traceImagePixelAfter(&p, "blitImage", dx, dy)
+					traceImagePixelAfter(p, "blitImage", dx, dy)
 				}
 				srcOff += srcBpp
 			}
 		}
+		*p = pipe{}
+		imagePipePool.Put(p)
 	}
 
 	if clipRes == xpath.ClipAllInside {
@@ -1186,9 +2521,7 @@ func (s *Splash) blitImageClippedAA(scaled *Bitmap, xSrc, ySrc, xDest, yDest, w,
 		if dy < clipYMin || dy > clipYMax || dy < 0 || dy >= s.bitmap.height {
 			continue
 		}
-		for i := 0; i < aaLen; i++ {
-			s.aaBuf[i] = 0xff
-		}
+		fillBitmapBytes(s.aaBuf[:aaLen], 0xff)
 		if fullWidthClip {
 			_, _ = clip.ClipAALineFullWidth(dy, s.aaBuf, 0, s.bitmap.width-1, s.bitmap.width)
 		} else {
@@ -1215,14 +2548,14 @@ func (s *Splash) blitImageClippedAA(scaled *Bitmap, xSrc, ySrc, xDest, yDest, w,
 					t = splashAASize * splashAASize
 				}
 			}
-						if t < 0 {
-							t = s.aaCoverageAt(dx, rowSize)
-						}
-						t = adjustClippedImageLowAACoverageForDebug(t)
-						if t == 0 {
-							srcOff += bpp
-							alphaOff++
-							continue
+			if t < 0 {
+				t = s.aaCoverageAt(dx, rowSize)
+			}
+			t = adjustClippedImageLowAACoverageForDebug(t)
+			if t == 0 {
+				srcOff += bpp
+				alphaOff++
+				continue
 			}
 			var c Color
 			readScaledPixel(scaled.data, srcOff, scaled.mode, &c)
@@ -1254,7 +2587,7 @@ func (s *Splash) blitImageClippedAA(scaled *Bitmap, xSrc, ySrc, xDest, yDest, w,
 }
 
 func adjustClippedImageLowAACoverageForDebug(t int) int {
-	if os.Getenv("PDF_DEBUG_SPLASH_IMAGE_CLIP_T2_TO_T1") != "1" {
+	if !debugSplashImageClipT2ToT1 {
 		return t
 	}
 	if t == 2 {
@@ -1283,7 +2616,7 @@ func (s *Splash) blitImageClippedNoAA(scaled *Bitmap, xSrc, ySrc, xDest, yDest, 
 		alphaOff := (ySrc+y)*scaled.width + xSrc
 		for x := 0; x < w; x++ {
 			dx := xDest + x
-			if dx < 0 || dx >= s.bitmap.width || clip.TestSpan(dx, dx, dy) == xpath.ClipAllOutside {
+			if dx < 0 || dx >= s.bitmap.width || !clip.Test(dx, dy) {
 				srcOff += bpp
 				alphaOff++
 				continue
@@ -1315,22 +2648,10 @@ func (s *Splash) blitImageClippedNoAA(scaled *Bitmap, xSrc, ySrc, xDest, yDest, 
 }
 
 func (s *Splash) aaCoverageAt(x, rowSize int) int {
-	cell := x * splashAASize
-	t := 0
-	for yy := 0; yy < splashAASize; yy++ {
-		rowOff := yy * rowSize
-		byteIdx := rowOff + (cell >> 3)
-		if byteIdx >= len(s.aaBuf) {
-			continue
-		}
-		b := s.aaBuf[byteIdx]
-		if cell&7 == 0 {
-			t += bitCount4[(b>>4)&0x0f]
-		} else {
-			t += bitCount4[b&0x0f]
-		}
+	if x < 0 || rowSize <= 0 {
+		return 0
 	}
-	return t
+	return s.aaBufCoverageAt(x, rowSize)
 }
 
 // unpremultiplyImageColor is kept as an opt-in diagnostic for legacy callers
@@ -1352,7 +2673,7 @@ func unpremultiplyImageColor(c *Color, mode ColorMode, alpha byte) {
 }
 
 func shouldUnpremultiplyImageColor() bool {
-	return os.Getenv("PDF_SPLASH_IMAGE_ENABLE_ALPHA_UNPREMULTIPLY") == "1"
+	return splashImageEnableAlphaUnpremultiply
 }
 
 func unpremultiplyByte(v byte, alpha byte) byte {
@@ -1503,13 +2824,24 @@ func (s *Splash) arbitraryTransformImage(
 		scaledH = 1
 	}
 
+	// Scale the source to the bbox-derived device resolution, passing the real
+	// interpolate flag (Poppler Splash.cc:3851: scaledImg = scaleImage(src,
+	// srcW, srcH, scaledWidth, scaledHeight, interpolate)). Poppler's
+	// arbitraryTransformImage is a two-pass scale-then-nearest-warp — NOT a
+	// one-pass bilinear warp — so we must NOT keep the source at 1:1 here.
 	scaled, err := s.scaleImageWithSourceAlpha(src, srcW, srcH, scaledW, scaledH, interpolate, sourceAlpha)
 	if err != nil {
 		return err
 	}
 	s.applyPostScaleRGBTransform(scaled, postTransform)
 
-	// compute inverse of the post-scale 2x2.
+	// Compute the inverse of the (image→device) matrix in Poppler's exact
+	// formulation (Splash.cc:3763-3776): first scale the linear part into
+	// scaled-image space (r = mat/scaled), then invert THAT. The result maps
+	// device points straight to scaled-image pixel coords, so the warp below
+	// needs no ·sampleW/·sampleH re-scale, and every float op matches
+	// Poppler's — deriving the same values in a different op-order flips
+	// splashFloor at pixel boundaries on rotated images.
 	r00 := mat[0] / float64(scaledW)
 	r01 := mat[1] / float64(scaledW)
 	r10 := mat[2] / float64(scaledH)
@@ -1617,7 +2949,12 @@ func (s *Splash) arbitraryTransformImage(
 		sec.dxdyb = (sec.xb1 - sec.xb0) / (sec.yb1 - sec.yb0)
 	}
 
-	bpp := bytesPerPixel(s.bitmap.mode)
+	sampleW := scaled.width
+	sampleH := scaled.height
+	if sampleW <= 0 || sampleH <= 0 {
+		return nil
+	}
+	bpp := bytesPerPixel(scaled.mode)
 	hasAlpha := scaled.alpha != nil
 	alphaIn := byte(Round(s.state.fillAlpha * 255))
 	var p pipe
@@ -1643,6 +2980,10 @@ func (s *Splash) arbitraryTransformImage(
 	for j := 0; j < nSections; j++ {
 		sec := sections[j]
 		for y := sec.y0; y <= sec.y1; y++ {
+			// Poppler samples the section edges at the row CENTER
+			// (Splash.cc:3903: xa0 + (y + 0.5 - ya0) * dxdya). Omitting the
+			// +0.5 is invisible for axis-aligned quads (dxdy = 0) but shifts
+			// every span boundary of a ROTATED image by half a row.
 			xa := imgCoordMungeLower(sec.xa0 + (float64(y)+0.5-sec.ya0)*sec.dxdya)
 			if xa < 0 {
 				xa = 0
@@ -1672,35 +3013,50 @@ func (s *Splash) arbitraryTransformImage(
 				if x < 0 || x >= s.bitmap.width || y < 0 || y >= s.bitmap.height {
 					continue
 				}
-				fx := float64(x) + 0.5 - mat[4]
-				fy := float64(y) + 0.5 - mat[5]
-				xx := Floor(fx*ir00 + fy*ir10)
-				yy := Floor(fx*ir01 + fy*ir11)
-				if xx < 0 {
-					xx = 0
-				} else if xx >= scaledW {
-					xx = scaledW - 1
-				}
-				if yy < 0 {
-					yy = 0
-				} else if yy >= scaledH {
-					yy = scaledH - 1
-				}
-				off := (yy*scaledW + xx) * bpp
+				fx := float64(x) + 0.5
+				fy := float64(y) + 0.5
+
 				var c Color
-				readScaledPixel(scaled.data, off, scaled.mode, &c)
 				shape := byte(255)
+
+				// Nearest-neighbor warp of the scaled bitmap (Poppler
+				// Splash.cc:3920-3923): map (x+0.5, y+0.5) back to the scaled
+				// image with Poppler's exact expression — translation
+				// subtracted BEFORE the multiply, no interpolation in the warp.
+				// The bilinear case is handled by scaleImage above, which is
+				// given the real interpolate flag.
+				srcXf := (fx-mat[4])*ir00 + (fy-mat[5])*ir10
+				srcYf := (fx-mat[4])*ir01 + (fy-mat[5])*ir11
+				ix := int(math.Floor(srcXf))
+				iy := int(math.Floor(srcYf))
+				if ix < 0 {
+					ix = 0
+				} else if ix >= sampleW {
+					ix = sampleW - 1
+				}
+				if iy < 0 {
+					iy = 0
+				} else if iy >= sampleH {
+					iy = sampleH - 1
+				}
+				readScaledPixel(scaled.data, (iy*sampleW+ix)*bpp, scaled.mode, &c)
 				if hasAlpha {
-					shape = scaled.alpha[yy*scaledW+xx]
+					shape = scaled.alpha[iy*sampleW+ix]
 					if shouldUnpremultiplyImageColor() {
 						unpremultiplyImageColor(&c, scaled.mode, shape)
 					}
 				}
+
 				if s.vectorAA && clipRes2 != xpath.ClipAllInside {
 					if !aaReady {
 						continue
 					}
 					t := s.aaCoverageAt(x, rowSize)
+					if shouldTraceImagePixel(x, y) {
+						cxMin, cyMin, cxMax, cyMax := clip.Bounds()
+						fmt.Fprintf(os.Stderr, "SPLASH_IMAGE_CLIPAA x=%d y=%d t=%d clipRes2=%d hasPath=%t bounds=(%.17g,%.17g)-(%.17g,%.17g)\n",
+							x, y, t, clipRes2, clip.HasPathClip(), cxMin, cyMin, cxMax, cyMax)
+					}
 					if t == 0 {
 						continue
 					}
@@ -1715,7 +3071,7 @@ func (s *Splash) arbitraryTransformImage(
 				p.shape = shape
 				s.pipeSetXY(&p, x, y)
 				if shouldTraceImagePixel(x, y) {
-					traceImagePixelBefore(&p, "arbitraryTransformImage", x, y, xx, yy, c, shape)
+					traceImagePixelBefore(&p, "arbitraryTransformImage", x, y, -1, -1, c, shape) // srcXY not easily available for bilinear
 				}
 				p.run(&p)
 				if shouldTraceImagePixel(x, y) {
@@ -1729,8 +3085,17 @@ func (s *Splash) arbitraryTransformImage(
 
 var imageTracePixels = parseSplashTracePixels(os.Getenv("PDF_DEBUG_SPLASH_IMAGE_TRACE"))
 var imageScaleTracePixels = parseSplashTracePixels(os.Getenv("PDF_DEBUG_SPLASH_SCALE_TRACE"))
+var imageTracePixelsEnabled = len(imageTracePixels) > 0
+var imageScaleTracePixelsEnabled = len(imageScaleTracePixels) > 0
 
 func shouldTraceImagePixel(x, y int) bool {
+	if !imageTracePixelsEnabled {
+		return false
+	}
+	return imageTracePixelMatch(x, y)
+}
+
+func imageTracePixelMatch(x, y int) bool {
 	for _, pixel := range imageTracePixels {
 		if pixel.x == x && pixel.y == y {
 			return true

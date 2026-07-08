@@ -12,9 +12,7 @@ func rgb(r, g, b byte) Color { return Color{r, g, b, 0, 0, 0, 0, 0} }
 func cmyk(c, m, y, k byte) Color { return Color{c, m, y, k, 0, 0, 0, 0} }
 
 func runBlend(f BlendFunc, src, dst Color, mode ColorMode) Color {
-	var out Color
-	f(&src, &dst, &out, mode)
-	return out
+	return f(src, dst, mode)
 }
 
 // -------------------- Per-mode point sample --------------------

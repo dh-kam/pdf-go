@@ -222,16 +222,28 @@ func renderHighlightAnnotation(page *entity.Page, c domaincanvas.Canvas, initial
 }
 
 func annotationMaskCanvas(dst domaincanvas.Canvas, pageYOriginPx float64) domaincanvas.Canvas {
+	yDown := false
+	if q, ok := dst.(interface{ YDownBase() bool }); ok {
+		yDown = q.YDownBase()
+	}
 	if factory, ok := dst.(interface {
 		NewAnnotationMaskCanvas(bounds image.Rectangle, pageYOriginPx float64) domaincanvas.Canvas
 	}); ok {
 		if mask := factory.NewAnnotationMaskCanvas(dst.Bounds(), pageYOriginPx); mask != nil {
+			if setter, ok := mask.(interface{ SetYDownBase(bool) }); ok && yDown {
+				// The evaluator replaying the annotation appearance composes
+				// y-down CTMs; the mask canvas must not re-flip.
+				setter.SetYDownBase(true)
+			}
 			return mask
 		}
 	}
 	maskCanvas := canvas.NewImageCanvas(dst.Bounds())
 	if setter, ok := maskCanvas.(interface{ SetPageYOriginPx(float64) }); ok && pageYOriginPx > 0 {
 		setter.SetPageYOriginPx(pageYOriginPx)
+	}
+	if setter, ok := maskCanvas.(interface{ SetYDownBase(bool) }); ok && yDown {
+		setter.SetYDownBase(true)
 	}
 	return maskCanvas
 }

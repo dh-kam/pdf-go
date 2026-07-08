@@ -5,15 +5,21 @@ import (
 
 	"github.com/dh-kam/pdf-go/internal/domain/entity"
 	"github.com/dh-kam/pdf-go/internal/infrastructure/font/cff"
-	"github.com/dh-kam/pdf-go/internal/infrastructure/font/type1"
 )
 
 func (e *Evaluator) applyFontEncodingFromDict(dict *entity.Dict, font entity.Font) entity.Font {
+	return e.applyFontEncodingFromDictWithEmbeddedData(dict, font, nil)
+}
+
+func (e *Evaluator) applyFontEncodingFromDictWithEmbeddedData(dict *entity.Dict, font entity.Font, embeddedFontData []byte) entity.Font {
 	if dict == nil || font == nil || font.IsCIDFont() {
 		return font
 	}
 
-	encodingMap := e.resolveSimpleFontEncoding(dict.Get(entity.Name("Encoding")))
+	encodingMap := e.resolveSimpleFontEncoding(dict.Get(pdfNameEncoding))
+	if len(encodingMap) == 0 {
+		encodingMap = e.resolveEmbeddedType1EncodingFromFont(dict, font, embeddedFontData)
+	}
 	if len(encodingMap) == 0 {
 		encodingMap = e.resolveEmbeddedType1Encoding(dict)
 	}
@@ -21,38 +27,44 @@ func (e *Evaluator) applyFontEncodingFromDict(dict *entity.Dict, font entity.Fon
 		return font
 	}
 
-	glyphByCode := map[uint32]uint32{}
-	nameByCode := map[uint32]string{}
-	glyphByName := map[string]uint32{}
+	glyphByCode := make(map[uint32]uint32, len(encodingMap))
+	nameByCode := make(map[uint32]string, len(encodingMap))
 	if namedFont, ok := font.(glyphIDByNameFont); ok {
 		for code, name := range encodingMap {
-			for _, candidate := range encodingGlyphNameCandidates(name) {
-				glyph, found := namedFont.GlyphIDByName(candidate)
-				if !found {
+			candidate := name
+			glyph, found := namedFont.GlyphIDByName(candidate)
+			if !found {
+				candidate = encodingGlyphNameAlias(name)
+				if candidate == "" || candidate == name {
 					continue
 				}
-				glyphByCode[uint32(code)] = glyph
-				nameByCode[uint32(code)] = candidate
-				break
+				glyph, found = namedFont.GlyphIDByName(candidate)
+			}
+			if found {
+				code := uint32(code)
+				glyphByCode[code] = glyph
+				nameByCode[code] = candidate
 			}
 		}
 	}
-	for code := uint32(0); code <= 255; code++ {
-		glyph, err := font.CharCodeToGlyph(code)
-		if err != nil {
-			continue
-		}
-		name := font.GlyphName(glyph)
-		if name == "" || name == ".notdef" {
-			continue
-		}
-		if _, exists := glyphByName[name]; !exists {
-			glyphByName[name] = glyph
-		}
-	}
 
-	if len(glyphByName) == 0 {
-		if len(glyphByCode) == 0 {
+	var glyphByName map[string]uint32
+	if len(glyphByCode) < len(encodingMap) {
+		glyphByName = make(map[string]uint32, 256)
+		for code := uint32(0); code <= 255; code++ {
+			glyph, err := font.CharCodeToGlyph(code)
+			if err != nil {
+				continue
+			}
+			name := font.GlyphName(glyph)
+			if name == "" || name == ".notdef" {
+				continue
+			}
+			if _, exists := glyphByName[name]; !exists {
+				glyphByName[name] = glyph
+			}
+		}
+		if len(glyphByName) == 0 && len(glyphByCode) == 0 {
 			return font
 		}
 	}
@@ -61,14 +73,19 @@ func (e *Evaluator) applyFontEncodingFromDict(dict *entity.Dict, font entity.Fon
 		if _, ok := nameByCode[uint32(code)]; ok {
 			continue
 		}
-		for _, candidate := range encodingGlyphNameCandidates(name) {
-			glyph, ok := glyphByName[candidate]
-			if !ok {
+		candidate := name
+		glyph, ok := glyphByName[candidate]
+		if !ok {
+			candidate = encodingGlyphNameAlias(name)
+			if candidate == "" || candidate == name {
 				continue
 			}
-			glyphByCode[uint32(code)] = glyph
-			nameByCode[uint32(code)] = candidate
-			break
+			glyph, ok = glyphByName[candidate]
+		}
+		if ok {
+			code := uint32(code)
+			glyphByCode[code] = glyph
+			nameByCode[code] = candidate
 		}
 	}
 
@@ -83,11 +100,24 @@ func (e *Evaluator) applyFontEncodingFromDict(dict *entity.Dict, font entity.Fon
 	}
 }
 
+func (e *Evaluator) resolveEmbeddedType1EncodingFromFont(dict *entity.Dict, font entity.Font, embeddedFontData []byte) map[byte]string {
+	if dict == nil || len(embeddedFontData) == 0 {
+		return nil
+	}
+	if nameValueForEncoding(dict.Get(pdfNameSubtype)) != "Type1" {
+		return nil
+	}
+	if looksLikeCFFEmbeddedFont(embeddedFontData) {
+		return nil
+	}
+	return encodingNamesFromFont(font)
+}
+
 func (e *Evaluator) resolveEmbeddedType1Encoding(dict *entity.Dict) map[byte]string {
 	if dict == nil {
 		return nil
 	}
-	if nameValueForEncoding(dict.Get(entity.Name("Subtype"))) != "Type1" {
+	if nameValueForEncoding(dict.Get(pdfNameSubtype)) != "Type1" {
 		return nil
 	}
 
@@ -102,8 +132,8 @@ func (e *Evaluator) resolveEmbeddedType1Encoding(dict *entity.Dict) map[byte]str
 		}
 	}
 
-	font, err := type1.NewFontFromBytes(fontData)
-	if err != nil {
+	font := e.embeddedType1FontFromBytes(fontData)
+	if font == nil {
 		return nil
 	}
 
@@ -122,6 +152,28 @@ func (e *Evaluator) resolveEmbeddedType1Encoding(dict *entity.Dict) map[byte]str
 		return nil
 	}
 	return out
+}
+
+func encodingNamesFromFont(font entity.Font) map[byte]string {
+	if font == nil {
+		return nil
+	}
+	if encoded, ok := any(font).(encodingNameFont); ok {
+		out := map[byte]string{}
+		for code := 0; code <= 255; code++ {
+			if name := encoded.EncodingName(byte(code)); name != "" {
+				out[byte(code)] = name
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	}
+	if unwrapper, ok := font.(fontBaseUnwrapper); ok {
+		return encodingNamesFromFont(unwrapper.BaseFont())
+	}
+	return nil
 }
 
 func embeddedCFFEncodingNames(fontData []byte) map[byte]string {
@@ -456,15 +508,17 @@ func (e *Evaluator) resolveSimpleFontEncoding(obj entity.Object) map[byte]string
 		return simpleEncodingBaseNames(v.Value())
 	case *entity.Dict:
 		base := simpleEncodingBaseNames("")
-		if baseName, ok := v.Get(entity.Name("BaseEncoding")).(entity.Name); ok {
+		if baseName, ok := v.Get(pdfNameBaseEncoding).(entity.Name); ok {
 			base = simpleEncodingBaseNames(baseName.Value())
 		}
-		differences, ok := v.Get(entity.Name("Differences")).(*entity.Array)
+		differences, ok := v.Get(pdfNameDifferences).(*entity.Array)
 		if !ok || differences.Len() == 0 {
 			return base
 		}
-		if base == nil {
+		if len(base) == 0 {
 			base = map[byte]string{}
+		} else {
+			base = cloneEncodingNames(base)
 		}
 		applyEncodingDifferences(base, differences)
 		return base
@@ -483,17 +537,26 @@ func (e *Evaluator) resolveDirectObject(obj entity.Object) entity.Object {
 	return obj
 }
 
+var (
+	simpleASCIIEncodingBaseNames = simpleASCIIEncodingNames()
+	emptyEncodingBaseNames       = map[byte]string{}
+)
+
 func simpleEncodingBaseNames(name string) map[byte]string {
 	switch name {
 	case "", "StandardEncoding", "MacRomanEncoding", "WinAnsiEncoding":
-		out := map[byte]string{}
-		for code, glyph := range simpleASCIIEncodingNames() {
-			out[code] = glyph
-		}
-		return out
+		return simpleASCIIEncodingBaseNames
 	default:
-		return map[byte]string{}
+		return emptyEncodingBaseNames
 	}
+}
+
+func cloneEncodingNames(src map[byte]string) map[byte]string {
+	out := make(map[byte]string, len(src))
+	for code, glyph := range src {
+		out[code] = glyph
+	}
+	return out
 }
 
 func applyEncodingDifferences(base map[byte]string, differences *entity.Array) {

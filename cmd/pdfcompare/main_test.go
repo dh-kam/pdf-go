@@ -6,6 +6,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -124,9 +125,203 @@ exit 0
 		path: pdfPath,
 		rel:  "zero.pdf",
 		slug: "0001_zero",
-	}, nil)
+	}, nil, nil)
 	if len(rows) != 0 {
 		t.Fatalf("rows = %d, want zero-page PDF to be skipped", len(rows))
+	}
+}
+
+func TestRenderCommandsUsePageRanges(t *testing.T) {
+	dir := t.TempDir()
+	logDir := filepath.Join(dir, "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	popplerArgs := filepath.Join(dir, "poppler.args")
+	pdftoppm := writeScript(t, dir, "pdftoppm", `#!/bin/sh
+printf '%s\n' "$@" > "`+popplerArgs+`"
+`)
+	popplerErr, _ := renderPoppler(config{
+		repoRoot: dir,
+		dpi:      96,
+		pdftoppm: pdftoppm,
+	}, "input.pdf", filepath.Join(dir, "poppler"), logDir, "", 2, 4)
+	if popplerErr != "" {
+		t.Fatalf("renderPoppler error = %q", popplerErr)
+	}
+	popplerArgText := readTextFile(t, popplerArgs)
+	if !strings.Contains(popplerArgText, "-f\n2\n-l\n4\n") {
+		t.Fatalf("poppler args = %q, want page range flags", popplerArgText)
+	}
+	if _, err := os.Stat(filepath.Join(logDir, "poppler_0002_0004.stdout.log")); err != nil {
+		t.Fatalf("expected ranged poppler log: %v", err)
+	}
+
+	oursArgs := filepath.Join(dir, "ours.args")
+	pdfrender := writeScript(t, dir, "pdfrender", `#!/bin/sh
+printf '%s\n' "$@" > "`+oursArgs+`"
+`)
+	oursErr, _ := renderOurs(config{
+		repoRoot:          dir,
+		dpi:               96,
+		workers:           1,
+		backend:           "splash",
+		imageSamplingMode: "legacy",
+		pdfrender:         pdfrender,
+	}, "input.pdf", filepath.Join(dir, "ours"), logDir, "", 2, 4)
+	if oursErr != "" {
+		t.Fatalf("renderOurs error = %q", oursErr)
+	}
+	oursArgText := readTextFile(t, oursArgs)
+	if !strings.Contains(oursArgText, "--pages\n2-4\n") {
+		t.Fatalf("ours args = %q, want --pages range", oursArgText)
+	}
+	if !strings.Contains(oursArgText, "--png-compression\nfast\n") {
+		t.Fatalf("ours args = %q, want default fast PNG compression", oursArgText)
+	}
+	if _, err := os.Stat(filepath.Join(logDir, "ours_0002_0004.stdout.log")); err != nil {
+		t.Fatalf("expected ranged ours log: %v", err)
+	}
+}
+
+func TestRenderOursUsesConfiguredPNGCompression(t *testing.T) {
+	dir := t.TempDir()
+	logDir := filepath.Join(dir, "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oursArgs := filepath.Join(dir, "ours.args")
+	pdfrender := writeScript(t, dir, "pdfrender", `#!/bin/sh
+printf '%s\n' "$@" > "`+oursArgs+`"
+`)
+	oursErr, _ := renderOurs(config{
+		repoRoot:           dir,
+		dpi:                150,
+		workers:            1,
+		backend:            "splash",
+		imageSamplingMode:  "legacy",
+		oursPNGCompression: "none",
+		pdfrender:          pdfrender,
+	}, "input.pdf", filepath.Join(dir, "ours"), logDir, "", 1, 1)
+	if oursErr != "" {
+		t.Fatalf("renderOurs error = %q", oursErr)
+	}
+	oursArgText := readTextFile(t, oursArgs)
+	if !strings.Contains(oursArgText, "--png-compression\nnone\n") {
+		t.Fatalf("ours args = %q, want configured none PNG compression", oursArgText)
+	}
+}
+
+func TestRenderOursAutoPNGCompressionUsesNoneWhenImagesAreDiscarded(t *testing.T) {
+	dir := t.TempDir()
+	logDir := filepath.Join(dir, "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oursArgs := filepath.Join(dir, "ours.args")
+	pdfrender := writeScript(t, dir, "pdfrender", `#!/bin/sh
+printf '%s\n' "$@" > "`+oursArgs+`"
+`)
+	oursErr, _ := renderOurs(config{
+		repoRoot:           dir,
+		dpi:                150,
+		workers:            1,
+		backend:            "splash",
+		imageSamplingMode:  "legacy",
+		oursPNGCompression: "auto",
+		keepImages:         false,
+		pdfrender:          pdfrender,
+	}, "input.pdf", filepath.Join(dir, "ours"), logDir, "", 1, 1)
+	if oursErr != "" {
+		t.Fatalf("renderOurs error = %q", oursErr)
+	}
+	oursArgText := readTextFile(t, oursArgs)
+	if !strings.Contains(oursArgText, "--png-compression\nnone\n") {
+		t.Fatalf("ours args = %q, want auto PNG compression to use none", oursArgText)
+	}
+}
+
+func TestNormalizeOursPNGCompressionRejectsUnknownValue(t *testing.T) {
+	if _, err := normalizeOursPNGCompression("slow"); err == nil {
+		t.Fatal("expected unsupported PNG compression to be rejected")
+	}
+}
+
+func TestEffectiveOursPNGCompression(t *testing.T) {
+	if got := effectiveOursPNGCompression("auto", true); got != "fast" {
+		t.Fatalf("auto with keepImages=true = %q, want fast", got)
+	}
+	if got := effectiveOursPNGCompression("auto", false); got != "none" {
+		t.Fatalf("auto with keepImages=false = %q, want none", got)
+	}
+	if got := effectiveOursPNGCompression("best", false); got != "best" {
+		t.Fatalf("explicit best = %q, want best", got)
+	}
+}
+
+func TestCompareRGBXNoDiagnosticsCountsRGBAndIgnoresAlpha(t *testing.T) {
+	poppler := image.NewRGBA(image.Rect(0, 0, 2, 1))
+	ours := image.NewNRGBA(image.Rect(0, 0, 2, 1))
+	poppler.SetRGBA(0, 0, color.RGBA{R: 10, G: 20, B: 30, A: 255})
+	poppler.SetRGBA(1, 0, color.RGBA{R: 40, G: 50, B: 60, A: 255})
+	ours.SetNRGBA(0, 0, color.NRGBA{R: 10, G: 20, B: 30, A: 7})
+	ours.SetNRGBA(1, 0, color.NRGBA{R: 40, G: 51, B: 60, A: 255})
+
+	stats, ok := compareRGBXNoDiagnostics(poppler, ours)
+	if !ok {
+		t.Fatal("expected RGBA/NRGBA fast path")
+	}
+	if stats.width != 2 || stats.height != 1 {
+		t.Fatalf("dimensions = %dx%d, want 2x1", stats.width, stats.height)
+	}
+	if stats.matchedPixels != 1 || stats.totalPixels != 2 {
+		t.Fatalf("matched/total = %d/%d, want 1/2", stats.matchedPixels, stats.totalPixels)
+	}
+	if stats.exactPercent != 50 {
+		t.Fatalf("exactPercent = %v, want 50", stats.exactPercent)
+	}
+}
+
+func TestCompareRGBXNoDiagnosticsRejectsSizeMismatch(t *testing.T) {
+	poppler := image.NewRGBA(image.Rect(0, 0, 2, 1))
+	ours := image.NewRGBA(image.Rect(0, 0, 1, 1))
+
+	if _, ok := compareRGBXNoDiagnostics(poppler, ours); ok {
+		t.Fatal("expected size mismatch to use generic compare path")
+	}
+}
+
+func TestParsePageRangesNormalizesAndMerges(t *testing.T) {
+	got, err := parsePageRanges("5, 2-4, 4, 9")
+	if err != nil {
+		t.Fatalf("parsePageRanges returned error: %v", err)
+	}
+	want := []pageRange{{start: 2, end: 5}, {start: 9, end: 9}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parsePageRanges = %+v, want %+v", got, want)
+	}
+}
+
+func TestParsePageRangesRejectsInvalidSpecs(t *testing.T) {
+	for _, spec := range []string{"0", "3-2", "a", "1,,2", "1-"} {
+		if _, err := parsePageRanges(spec); err == nil {
+			t.Fatalf("parsePageRanges(%q) returned nil error", spec)
+		}
+	}
+}
+
+func TestSplitPageRangesUsesChunkSize(t *testing.T) {
+	got := splitPageRanges([]pageRange{{start: 2, end: 6}}, 2)
+	want := []pageRange{
+		{start: 2, end: 3},
+		{start: 4, end: 5},
+		{start: 6, end: 6},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("splitPageRanges = %+v, want %+v", got, want)
 	}
 }
 
@@ -193,6 +388,15 @@ func writeScript(t *testing.T, dir, name, body string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func readTextFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
 
 func fillImage(img *image.RGBA, c color.RGBA) {

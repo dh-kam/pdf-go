@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/png"
 	"math"
 	"os"
 	"strconv"
@@ -34,6 +35,15 @@ type splashCanvas struct {
 	// CTM in Transform() so xpath.NewXPath emits already-flipped device coords).
 	pageYOriginPx float64
 
+	// yDownBase marks that the evaluator's CTMs are composed directly in
+	// device (y-down) space — Poppler's GfxState upsideDown convention — so
+	// every y-up→y-down conversion in this canvas (flipY, flipYMatrix uses,
+	// pathYFlipMatrix, bbox unflips, glyph-origin quantisation) becomes the
+	// identity. Composing y-up and flipping per point loses ~1e-13 at page
+	// magnitude, which flips AA subcells on ROTATED geometry (map p2 airplane
+	// clip span; doc_027 Type3 cells needed the same treatment locally).
+	yDownBase bool
+
 	// Text state — mirrors ImageCanvas.textPosition / inTextBlock and tracks
 	// current font for ShowText (PDF 1.7 §9.4 text object operators).
 	currentFont    entity.Font
@@ -52,6 +62,11 @@ type splashCanvas struct {
 	// type3CacheDepth is non-zero for CharProcs that Poppler would draw through
 	// its cached Type3 glyph bitmap path after a leading d1 operator.
 	type3CacheDepth int
+	// type3Temp, when non-nil, holds the page splash/bitmap swapped out while a
+	// Type3 CharProc renders to a small glyph-relative Mono8 bitmap (mirrors
+	// Poppler SplashOutputDev::type3D1 → endType3Char::drawType3Glyph). See
+	// PrepareType3TempBitmap / FinishType3TempBitmap.
+	type3Temp *type3TempState
 	// strokeIndex counts Stroke calls for narrow diagnostic gates.
 	strokeIndex int
 	// fillIndex counts Fill calls for narrow diagnostic gates.
@@ -292,6 +307,21 @@ func (c *splashCanvas) Bounds() image.Rectangle {
 // CurrentClipBBox returns the current clip bbox in evaluator coordinates
 // (device X with PDF-style bottom-up Y), matching Poppler's state->getClipBBox
 // input to SplashOutputDev::univariateShadedFill.
+// userClipBBoxForShadingCache mirrors GfxState::getUserClipBBox for the
+// univariate shading cache: map the RAW (un-floored) device clip bounds
+// through the inverse pattern CTM into pattern space.
+func (c *splashCanvas) userClipBBoxForShadingCache(inv [6]float64) ([4]float64, bool) {
+	if c == nil || c.s == nil {
+		return [4]float64{}, false
+	}
+	xMin, yMin, xMax, yMax, ok := c.s.ensureClip().VectorEffectiveBounds()
+	if !ok || xMax <= xMin || yMax <= yMin {
+		return [4]float64{}, false
+	}
+	uxMin, uyMin, uxMax, uyMax := transformedBBoxBounds([4]float64{xMin, yMin, xMax, yMax}, inv)
+	return [4]float64{uxMin, uyMin, uxMax, uyMax}, true
+}
+
 func (c *splashCanvas) CurrentClipBBox() ([4]float64, bool) {
 	if c == nil || c.s == nil {
 		return [4]float64{}, false
@@ -299,6 +329,14 @@ func (c *splashCanvas) CurrentClipBBox() ([4]float64, bool) {
 	xMin, yMin, xMax, yMax, ok := c.s.ensureClip().VectorEffectiveBounds()
 	if !ok || xMax <= xMin || yMax <= yMin {
 		return [4]float64{}, false
+	}
+	if c.yDownBase {
+		return [4]float64{
+			math.Floor(xMin),
+			math.Floor(yMin),
+			math.Ceil(xMax),
+			math.Ceil(yMax),
+		}, true
 	}
 	yOrigin := c.flipYOrigin()
 	return [4]float64{
@@ -384,7 +422,62 @@ func (c *splashCanvas) fill(evenOdd bool) {
 		fillPath = fillPath.WithIntegralSubpathYMinNudgedDown()
 	}
 	c.s.debugFillIndex = fillIndex
+	// Poppler renders Type3 CharProcs to a temporary bitmap
+	// (SplashOutputDev::drawType3Glyph → Splash::fillGlyph blit) rather than
+	// filling the glyph's vector paths directly on the page, so page-level
+	// strokeAdjust hint injection never applies to Type3 glyph fills. go-pdf
+	// replays CharProcs directly on the page canvas; without this guard, the
+	// glyph's sub-pixel fill rects get hint-snapped (widened to full columns),
+	// over-rendering Type3 text (doc_027 /F1 DejaVuSans). Disable strokeAdjust
+	// for the duration of the fill while inside a Type3 CharProc.
+	savedStrokeAdjust := c.s.state.strokeAdjust
+	if c.inType3Glyph() {
+		c.s.state.strokeAdjust = false
+	}
+	// While rendering the Type3 CharProc to the temp bitmap, force a solid white
+	// coverage pattern (Poppler SplashOutputDev::type3D1 sets the temp splash's
+	// pattern to a solid so the Mono8 pixel carries pure scan coverage, ignoring
+	// the page text color). The evaluator's color-sync re-installs the text
+	// color on c.s during the CharProc; without this the temp fill renders
+	// black-on-black and captures no coverage.
+	if c.inType3TempBitmap() {
+		c.s.SetFillPattern(type3TempCoveragePattern)
+		c.s.SetFillAlpha(1)
+	}
+	if os.Getenv("PDF_DEBUG_TYPE3_TEMPBITMAP_DUMP") != "" && c.inType3TempBitmap() {
+		pl := 0
+		xmin, ymin := 1e9, 1e9
+		xmax, ymax := -1e9, -1e9
+		if fillPath != nil {
+			pl = fillPath.Length()
+			for i := 0; i < pl; i++ {
+				pt, _ := fillPath.Point(i)
+				if pt.X < xmin {
+					xmin = pt.X
+				}
+				if pt.X > xmax {
+					xmax = pt.X
+				}
+				if pt.Y < ymin {
+					ymin = pt.Y
+				}
+				if pt.Y > ymax {
+					ymax = pt.Y
+				}
+			}
+		}
+		fmt.Fprintf(os.Stderr, "T3FILL-IN pathLen=%d matrix=%v bbox=[%.4f %.4f %.4f %.4f] bitmap=%dx%d\n",
+			pl, c.s.state.matrix, xmin, ymin, xmax, ymax, c.s.bitmap.Width(), c.s.bitmap.Height())
+	}
 	_ = c.s.Fill(fillPath, evenOdd)
+	if os.Getenv("PDF_DEBUG_TYPE3_TEMPBITMAP_DUMP") != "" && c.inType3TempBitmap() {
+		sum := 0
+		for _, b := range c.s.bitmap.Data() {
+			sum += int(b)
+		}
+		fmt.Fprintf(os.Stderr, "T3FILL-OUT bitmap sum=%d over %d bytes\n", sum, len(c.s.bitmap.Data()))
+	}
+	c.s.state.strokeAdjust = savedStrokeAdjust
 	c.s.debugFillIndex = -1
 	c.paintType3GlyphCacheRectFringe(fillPath)
 	c.rememberLastFillPathForClip(fillPath)
@@ -394,6 +487,13 @@ func (c *splashCanvas) fill(evenOdd bool) {
 
 func (c *splashCanvas) paintType3GlyphCacheRectFringe(path *xpath.Path) {
 	if c == nil || c.s == nil || c.s.bitmap == nil || !c.inType3GlyphCache() {
+		return
+	}
+	// The fringe run is a direct-render compensation for the cache path. While
+	// rendering to the temp glyph bitmap (Poppler's path) the coverage is
+	// produced by the scan converter itself, so the compensation would double-
+	// paint the cap fringe — skip it.
+	if c.inType3TempBitmap() {
 		return
 	}
 	xMin, yMin, xMax, yMax, ok := type3GlyphCacheAxisAlignedRectBounds(path)
@@ -523,6 +623,12 @@ func (c *splashCanvas) Stroke() {
 	if shouldDisableStrokeAdjustForDebugStrokeIndex(strokeIndex) {
 		c.s.SetStrokeAdjust(false)
 	}
+	// As with fills (see fill()), Poppler renders Type3 CharProc strokes via a
+	// temp bitmap + fillGlyph blit, so page-level strokeAdjust hint injection
+	// does not apply. Disable it while inside a Type3 CharProc.
+	if c.inType3Glyph() {
+		c.s.SetStrokeAdjust(false)
+	}
 	_ = c.s.Stroke(strokePath)
 	c.s.SetMirrorStrokeNormals(savedMirrorStrokeNormals)
 	c.s.SetStrokeAdjust(savedStrokeAdjust)
@@ -550,7 +656,7 @@ func (c *splashCanvas) FillPathWithCTM(elements []renderer.PathElement, ctm [6]f
 		return
 	}
 
-	fillMatrix := flipYMatrix(ctm, c.flipYOrigin())
+	fillMatrix := c.deviceMatrixForCTM(ctm)
 	savedMatrix := c.s.state.matrix
 	c.s.SetMatrix(fillMatrix)
 	if shouldTraceSplashFillIndex(fillIndex) {
@@ -588,7 +694,7 @@ func (c *splashCanvas) StrokePathWithCTM(elements []renderer.PathElement, ctm [6
 		return
 	}
 
-	strokeMatrix := flipYMatrix(ctm, c.flipYOrigin())
+	strokeMatrix := c.deviceMatrixForCTM(ctm)
 	savedMatrix := c.s.state.matrix
 	savedLineWidth := c.s.state.lineWidth
 	savedDash := append([]float64(nil), c.s.state.lineDash...)
@@ -602,6 +708,12 @@ func (c *splashCanvas) StrokePathWithCTM(elements []renderer.PathElement, ctm [6
 	c.s.SetLineDash(dash, phase)
 	c.s.SetMirrorStrokeNormals(false)
 	if shouldDisableStrokeAdjustForDebugStrokeIndex(strokeIndex) {
+		c.s.SetStrokeAdjust(false)
+	}
+	// As with fills (see fill()), Poppler renders Type3 CharProc strokes via a
+	// temp bitmap + fillGlyph blit, so page-level strokeAdjust hint injection
+	// does not apply. Disable it while inside a Type3 CharProc.
+	if c.inType3Glyph() {
 		c.s.SetStrokeAdjust(false)
 	}
 	_ = c.s.Stroke(strokePath)
@@ -799,7 +911,7 @@ func (c *splashCanvas) debugTraceStroke(index int) {
 		index, col[0], col[1], col[2], c.s.state.lineWidth, c.s.state.lineCap, c.s.state.lineJoin, c.s.state.miterLimit, c.s.state.matrix, c.path.Length(), x0, y0, x1, y1)
 	for i := 0; i < c.path.Length(); i++ {
 		pt, flag := c.path.Point(i)
-		fmt.Fprintf(os.Stderr, "  pt[%03d]=(%.8f,%.8f) flag=0x%02x\n", i, pt.X, pt.Y, flag)
+		fmt.Fprintf(os.Stderr, "  pt[%03d]=(%.17g,%.17g) flag=0x%02x\n", i, pt.X, pt.Y, flag)
 	}
 }
 
@@ -885,7 +997,7 @@ func (c *splashCanvas) debugTraceFill(index int, evenOdd bool) {
 		index, col[0], col[1], col[2], evenOdd, c.type3Depth, pendingShading, pendingPatches, c.s.state.matrix, c.path.Length(), x0, y0, x1, y1)
 	for i := 0; i < c.path.Length(); i++ {
 		pt, flag := c.path.Point(i)
-		fmt.Fprintf(os.Stderr, "  pt[%03d]=(%.8f,%.8f) flag=0x%02x\n", i, pt.X, pt.Y, flag)
+		fmt.Fprintf(os.Stderr, "  pt[%03d]=(%.17g,%.17g) flag=0x%02x\n", i, pt.X, pt.Y, flag)
 	}
 }
 
@@ -1151,7 +1263,7 @@ func (c *splashCanvas) ShowText(text string) error {
 	codes := splashSplitTextCodes([]byte(text), font)
 	curX := c.textX
 	curY := c.textY
-	userToSplash := flipYMatrix(c.textCTM, c.flipYOrigin())
+	userToSplash := c.deviceMatrixForCTM(c.textCTM)
 	for _, charCode := range codes {
 		glyph, err := font.CharCodeToGlyph(charCode)
 		if err == nil {
@@ -1242,6 +1354,13 @@ func (c *splashCanvas) MoveTextPoint(tx, ty float64) {
 // syncCanvasGlyphTransform before each text run so glyph rasterisation
 // honours the current CTM scale (e.g. 150/72 ≈ 2.083 at 150 DPI).
 func (c *splashCanvas) SetGlyphTransform(t [4]float64) {
+	// The glyph raster pipeline (axis-aligned checks, cache heights, FT scale
+	// derivation) consumes a Y-UP text rendering matrix. Under yDownBase the
+	// evaluator's TRM is composed y-down; normalise with exact IEEE sign flips.
+	if c.yDownBase {
+		t[1] = -t[1]
+		t[3] = -t[3]
+	}
 	c.glyphTransform = t
 	if os.Getenv("SPLASH_DEBUG_GT") != "" {
 		fmt.Fprintf(os.Stderr, "SetGlyphTransform: %v\n", t)
@@ -1610,7 +1729,7 @@ func (c *splashCanvas) strokeTextPathPopplerOrder(p *xpath.Path) error {
 }
 
 func (c *splashCanvas) popplerOrderedTextPath(p *xpath.Path) (*xpath.Path, [6]float64, bool) {
-	matrix := flipYMatrix(c.textCTM, c.flipYOrigin())
+	matrix := c.deviceMatrixForCTM(c.textCTM)
 	inv, ok := invertSplashAffine(matrix)
 	if !ok {
 		return nil, [6]float64{}, false
@@ -2707,7 +2826,7 @@ func (c *splashCanvas) drawImageWithPopplerContract(
 	if os.Getenv("PDF_DEBUG_SPLASH_POPPLER_IMAGE_LEGACY_MATRIX") == "1" {
 		mat = c.imageDrawMatrix(composed)
 	}
-	return c.s.drawImageImplWithPostTransform(src, srcW, srcH, mat, interpolate, sourceAlpha, postScaleICCRGB)
+	return c.s.drawImageImplWithPostTransformOptions(src, srcW, srcH, mat, interpolate, sourceAlpha, postScaleICCRGB, imageDrawOptions{})
 }
 
 type popplerPostScaleICCRGBImage interface {
@@ -2921,6 +3040,9 @@ func splashTransformPoint(m [6]float64, x, y float64) (float64, float64) {
 }
 
 func (c *splashCanvas) pathYFlipMatrix() [6]float64 {
+	if c.yDownBase {
+		return [6]float64{1, 0, 0, 1, 0, 0}
+	}
 	return [6]float64{1, 0, 0, -1, 0, c.flipYOrigin()}
 }
 
@@ -2936,10 +3058,19 @@ func popplerImageMatrixFromCTM(ctm [6]float64) [6]float64 {
 }
 
 func (c *splashCanvas) imageDrawMatrixForRegularImage(composed [6]float64) [6]float64 {
+	if c.yDownBase {
+		return popplerImageMatrixFromCTM(composed)
+	}
 	return popplerImageMatrixFromCTM(flipYMatrix(composed, c.flipYOrigin()))
 }
 
 func (c *splashCanvas) imageDrawMatrix(composed [6]float64) [6]float64 {
+	if c.yDownBase {
+		if c.inType3Glyph() {
+			return popplerImageMatrixFromCTM(composed)
+		}
+		return composed
+	}
 	if c.inType3Glyph() {
 		// Poppler evaluates Type3 CharProcs with a device-space CTM, then
 		// SplashOutputDev::drawSoftMaskedImage converts that CTM to a Splash
@@ -2993,7 +3124,283 @@ func (c *splashCanvas) EndType3GlyphCache() {
 	}
 }
 
-// Save pushes the graphics state (Splash::saveState, Splash.cc:1737).
+// type3TempState captures the page splash while a Type3 CharProc is rendered to
+// a small glyph-relative Mono8 bitmap, mirroring Poppler's
+// SplashOutputDev::type3D1 → endType3Char::drawType3Glyph temp-bitmap path.
+// Rendering at glyph-relative magnitude (seg coords ~10 instead of ~1e5) avoids
+// the catastrophic float cancellation the device-magnitude scan converter
+// suffers at 45° cap edges (doc_027 DejaVuSans Type3 glyphs), where
+// xbase = X0 - Y0·dxdy loses ~5e-11 of precision and floors a cap edge to 45
+// instead of 46.
+type type3TempState struct {
+	origSplash *Splash
+	tempBitmap *Bitmap
+	w, h       int
+	blitX      int
+	blitY      int
+}
+
+// type3TempCoveragePattern is the solid white pattern used while rendering a
+// Type3 CharProc to the temp bitmap so each pixel stores the scan converter's
+// coverage (mirrors Poppler SplashOutputDev::type3D1's solid temp fill pattern).
+var type3TempCoveragePattern = NewSolidColor(Color{0xff, 0xff, 0xff})
+
+// inType3TempBitmap reports whether the canvas is currently rendering a Type3
+// CharProc onto the temporary glyph-relative bitmap.
+func (c *splashCanvas) inType3TempBitmap() bool {
+	return c != nil && c.type3Temp != nil && c.type3Temp.origSplash != nil
+}
+
+// type3TempTransformPoint applies the 2×3 matrix m to (x,y) (PDF user space).
+func type3TempTransformPoint(m [6]float64, x, y float64) (float64, float64) {
+	return m[0]*x + m[2]*y + m[4], m[1]*x + m[3]*y + m[5]
+}
+
+// type3TempDeviceBBox transforms a font-space bbox by glyphCTM and returns the
+// Y-up device-space min/max (matches evaluator.transformedBBoxBounds).
+func type3TempDeviceBBox(glyphCTM [6]float64, bbox [4]float64) (xMin, yMin, xMax, yMax float64) {
+	corners := [4][2]float64{
+		{bbox[0], bbox[1]}, {bbox[0], bbox[3]},
+		{bbox[2], bbox[1]}, {bbox[2], bbox[3]},
+	}
+	xMin, yMin = type3TempTransformPoint(glyphCTM, corners[0][0], corners[0][1])
+	xMax, yMax = xMin, yMin
+	for _, p := range corners[1:] {
+		px, py := type3TempTransformPoint(glyphCTM, p[0], p[1])
+		if px < xMin {
+			xMin = px
+		} else if px > xMax {
+			xMax = px
+		}
+		if py < yMin {
+			yMin = py
+		} else if py > yMax {
+			yMax = py
+		}
+	}
+	return xMin, yMin, xMax, yMax
+}
+
+// PrepareType3TempBitmap mirrors Poppler SplashOutputDev::type3D1: compute the
+// glyph cache box from the font bbox, allocate a Mono8 temp bitmap sized to it,
+// install a fresh Splash whose matrix is identity (the evaluator feeds already
+// glyph-relative stored coords via tempCTM), and swap it in as the active
+// canvas. The returned tempCTM replaces the evaluator's transform so the
+// CharProc path is generated at glyph-relative magnitude. Returns ok=false (no
+// change) when the glyph box is degenerate or too large.
+//
+// Coordinate derivation. The page stores path points as (D_x, flipY(D_y)) where
+// (D_x, D_y) = transform(glyphCTM, g) are device Y-up coords and flipY(D_y) =
+// Cp - D_y. We want the temp bitmap's pixel (px,py) to map back to page stored
+// (blitX+px, blitY+py), so the temp stored coord must be (D_x - blitX,
+// (Cp-D_y) - blitY). Since the evaluator computes transform(tempCTM,g) = (P_x,
+// P_y) and the canvas stores (P_x, Cp - P_y), matching gives tempCTM[4] =
+// glyphCTM[4] - blitX and tempCTM[5] = glyphCTM[5] + blitY.
+//
+// The blit origin mirrors Poppler type3D1's cache box: relX = floor(sXMin -
+// sPenX) - 2, relY = floor(sYMin - sPenY) - 2 where sPenX = glyphCTM[4],
+// sPenY = Cp - glyphCTM[5] and the bbox Y-up extrema flip to sYMin = Cp - yMax,
+// sYMax = Cp - yMin; blitX = floor(sPenX) + relX, blitY = floor(sPenY) + relY.
+// The temp box width/height are ceil(max)-floor(min)+4 over the stored extrema.
+func (c *splashCanvas) PrepareType3TempBitmap(glyphCTM [6]float64, fontBBox [4]float64) (tempCTM [6]float64, w, h, blitX, blitY int, ok bool) {
+	if c == nil || c.s == nil {
+		return [6]float64{}, 0, 0, 0, 0, false
+	}
+	if fontBBox[0] == 0 && fontBBox[1] == 0 && fontBBox[2] == 0 && fontBBox[3] == 0 {
+		return [6]float64{}, 0, 0, 0, 0, false
+	}
+	xMin, yMin, xMax, yMax := type3TempDeviceBBox(glyphCTM, fontBBox)
+	sPenX := glyphCTM[4]
+	var sPenY, sXMin, sXMax, sYMin, sYMax float64
+	if c.yDownBase {
+		// glyphCTM is already y-down device space; no page-flip conversions.
+		sPenY = glyphCTM[5]
+		sXMin, sXMax = xMin, xMax
+		sYMin, sYMax = yMin, yMax
+	} else {
+		Cp := c.flipYOrigin()
+		sPenY = Cp - glyphCTM[5]
+		sXMin, sXMax = xMin, xMax
+		sYMin = Cp - yMax
+		sYMax = Cp - yMin
+	}
+	relX := math.Floor(sXMin-sPenX) - 2
+	relY := math.Floor(sYMin-sPenY) - 2
+	w = int(math.Ceil(sXMax)-math.Floor(sXMin)) + 4
+	h = int(math.Ceil(sYMax)-math.Floor(sYMin)) + 4
+	if w <= 0 || h <= 0 || w*h > 100000 {
+		return [6]float64{}, 0, 0, 0, 0, false
+	}
+	blitX = int(math.Floor(sPenX)) + int(relX)
+	blitY = int(math.Floor(sPenY)) + int(relY)
+
+	// Poppler uses a Mono8 temp bitmap. We use RGB8 here because the Go Splash
+	// Fill/AA pipe is exercised in production only for RGB8 (Mono8 Fill is
+	// untested). With a solid white fill pattern over a black-cleared bitmap,
+	// each channel of a covered pixel equals the scan converter's coverage byte
+	// (aSrc*255/alpha2), identical to the Mono8 value Poppler stores. We extract
+	// the red channel as the glyph alpha, so the blit is byte-identical to a
+	// Mono8 render.
+	tempBitmap := NewBitmap(w, h, ModeRGB8, false)
+	tempSplash, err := New(tempBitmap, c.s.vectorAA)
+	if err != nil || tempSplash == nil {
+		return [6]float64{}, 0, 0, 0, 0, false
+	}
+	tempBitmap.Clear(Color{})
+	tempSplash.SetFillPattern(NewSolidColor(Color{0xff, 0xff, 0xff}))
+	tempSplash.SetStrokePattern(NewSolidColor(Color{0xff, 0xff, 0xff}))
+	tempSplash.SetFillAlpha(1)
+	tempSplash.SetStrokeAlpha(1)
+	tempSplash.SetStrokeAdjust(false)
+	tempSplash.SetMatrix([6]float64{1, 0, 0, 1, 0, 0})
+
+	c.type3Temp = &type3TempState{
+		origSplash: c.s,
+		tempBitmap: tempBitmap,
+		w:          w, h: h,
+		blitX: blitX, blitY: blitY,
+	}
+	c.s = tempSplash
+
+	// Temp CTM is composed directly in DEVICE (y-down) cell space, exactly like
+	// Poppler's state->setCTM(a,b,c,d, -glyphX, -glyphY) (SplashOutputDev.cc
+	// type3D1). The linear part y-row is sign-flipped from the y-up glyphCTM
+	// (exact in IEEE), and the translation is the SMALL integer (-relX,-relY) =
+	// Poppler's (-glyphX,-glyphY). The canvas flipY is bypassed while the temp
+	// render is active (type3Temp != nil), so each path point evaluates as
+	//   y_cell = fl(x*(-b) + y*(-d) + (-relY))
+	// — bit-identical to SplashXPath::transform. The previous y-up composition
+	// routed Y through the ~page-height flip (Cp - (g·L + T)), whose float
+	// cancellation at magnitude ~1650 left a ~1e-13 residual that flipped one
+	// AA subline at 45° cap edges (doc_027 'w' cell (11,13): 45 vs 59).
+	if c.yDownBase {
+		// Already y-down: keep the linear part, swap in the small cell offset.
+		tempCTM = [6]float64{
+			glyphCTM[0], glyphCTM[1], glyphCTM[2], glyphCTM[3],
+			-float64(relX), -float64(relY),
+		}
+	} else {
+		tempCTM = [6]float64{
+			glyphCTM[0], -glyphCTM[1], glyphCTM[2], -glyphCTM[3],
+			-float64(relX), -float64(relY),
+		}
+	}
+	if os.Getenv("PDF_DEBUG_TYPE3_TEMPBITMAP") != "" {
+		fmt.Fprintf(os.Stderr, "T3TEMP bbox=[%.6g %.6g %.6g %.6g] pen=(%.6g,%.6g) rel=(%.6g,%.6g) wh=(%d,%d) blit=(%d,%d) ctm=[%.17g %.17g %.17g %.17g %.17g %.17g]\n",
+			xMin, yMin, xMax, yMax, sPenX, sPenY, relX, relY, w, h, blitX, blitY,
+			tempCTM[0], tempCTM[1], tempCTM[2], tempCTM[3], tempCTM[4], tempCTM[5])
+	}
+	return tempCTM, w, h, blitX, blitY, true
+}
+
+// FinishType3TempBitmap mirrors Poppler endType3Char::drawType3Glyph: extract
+// the rendered Mono8 coverage, restore the page splash, and blit the glyph at
+// its device origin via fillGlyph2 (page splash's fill pattern = text color).
+func (c *splashCanvas) FinishType3TempBitmap() {
+	if c == nil || c.type3Temp == nil {
+		return
+	}
+	ts := c.type3Temp
+	c.type3Temp = nil
+	pageSplash := ts.origSplash
+	if pageSplash == nil {
+		return
+	}
+	c.s = pageSplash
+	tb := ts.tempBitmap
+	if tb == nil {
+		return
+	}
+	src := tb.Data()
+	rowSize := tb.RowSize()
+	srcW := tb.Width()
+	srcH := tb.Height()
+	if srcW <= 0 || srcH <= 0 || len(src) == 0 {
+		return
+	}
+	bpp := bytesPerPixel(tb.Mode())
+	data := make([]byte, ts.w*ts.h)
+	copyW := srcW
+	if copyW > ts.w {
+		copyW = ts.w
+	}
+	copyH := srcH
+	if copyH > ts.h {
+		copyH = ts.h
+	}
+	// Extract per-pixel coverage from the red channel (byte 0 of each pixel).
+	for yy := 0; yy < copyH; yy++ {
+		for xx := 0; xx < copyW; xx++ {
+			data[yy*ts.w+xx] = src[yy*rowSize+xx*bpp]
+		}
+	}
+	glyph := &GlyphBitmap{X: 0, Y: 0, W: ts.w, H: ts.h, AA: true, Data: data}
+	if os.Getenv("PDF_DEBUG_TYPE3_TEMPBITMAP_PNG") != "" {
+		dumpType3TempGlyphPNG(ts, glyph, pageSplash)
+	}
+	if os.Getenv("PDF_DEBUG_TYPE3_TEMPBITMAP_DUMP") != "" {
+		nonzero := 0
+		for _, b := range data {
+			if b != 0 {
+				nonzero++
+			}
+		}
+		var fpCol Color
+		hasFP := pageSplash.state.fillPattern != nil && pageSplash.state.fillPattern.IsStatic()
+		if hasFP {
+			pageSplash.state.fillPattern.GetColor(0, 0, &fpCol)
+		}
+		fmt.Fprintf(os.Stderr, "T3BLIT wh=(%d,%d) blit=(%d,%d) nonzero=%d/%d fillAlpha=%.3g fillPattern=%v staticFP=%v\n",
+			ts.w, ts.h, ts.blitX, ts.blitY, nonzero, len(data), pageSplash.state.fillAlpha, fpCol, hasFP)
+	}
+	fillGlyph2(pageSplash, ts.blitX, ts.blitY, glyph)
+}
+
+// dumpType3TempGlyphPNG writes the temp glyph coverage (white=full) as a
+// grayscale PNG plus the corresponding page-splash region AFTER the blit, so the
+// two can be compared against a Poppler page crop at (blitX,blitY).
+func dumpType3TempGlyphPNG(ts *type3TempState, glyph *GlyphBitmap, pageSplash *Splash) {
+	idx := type3TempDumpIdx
+	type3TempDumpIdx++
+	// Coverage map: white=full coverage, black=none.
+	cov := image.NewGray(image.Rect(0, 0, glyph.W, glyph.H))
+	for i, a := range glyph.Data {
+		cov.Pix[i] = a
+	}
+	covPath := fmt.Sprintf("/tmp/t3_cov_%03d_%dx%d_%d_%d.png", idx, glyph.W, glyph.H, ts.blitX, ts.blitY)
+	if f, err := os.Create(covPath); err == nil {
+		_ = png.Encode(f, cov)
+		_ = f.Close()
+	}
+	// Page region after blit (the actual composited result).
+	pb := pageSplash.bitmap
+	pr := image.NewGray(image.Rect(0, 0, glyph.W, glyph.H))
+	bpp := bytesPerPixel(pb.Mode())
+	rowSize := pb.RowSize()
+	src := pb.Data()
+	for yy := 0; yy < glyph.H; yy++ {
+		py := ts.blitY + yy
+		if py < 0 || py >= pb.Height() {
+			continue
+		}
+		for xx := 0; xx < glyph.W; xx++ {
+			px := ts.blitX + xx
+			if px < 0 || px >= pb.Width() {
+				continue
+			}
+			pr.Pix[yy*glyph.W+xx] = src[py*rowSize+px*bpp]
+		}
+	}
+	pgPath := fmt.Sprintf("/tmp/t3_page_%03d_%dx%d_%d_%d.png", idx, glyph.W, glyph.H, ts.blitX, ts.blitY)
+	if f, err := os.Create(pgPath); err == nil {
+		_ = png.Encode(f, pr)
+		_ = f.Close()
+	}
+	fmt.Fprintf(os.Stderr, "T3DUMP idx=%d wh=(%d,%d) blit=(%d,%d) cov=%s page=%s\n",
+		idx, glyph.W, glyph.H, ts.blitX, ts.blitY, covPath, pgPath)
+}
+
+var type3TempDumpIdx int
 func (c *splashCanvas) Save() { c.s.SaveState() }
 
 // Restore pops the graphics state (Splash::restoreState, Splash.cc:1746).
@@ -3023,6 +3430,12 @@ func (c *splashCanvas) ClearSoftMask() {
 // HasSoftMask reports whether a soft mask is active on the current Splash state.
 func (c *splashCanvas) HasSoftMask() bool {
 	return c != nil && c.s != nil && c.s.state != nil && c.s.state.softMask != nil
+}
+
+// InNonIsolatedGroup reports whether the current Splash state is rendering inside
+// a non-isolated transparency group (mirrors Splash's state->inNonIsolatedGroup).
+func (c *splashCanvas) InNonIsolatedGroup() bool {
+	return c != nil && c.s != nil && c.s.state != nil && c.s.state.inNonIsolatedGroup
 }
 
 // BeginTransparencyGroup starts a transparency group whose bbox is expressed in
@@ -3273,6 +3686,9 @@ func (c *splashCanvas) deviceBBoxToSplash(bbox [4]float64) [4]float64 {
 	x1 := math.Max(bbox[0], bbox[2])
 	y0 := math.Min(bbox[1], bbox[3])
 	y1 := math.Max(bbox[1], bbox[3])
+	if c.yDownBase {
+		return [4]float64{x0, y0, x1, y1}
+	}
 	return [4]float64{x0, c.flipY(y1), x1, c.flipY(y0)}
 }
 
@@ -3303,12 +3719,39 @@ func (c *splashCanvas) SetPageYOriginPx(yOrigin float64) {
 // flipY converts an evaluator-space Y (device pixel space, but with Y still
 // pointing up because the renderer's initial CTM does not flip Y — see
 // concurrent_renderer.go default branch tY=0) into splash-bitmap Y.
+// deviceMatrixForCTM converts an evaluator CTM into the Splash device matrix.
+// Normally that means baking the y-up→y-down page flip (flipYMatrix); during a
+// Type3 temp-bitmap render the evaluator's CTM is already composed in y-down
+// cell space (PrepareType3TempBitmap), so it passes through unchanged —
+// flipping again would send Y back to page magnitude (samsung: glyph dot
+// subpaths drawn via FillPathWithCTM landed outside the temp cell).
+func (c *splashCanvas) deviceMatrixForCTM(ctm [6]float64) [6]float64 {
+	if c.yDownBase || c.type3Temp != nil {
+		return ctm
+	}
+	return flipYMatrix(ctm, c.flipYOrigin())
+}
+
 func (c *splashCanvas) flipY(y float64) float64 {
+	// Type3 temp-bitmap renders compose their CTM directly in device (y-down)
+	// cell space (PrepareType3TempBitmap), so the y-up→y-down flip must be a
+	// no-op: flipping through the page height reintroduces the ~1e-13 float
+	// cancellation the temp render exists to eliminate. yDownBase generalises
+	// the same rule to the whole page.
+	if c.yDownBase || c.type3Temp != nil {
+		return y
+	}
 	if c.pageYOriginPx > 0 {
 		return c.pageYOriginPx - y
 	}
 	return float64(c.height) - y
 }
+
+// SetYDownBase marks the evaluator CTMs as composed in y-down device space.
+func (c *splashCanvas) SetYDownBase(on bool) { c.yDownBase = on }
+
+// YDownBase reports whether CTMs are composed in y-down device space.
+func (c *splashCanvas) YDownBase() bool { return c.yDownBase }
 
 // QuantizeType3GlyphOrigin mirrors Poppler's Type3 cache blit placement.
 // SplashOutputDev::drawType3Glyph() calls Splash::fillGlyph(0,0), which floors
@@ -3316,6 +3759,9 @@ func (c *splashCanvas) flipY(y float64) float64 {
 func (c *splashCanvas) QuantizeType3GlyphOrigin(x, y float64) (float64, float64) {
 	if os.Getenv("PDF_DEBUG_TYPE3_GLYPH_ORIGIN_MODE") == "raw" {
 		return x, y
+	}
+	if c.yDownBase {
+		return math.Floor(x), math.Floor(y)
 	}
 	yDown := c.flipYOrigin() - y
 	return math.Floor(x), c.flipYOrigin() - math.Floor(yDown)
@@ -3329,6 +3775,9 @@ func (c *splashCanvas) SetFillColor(col color.Color) {
 	if c.s == nil || c.s.bitmap == nil {
 		return
 	}
+	if c.setColorSkipsType3Temp() {
+		return
+	}
 	c.pendingFillTilingPattern = nil
 	c.pendingFillTilingTint = Color{}
 	c.pendingFillShadingPattern = nil
@@ -3337,11 +3786,24 @@ func (c *splashCanvas) SetFillColor(col color.Color) {
 	c.s.SetFillAlpha(alpha)
 }
 
+// setColorSkipsType3Temp: a d1 Type3 CharProc "shall not specify any colour"
+// (PDF 9.6.5). The temp cell renders pure coverage with the white pattern
+// installed by PrepareType3TempBitmap; the text colour applies once at the
+// blit. Poppler's temp splash keeps white because no colour ops fire during
+// the cell render — go's evaluator re-syncs the PAGE colour before each fill,
+// which would scale the coverage by the text grey (samsung: 232/255).
+func (c *splashCanvas) setColorSkipsType3Temp() bool {
+	return c.type3Temp != nil
+}
+
 // SetStrokeColor installs a SolidColor stroke pattern from a stdlib
 // color.Color (Splash::setStrokePattern, Splash.cc:1595). Mirror of
 // SetFillColor — see Hotfix #2 notes there.
 func (c *splashCanvas) SetStrokeColor(col color.Color) {
 	if c.s == nil || c.s.bitmap == nil {
+		return
+	}
+	if c.setColorSkipsType3Temp() {
 		return
 	}
 	sc, alpha := convertColorAndAlpha(col, c.s.bitmap.Mode())
@@ -3535,6 +3997,14 @@ func (c *splashCanvas) shouldUsePattern2SCNShadedFill(shading *entity.Shading) b
 	}
 	if os.Getenv("PDF_SPLASH_PATTERN2_SCN_SHFILL_GROUP_TILE") == "1" {
 		return inGroup && inTileReplay
+	}
+	if c.yDownBase {
+		// Poppler always routes PatternType2 through doShadingPatternFill:
+		// clip to the fill path FIRST, then build the pattern, so the
+		// univariate sample cache sees the clipped parameter range
+		// (day1 P29: s∈[0.052,0.890]/59 samples vs [0,1]/71 without the
+		// clip — the interpolation error decides ±1 colour bands).
+		return true
 	}
 	// Poppler routes PatternType2 fill through Gfx::doShadingPatternFill
 	// (Gfx.cc) instead of painting with a regular dynamic fill pattern. The
@@ -3974,6 +4444,11 @@ func (c *splashCanvas) fillPendingTilingPatternByTileReplay(evenOdd bool) bool {
 	yOrigin := c.canvasYOrigin()
 	fillYDevMin := yOrigin - fillYMax
 	fillYDevMax := yOrigin - fillYMin
+	if c.yDownBase {
+		// Path bounds are already device y-down; no unflip.
+		fillYDevMin = fillYMin
+		fillYDevMax = fillYMax
+	}
 
 	bboxX0Px := patternBBox[0] * scaleX
 	bboxX2Px := patternBBox[2] * scaleX
@@ -4075,6 +4550,10 @@ func (c *splashCanvas) drawTilingPatternByTileReplay(
 	mode := c.s.bitmap.Mode()
 	parentFill := splashColorToNRGBA(c.pendingFillTilingTint, mode)
 	yOrigin := c.canvasYOrigin()
+	if c.yDownBase {
+		// Sentinel for transformedBBoxPath: skip the y-up unflip.
+		yOrigin = math.NaN()
+	}
 	mainBounds := image.Rect(0, 0, c.width, c.height)
 	bboxMinX := math.Min(patternBBox[0], patternBBox[2]) * scaleX
 	bboxMaxX := math.Max(patternBBox[0], patternBBox[2]) * scaleX
@@ -4094,6 +4573,10 @@ func (c *splashCanvas) drawTilingPatternByTileReplay(
 			tileClipX1 := tileX + bboxMaxX
 			tileClipY0 := yOrigin - (tileYDev + bboxMaxYDev)
 			tileClipY1 := yOrigin - (tileYDev + bboxMinYDev)
+			if c.yDownBase {
+				tileClipY0 = tileYDev + bboxMinYDev
+				tileClipY1 = tileYDev + bboxMaxYDev
+			}
 			if fullAffineReplay {
 				tileTransform = matrix
 				tileTransform[4] = float64(i)*rawXStep*matrix[0] + float64(j)*rawYStep*matrix[2] + matrix[4]
@@ -4236,6 +4719,10 @@ func (c *splashCanvas) currentClipBBoxForShadingCache(matrix [6]float64) ([4]flo
 		return [4]float64{}, false
 	}
 	yOrigin := c.flipYOrigin()
+	if c.yDownBase {
+		// Sentinel: clipBoundsToShadingCacheBBox skips the y-up unflip.
+		yOrigin = math.NaN()
+	}
 	clip := c.s.ensureClip()
 	clipSource := "current"
 	if savedClip, ok := c.softMaskSavedClipForShadingCache(); ok {
@@ -4384,6 +4871,10 @@ func clipBoundsToShadingCacheBBox(bounds [4]float64, boundsOK bool, yOrigin floa
 		return [4]float64{}, false
 	}
 	deviceBBox := [4]float64{xMin, yOrigin - yMax, xMax, yOrigin - yMin}
+	if math.IsNaN(yOrigin) {
+		// y-down base: clip bounds are already device y-down.
+		deviceBBox = [4]float64{xMin, yMin, xMax, yMax}
+	}
 	uxMin, uyMin, uxMax, uyMax := transformedBBoxBounds(deviceBBox, inv)
 	return [4]float64{uxMin, uyMin, uxMax, uyMax}, true
 }
@@ -4447,6 +4938,10 @@ func transformedBBoxPath(bbox [4]float64, matrix [6]float64, yOrigin float64) (*
 	for i, pt := range points {
 		x, yDev := applyAffine(matrix, pt[0], pt[1])
 		y := yOrigin - yDev
+		if math.IsNaN(yOrigin) {
+			// y-down base: matrix output is already device y-down.
+			y = yDev
+		}
 		if i == 0 {
 			xMin, xMax = x, x
 			yMin, yMax = y, y
@@ -4875,6 +5370,15 @@ func (c *splashCanvas) shadingFillPath(matrix [6]float64, bbox [4]float64, hasBB
 	}
 	yOrigin := c.shadingFillPathYOrigin(matrix, bbox, shadingType)
 	path := devicePointPathWithYOrigin(deviceCorners, yOrigin)
+	if c.yDownBase {
+		// Corners are already device y-down; build the path without flipping.
+		path = xpath.NewPath()
+		_ = path.MoveTo(deviceCorners[0][0], deviceCorners[0][1])
+		for i := 1; i < len(deviceCorners); i++ {
+			_ = path.LineTo(deviceCorners[i][0], deviceCorners[i][1])
+		}
+		_ = path.Close(false)
+	}
 	if os.Getenv("PDF_DEBUG_SPLASH_SHADING_FILL_PATH_TRACE") != "" {
 		pxMin, pyMin, pxMax, pyMax := xpathPathBounds(path)
 		fmt.Fprintf(os.Stderr, "SPLASH_SHADING_FILL_PATH_TRACE hasBBox=%t bbox=(%.9f,%.9f)-(%.9f,%.9f) matrix=[%.9f %.9f %.9f %.9f %.9f %.9f] userBBox=(%.9f,%.9f)-(%.9f,%.9f) pathBounds=(%.9f,%.9f)-(%.9f,%.9f)\n",
@@ -5276,6 +5780,15 @@ func (c *splashCanvas) buildAxialPatternShader(patternName string, shading *enti
 			cacheBBox = bboxes[1]
 		}
 		fn = buildShadingFuncWithCache(shading, mode, newSplashUnivariateShadingColorCache(shading, matrix, cacheBBox))
+	} else if len(bboxes) == 0 && c.yDownBase && !disableShadingCacheForPattern(patternName) {
+		// Poppler's SplashUnivariatePattern ctor ALWAYS builds the sample
+		// cache (setupCache with getUserClipBBox); colours then come from
+		// linear interpolation between grid samples, not direct function
+		// evaluation. Without it the floats differ enough to flip the
+		// 16.16-quantized byte at band edges (day1 title gradient ±1).
+		if userBBox, ok := c.userClipBBoxForShadingCache(inv); ok {
+			fn = buildShadingFuncWithCache(shading, mode, newSplashUnivariateShadingColorCache(shading, matrix, userBBox))
+		}
 	}
 	yOrigin := c.canvasYOrigin()
 	if c.axialSampleShouldUseIntegerYOrigin(patternName, shading, matrix, bboxes...) {
@@ -5285,10 +5798,23 @@ func (c *splashCanvas) buildAxialPatternShader(patternName string, shading *enti
 				patternName, yOrigin, matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5], bboxes[0])
 		}
 	}
+	if os.Getenv("PDF_DEBUG_SPLASH_AXIAL_MATRIX_TRACE") != "" {
+		fmt.Fprintf(os.Stderr, "SPLASH_AXIAL_MATRIX name=%s mat=[%.17g %.17g %.17g %.17g %.17g %.17g] inv=[%.17g %.17g %.17g %.17g %.17g %.17g]\n",
+			patternName, matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5], inv[0], inv[1], inv[2], inv[3], inv[4], inv[5])
+	}
 	sampleXOff, sampleYOff := axialTopDownSampleOffsetForPattern(patternName)
 	yOrigin += axialYOriginDeltaForPattern(patternName)
 	transform := func(x, y float64) (float64, float64) {
 		return applyAffine(inv, x+sampleXOff, yOrigin-(y+sampleYOff))
+	}
+	if c.yDownBase {
+		// matrix (and thus inv) is composed y-down: bitmap coords map back to
+		// shading space directly — no page-height unflip and no legacy sample
+		// offsets (those compensated the flipped sampling; Poppler's
+		// SplashAxialPattern::getColor uses raw (x, y)).
+		transform = func(x, y float64) (float64, float64) {
+			return applyAffine(inv, x, y)
+		}
 	}
 	shader := NewAxialShaderWithTransform(coords[0], coords[1], coords[2], coords[3], t0, t1, extend[0], extend[1], fn, mode, transform)
 	shader.DebugName = patternName
@@ -5352,6 +5878,12 @@ func (c *splashCanvas) buildRadialPatternShader(patternName string, shading *ent
 			cacheBBox = bboxes[1]
 		}
 		fn = buildShadingFuncWithCache(shading, mode, newSplashUnivariateShadingColorCache(shading, matrix, cacheBBox))
+	} else if len(bboxes) == 0 && c.yDownBase && !disableShadingCacheForPattern(patternName) {
+		// See buildAxialPatternShader: Poppler always interpolates from the
+		// setupCache sample grid on the pattern path.
+		if userBBox, ok := c.userClipBBoxForShadingCache(inv); ok {
+			fn = buildShadingFuncWithCache(shading, mode, newSplashUnivariateShadingColorCache(shading, matrix, userBBox))
+		}
 	}
 	yOrigin := c.canvasYOrigin()
 	if os.Getenv("PDF_DEBUG_SPLASH_RADIAL_TRACE") != "" {
@@ -5360,6 +5892,11 @@ func (c *splashCanvas) buildRadialPatternShader(patternName string, shading *ent
 	}
 	transform := func(x, y float64) (float64, float64) {
 		return applyAffine(inv, x, yOrigin-y)
+	}
+	if c.yDownBase {
+		transform = func(x, y float64) (float64, float64) {
+			return applyAffine(inv, x, y)
+		}
 	}
 	shader := NewRadialShaderWithTransform(coords[0], coords[1], coords[2], coords[3], coords[4], coords[5], t0, t1, extend[0], extend[1], fn, mode, transform)
 	if skipExponentialRadialShadingEdgeCorrection() && shadingHasSingleExponentialFunction(shading) {
@@ -5674,8 +6211,7 @@ func applyAnnotationMultiplyPixel(bm *Bitmap, data []byte, colorOff, alphaOff, m
 
 	src := Color{fill.R, fill.G, fill.B}
 	dst := Color{data[colorOff], data[colorOff+1], data[colorOff+2]}
-	var blend Color
-	BlendMultiply(&src, &dst, &blend, bm.mode)
+	blend := BlendMultiply(src, dst, bm.mode)
 
 	aDest := 255
 	if alphaOff >= 0 && alphaOff < len(bm.alpha) {
@@ -5724,3 +6260,6 @@ func (c *splashCanvas) Reset() {
 	c.path = xpath.NewPath()
 	c.hasCur = false
 }
+
+// TrimMemoryPools drops released Splash bitmap buffers retained for reuse.
+func TrimMemoryPools() {}

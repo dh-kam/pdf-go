@@ -735,13 +735,25 @@ func imgCoordMungeUpper(v float64) int {
 // canUseAxisAlignedSplashBilinear returns true when the image transform is axis-aligned
 // (no rotation/skew) and upscaling in both dimensions — the condition under which
 // Poppler's Splash uses scaleImageYupXupBilinear.
+// axisAlignedSplashBilinearShearTolerance is the maximum off-axis shear
+// (device pixels over the full image, i.e. |ctm[1]| and |ctm[2]|) accepted by
+// canUseAxisAlignedSplashBilinear. Poppler's Splash::drawImage treats ANY
+// non-zero shear via arbitraryTransformImage (Splash.cc:3562, mat[1]==0 &&
+// mat[2]==0 exact), but for sub-pixel shear the warp is sub-rounding so the
+// result is identical to scaleImage+blit = this axis-aligned origin-phase
+// bilinear path. The strict 1e-6 epsilon mis-routed near-axis-aligned images
+// (e.g. CTM c=-0.000014) to the center-phase xdraw.ApproxBiLinear path, which
+// diverged from Poppler. 1e-3 device px is sub-rounding for any image size.
+const axisAlignedSplashBilinearShearTolerance = 1e-3
+
 func (c *ImageCanvas) canUseAxisAlignedSplashBilinear(
 	p00X, p00Y float64,
 	p10X, p10Y float64,
 	p01X, p01Y float64,
 	srcW, srcH int,
 ) bool {
-	if !nearlyEqual(p10Y, p00Y) || !nearlyEqual(p01X, p00X) {
+	if math.Abs(p10Y-p00Y) > axisAlignedSplashBilinearShearTolerance ||
+		math.Abs(p01X-p00X) > axisAlignedSplashBilinearShearTolerance {
 		return false
 	}
 	if (p10X-p00X) <= 0 || (p01Y-p00Y) <= 0 {

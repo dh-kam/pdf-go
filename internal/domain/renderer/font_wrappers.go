@@ -121,6 +121,29 @@ func unwrapMatrixGlyphBitmapRenderer(font entity.Font) (matrixGlyphBitmapRendere
 	return nil, false
 }
 
+// charCodeWidthFont reports a glyph width by PDF character code (the /Widths
+// array index), independent of glyph-ID resolution. Implemented by
+// widthMappedFont (see GetCharCodeWidth).
+type charCodeWidthFont interface {
+	GetCharCodeWidth(code uint32) (float64, bool)
+}
+
+// unwrapCharCodeWidthFont walks the BaseFont chain to find a font that carries
+// the PDF /Widths array indexed by character code. The outermost wrapper at
+// render time is often a non-metrics wrapper (e.g. fontBBoxOverrideFont) that
+// does not implement GetCharCodeWidth itself, so a direct type assertion would
+// miss it and fall back to a glyph-keyed lookup whose key diverged after a
+// post-metrics source swap (doc_027 "fi"/apostrophe advance drift).
+func unwrapCharCodeWidthFont(font entity.Font) (charCodeWidthFont, bool) {
+	if cw, ok := font.(charCodeWidthFont); ok {
+		return cw, true
+	}
+	if unwrapper, ok := font.(fontBaseUnwrapper); ok {
+		return unwrapCharCodeWidthFont(unwrapper.BaseFont())
+	}
+	return nil, false
+}
+
 // BaseFont returns the underlying font for unwrapping.
 func (f *widthMappedFont) BaseFont() entity.Font { return f.base }
 
@@ -222,44 +245,40 @@ func encodingGlyphNameCandidates(name string) []string {
 	}
 
 	candidates := []string{name}
-	appendAlias := func(alias string) {
-		if alias == "" {
-			return
-		}
-		for _, existing := range candidates {
-			if existing == alias {
-				return
-			}
-		}
+	if alias := encodingGlyphNameAlias(name); alias != "" && alias != name {
 		candidates = append(candidates, alias)
 	}
 
+	return candidates
+}
+
+func encodingGlyphNameAlias(name string) string {
 	switch name {
 	case "quotedblleft", "quotedblright":
-		appendAlias(`"`)
+		return `"`
 	case "quotedblbase":
-		appendAlias(",")
+		return ","
 	case "quoteleft", "quoteright":
-		appendAlias("'")
+		return "'"
 	case "quotesinglbase":
-		appendAlias(",")
+		return ","
 	case "endash", "emdash", "hyphen":
-		appendAlias("-")
+		return "-"
 	case "minus":
-		appendAlias("-")
+		return "-"
 	case "periodcentered":
-		appendAlias(".")
+		return "."
 	case "plusminus":
-		appendAlias("+")
+		return "+"
 	case "reflexsubset":
-		appendAlias("<")
+		return "<"
 	case "fi", "fl":
-		appendAlias("f")
+		return "f"
 	case "ff", "ffi":
-		appendAlias("f")
+		return "f"
 	}
 
-	return candidates
+	return ""
 }
 
 func (f *widthMappedFont) CharCodeToGlyph(code uint32) (uint32, error) {
@@ -294,11 +313,9 @@ func (f *widthMappedFont) GetGlyphWidth(glyph uint32) (float64, error) {
 		if f.forceDefaultWidthForMissing {
 			return f.defaultWidth, nil
 		}
-		if _, err := f.base.GetGlyphWidth(glyph); err == nil {
-			width, err := f.base.GetGlyphWidth(glyph)
-			if err == nil {
-				return width, nil
-			}
+		width, err := f.base.GetGlyphWidth(glyph)
+		if err == nil {
+			return width, nil
 		}
 		return f.defaultWidth, nil
 	}

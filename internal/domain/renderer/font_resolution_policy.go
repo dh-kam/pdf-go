@@ -1,6 +1,7 @@
 package renderer
 
 import (
+	"crypto/sha256"
 	"os"
 	"strings"
 
@@ -76,36 +77,44 @@ func (e *Evaluator) resolveType0FontCandidate(dict *entity.Dict, baseFont string
 		return nil
 	}
 
-	// For CIDFontType2 descendants with Identity CIDToGIDMap, wrap in cidIdentityFont
-	// so text is processed as 2-byte CIDs and char codes map directly to glyph IDs.
-	subtypeName := nameValueForEncoding(descendantDict.Get(entity.Name("Subtype")))
+	// CIDFontType2 descendants must be treated as CID fonts so text is split
+	// into 2-byte CIDs before glyph lookup.
+	subtypeName := nameValueForEncoding(descendantDict.Get(pdfNameSubtype))
 	if subtypeName == "CIDFontType0" {
 		font = e.wrapCIDFontType0CWithCIDToGIDMap(font)
 	}
 	if subtypeName == "CIDFontType2" {
-		cidToGID := descendantDict.Get(entity.Name("CIDToGIDMap"))
+		cidToGID := descendantDict.Get(pdfNameCIDToGIDMap)
 		isIdentity := cidToGID == nil
 		if cidToGIDName, ok := cidToGID.(entity.Name); ok && cidToGIDName.Value() == "Identity" {
 			isIdentity = true
 		}
-		if isIdentity && font != nil && !font.IsCIDFont() {
-			toUnicode := e.parseType0ToUnicodeMap(dict)
-			embeddedFontData, embeddedErr := e.getEmbeddedFontData(descendantDict)
-			preferToUnicodeCMap := shouldUseToUnicodeCMapForCIDIdentity(
-				baseFont,
-				toUnicode,
-				embeddedFontData,
-				embeddedErr,
-			)
-			font = &cidIdentityFont{
-				base:                font,
-				toUnicode:           toUnicode,
-				preferToUnicodeCMap: preferToUnicodeCMap,
+		if font != nil && !font.IsCIDFont() {
+			if cidToGIDMap, ok := e.parseCIDToGIDMap(cidToGID); ok {
+				font = &cidToGIDMappedFont{
+					base:     font,
+					cidToGID: cidToGIDMap,
+				}
+				font = e.applyFontMetricsFromDict(descendantDict, font)
+			} else if isIdentity {
+				toUnicode := e.parseType0ToUnicodeMap(dict)
+				embeddedFontData, embeddedErr := e.getEmbeddedFontData(descendantDict)
+				preferToUnicodeCMap := shouldUseToUnicodeCMapForCIDIdentity(
+					baseFont,
+					toUnicode,
+					embeddedFontData,
+					embeddedErr,
+				)
+				font = &cidIdentityFont{
+					base:                font,
+					toUnicode:           toUnicode,
+					preferToUnicodeCMap: preferToUnicodeCMap,
+				}
+				// Poppler's GfxCIDFont keeps /W and /DW advances keyed by CID.
+				// Apply metrics after the wrapper so CharCodeToGlyph uses the
+				// CID map rather than the embedded TrueType cmap glyph key.
+				font = e.applyFontMetricsFromDict(descendantDict, font)
 			}
-			// Poppler's GfxCIDFont keeps /W and /DW advances keyed by CID.
-			// Apply metrics after the Identity wrapper so CharCodeToGlyph uses
-			// the same CID key, not the embedded TrueType cmap glyph key.
-			font = e.applyFontMetricsFromDict(descendantDict, font)
 		}
 	}
 
@@ -202,7 +211,7 @@ func shouldEnableCIDFontType0CCIDToGIDMapDebug() bool {
 }
 
 func (e *Evaluator) resolveFirstDescendantFontDict(dict *entity.Dict) (*entity.Dict, bool) {
-	descendantFonts, ok := dict.Get(entity.Name("DescendantFonts")).(*entity.Array)
+	descendantFonts, ok := dict.Get(pdfNameDescendantFonts).(*entity.Array)
 	if !ok || descendantFonts.Len() == 0 {
 		return nil, false
 	}
@@ -226,13 +235,41 @@ func (e *Evaluator) resolveFirstDescendantFontDict(dict *entity.Dict) (*entity.D
 	return descendantDict, ok
 }
 
+func (e *Evaluator) parseCIDToGIDMap(obj entity.Object) (map[uint32]uint32, bool) {
+	stream, ok := e.resolveStreamObject(obj)
+	if !ok {
+		return nil, false
+	}
+
+	data, err := stream.Decode()
+	if err != nil || len(data) == 0 {
+		data = stream.RawBytes()
+	}
+	if len(data) < 2 {
+		return nil, false
+	}
+
+	result := make(map[uint32]uint32)
+	for i := 0; i+1 < len(data); i += 2 {
+		gid := uint32(data[i])<<8 | uint32(data[i+1])
+		if gid == 0 {
+			continue
+		}
+		result[uint32(i/2)] = gid
+	}
+	if len(result) == 0 {
+		return nil, false
+	}
+	return result, true
+}
+
 // parseType0ToUnicodeMap parses the ToUnicode CMap stream from a Type0 font dict,
 // returning a CID→Unicode rune mapping used to resolve glyph IDs via the TrueType cmap.
 func (e *Evaluator) parseType0ToUnicodeMap(dict *entity.Dict) map[uint32]rune {
 	if dict == nil {
 		return nil
 	}
-	tuObj := dict.Get(entity.Name("ToUnicode"))
+	tuObj := dict.Get(pdfNameToUnicode)
 	if tuObj == nil {
 		return nil
 	}
@@ -407,8 +444,7 @@ func (e *Evaluator) newEmbeddedType1Font(fontData []byte, fontErr error) entity.
 		}
 	}
 
-	font, err := type1.NewFontFromBytes(fontData)
-	if err == nil {
+	if font := e.embeddedType1FontFromBytes(fontData); font != nil {
 		return font
 	}
 
@@ -419,6 +455,24 @@ func (e *Evaluator) newEmbeddedType1Font(fontData []byte, fontErr error) entity.
 		return cffFont
 	}
 	return nil
+}
+
+func (e *Evaluator) embeddedType1FontFromBytes(fontData []byte) entity.Font {
+	key, cacheable := embeddedFontDataCacheKey(fontData)
+	if cacheable && e.type1FontCache != nil {
+		if cached := e.type1FontCache[key]; cached != nil {
+			return cached
+		}
+	}
+
+	font, err := type1.NewFontFromBytes(fontData)
+	if err != nil {
+		return nil
+	}
+	if cacheable {
+		e.ensureType1FontCache()[key] = font
+	}
+	return font
 }
 
 func (e *Evaluator) newEmbeddedCIDFontType0Candidate(fontData []byte, fontErr error) entity.Font {
@@ -444,7 +498,7 @@ func looksLikeCFFEmbeddedFont(fontData []byte) bool {
 }
 
 func (e *Evaluator) shouldTrustEmbeddedType1CFont(dict *entity.Dict) bool {
-	if dict == nil || nameValueForEncoding(dict.Get(entity.Name("Subtype"))) != "Type1" {
+	if dict == nil || nameValueForEncoding(dict.Get(pdfNameSubtype)) != "Type1" {
 		return false
 	}
 	fontData, err := e.getEmbeddedFontData(dict)
@@ -460,9 +514,30 @@ func (e *Evaluator) newEmbeddedTrueTypeFont(fontData []byte, fontErr error) enti
 		return nil
 	}
 
+	if key, cacheable := embeddedFontDataCacheKey(fontData); cacheable {
+		if e.trueTypeFontCache != nil {
+			if cached := e.trueTypeFontCache[key]; cached != nil {
+				return cached
+			}
+		}
+		font, err := truetype.NewFontFromBytes(fontData)
+		if err != nil {
+			return nil
+		}
+		e.ensureTrueTypeFontCache()[key] = font
+		return font
+	}
+
 	font, err := truetype.NewFontFromBytes(fontData)
 	if err != nil {
 		return nil
 	}
 	return font
+}
+
+func embeddedFontDataCacheKey(fontData []byte) (embeddedFontCacheKey, bool) {
+	if len(fontData) == 0 {
+		return embeddedFontCacheKey{}, false
+	}
+	return embeddedFontCacheKey{sum: sha256.Sum256(fontData), size: len(fontData)}, true
 }

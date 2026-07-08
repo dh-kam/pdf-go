@@ -18,7 +18,7 @@ func (e *Evaluator) applyEmbeddedType1CGlyphSourceFromDict(dict *entity.Dict, fo
 		return font
 	}
 
-	encodingMap := e.resolveSimpleFontEncoding(dict.Get(entity.Name("Encoding")))
+	encodingMap := e.resolveSimpleFontEncoding(dict.Get(pdfNameEncoding))
 	if len(encodingMap) == 0 {
 		encodingMap = e.resolveEmbeddedType1Encoding(dict)
 	}
@@ -26,26 +26,31 @@ func (e *Evaluator) applyEmbeddedType1CGlyphSourceFromDict(dict *entity.Dict, fo
 		return font
 	}
 
-	sourceByCode := map[uint32]glyphSourceOverride{}
-	targetByCode := map[uint32]uint32{}
-	nameByCode := map[uint32]string{}
+	sourceByCode := make(map[uint32]glyphSourceOverride, len(encodingMap))
+	targetByCode := make(map[uint32]uint32, len(encodingMap))
+	nameByCode := make(map[uint32]string, len(encodingMap))
 	for code, name := range encodingMap {
 		targetGlyph, err := font.CharCodeToGlyph(uint32(code))
 		if err != nil {
 			continue
 		}
-		for _, candidate := range encodingGlyphNameCandidates(name) {
-			sourceGlyph, ok := cffFont.GlyphIDByName(candidate)
-			if !ok {
+		candidate := name
+		sourceGlyph, ok := cffFont.GlyphIDByName(candidate)
+		if !ok {
+			candidate = encodingGlyphNameAlias(name)
+			if candidate == "" || candidate == name {
 				continue
 			}
+			sourceGlyph, ok = cffFont.GlyphIDByName(candidate)
+		}
+		if ok {
+			code := uint32(code)
 			sourceByCode[uint32(code)] = glyphSourceOverride{
 				font:  cffFont,
 				glyph: sourceGlyph,
 			}
-			targetByCode[uint32(code)] = targetGlyph
-			nameByCode[uint32(code)] = candidate
-			break
+			targetByCode[code] = targetGlyph
+			nameByCode[code] = candidate
 		}
 	}
 	if len(sourceByCode) == 0 {

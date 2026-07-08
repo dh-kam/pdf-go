@@ -29,7 +29,9 @@ type XPathSeg struct {
 
 // XPath is the device-space, flattened segment list (SplashXPath.h:59-93).
 type XPath struct {
-	Segs []XPathSeg
+	Segs    []XPathSeg
+	pts     []PathPoint
+	adjusts []xpathAdjust
 }
 
 // xpathAdjust mirrors SplashXPathAdjust (SplashXPath.cc:42-49).
@@ -79,23 +81,33 @@ func (x *XPath) Reset(p *Path, matrix [6]float64, flatness float64, closeSubpath
 	if n == 0 {
 		return
 	}
+	if cap(x.Segs) < n {
+		x.Segs = make([]XPathSeg, 0, n)
+	}
 
 	// transform every point through matrix (SplashXPath.cc:77-80).
-	pts := make([]PathPoint, n)
+	if cap(x.pts) < n {
+		x.pts = make([]PathPoint, n)
+	} else {
+		x.pts = x.pts[:n]
+	}
+	pts := x.pts
 	for i := 0; i < n; i++ {
 		px, py := transformPt(matrix, p.pts[i].X, p.pts[i].Y)
 		pts[i] = PathPoint{X: px, Y: py}
 	}
 
 	// build adjust descriptors from hints (SplashXPath.cc:83-149).
-	var adjusts []xpathAdjust
+	adjusts := x.adjusts[:0]
 	if len(p.hints) > 0 {
-		adjusts = make([]xpathAdjust, 0, len(p.hints))
+		if cap(adjusts) < len(p.hints) {
+			adjusts = make([]xpathAdjust, 0, len(p.hints))
+		}
 		ok := true
 		for i := 0; i < len(p.hints); i++ {
 			h := &p.hints[i]
 			if h.Ctrl0+1 >= n || h.Ctrl1+1 >= n {
-				adjusts = nil
+				adjusts = adjusts[:0]
 				ok = false
 				break
 			}
@@ -116,7 +128,7 @@ func (x *XPath) Reset(p *Path, matrix [6]float64, flatness float64, closeSubpath
 				adj.vert = false
 				adj0, adj1 = y0, y2
 			} else {
-				adjusts = nil
+				adjusts = adjusts[:0]
 				ok = false
 				break
 			}
@@ -156,6 +168,7 @@ func (x *XPath) Reset(p *Path, matrix [6]float64, flatness float64, closeSubpath
 			}
 		}
 	}
+	x.adjusts = adjusts[:0]
 
 	// walk path emitting line/curve segments (SplashXPath.cc:172-214).
 	var x0, y0, xsp, ysp float64
@@ -262,9 +275,9 @@ func (x *XPath) addSegment(x0, y0, x1, y1 float64) {
 // flatness2 = flatness*flatness, NOT (flatness*0.5)^2.
 func (x *XPath) addCurve(x0, y0, x1, y1, x2, y2, x3, y3, flatness float64) {
 	const sz = MaxCurveSplits + 1
-	cx := make([]float64, sz*3)
-	cy := make([]float64, sz*3)
-	cNext := make([]int, sz)
+	var cx [sz * 3]float64
+	var cy [sz * 3]float64
+	var cNext [sz]int
 	flatness2 := flatness * flatness
 
 	p1 := 0

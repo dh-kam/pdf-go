@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/zlib"
 	"image"
 	"image/color"
 	"image/png"
@@ -126,6 +127,31 @@ func TestSaveImage(t *testing.T) {
 		_, err := os.Stat(path)
 		require.NoError(t, err)
 	})
+}
+
+func TestEncodePNGCanonicalStreamsFastIDATForSeekableWriter(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 3, 2))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	img.Set(1, 0, color.RGBA{G: 128, A: 255})
+	img.Set(2, 0, color.RGBA{B: 64, A: 255})
+	img.Set(0, 1, color.RGBA{R: 1, G: 2, B: 3, A: 255})
+
+	var fallback bytes.Buffer
+	require.NoError(t, encodePNGCanonicalWithCompression(&fallback, img, zlib.BestSpeed))
+
+	path := filepath.Join(t.TempDir(), "streamed.png")
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	require.NoError(t, encodePNGCanonicalWithCompression(f, img, zlib.BestSpeed))
+	require.NoError(t, f.Close())
+
+	streamed, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, fallback.Bytes(), streamed)
+
+	decoded, err := png.Decode(bytes.NewReader(streamed))
+	require.NoError(t, err)
+	assert.Equal(t, img.Bounds(), decoded.Bounds())
 }
 
 func TestNormalizeImageFormat(t *testing.T) {

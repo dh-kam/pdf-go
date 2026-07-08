@@ -23,6 +23,10 @@ type Predictor interface {
 	Decode(data []byte, columns int, colors int, bitsPerComponent int) ([]byte, error)
 }
 
+type inPlacePredictor interface {
+	DecodeInPlace(data []byte, columns int, colors int, bitsPerComponent int) ([]byte, error)
+}
+
 // DecodeParams represents predictor decode parameters from DecodeParms dictionary.
 type DecodeParams struct {
 	Predictor        int // Predictor type (1, 2, 10-15)
@@ -47,28 +51,28 @@ func GetDecodeParams(params *entity.Dict) (*DecodeParams, error) {
 	}
 
 	// Extract Predictor
-	if val := params.Get(entity.Name("Predictor")); val != nil {
+	if val := params.Get(streamNamePredictor); val != nil {
 		if integer, ok := val.(*entity.Integer); ok {
 			dp.Predictor = int(integer.Value())
 		}
 	}
 
 	// Extract Columns
-	if val := params.Get(entity.Name("Columns")); val != nil {
+	if val := params.Get(streamNameColumns); val != nil {
 		if integer, ok := val.(*entity.Integer); ok {
 			dp.Columns = int(integer.Value())
 		}
 	}
 
 	// Extract Colors
-	if val := params.Get(entity.Name("Colors")); val != nil {
+	if val := params.Get(streamNameColors); val != nil {
 		if integer, ok := val.(*entity.Integer); ok {
 			dp.Colors = int(integer.Value())
 		}
 	}
 
 	// Extract BitsPerComponent
-	if val := params.Get(entity.Name("BitsPerComponent")); val != nil {
+	if val := params.Get(streamNameBitsPerComponent); val != nil {
 		if integer, ok := val.(*entity.Integer); ok {
 			dp.BitsPerComponent = int(integer.Value())
 		}
@@ -124,7 +128,13 @@ func (p *TIFFPredictor) Decode(data []byte, columns int, colors int, bitsPerComp
 	if len(data) == 0 {
 		return data, nil
 	}
+	result := make([]byte, len(data))
+	copy(result, data)
+	return p.DecodeInPlace(result, columns, colors, bitsPerComponent)
+}
 
+// DecodeInPlace decodes TIFF predictor 2 in the provided buffer.
+func (p *TIFFPredictor) DecodeInPlace(data []byte, columns int, colors int, bitsPerComponent int) ([]byte, error) {
 	// TIFF predictor works on bytes, so we need to calculate bytes per row
 	// For TIFF predictor, each sample is assumed to be a full byte
 	bytesPerRow := columns * colors
@@ -134,9 +144,6 @@ func (p *TIFFPredictor) Decode(data []byte, columns int, colors int, bitsPerComp
 			ErrInvalidDataSize, len(data), bytesPerRow)
 	}
 
-	result := make([]byte, len(data))
-	copy(result, data)
-
 	// Apply horizontal differencing reversal
 	// Each byte is decoded as: original[i] = encoded[i] + original[i-1]
 	// The first byte of each component sample is not predicted
@@ -144,11 +151,11 @@ func (p *TIFFPredictor) Decode(data []byte, columns int, colors int, bitsPerComp
 	for row := 0; row < rows; row++ {
 		rowOffset := row * bytesPerRow
 		for col := 1; col < bytesPerRow; col++ {
-			result[rowOffset+col] += result[rowOffset+col-1]
+			data[rowOffset+col] += data[rowOffset+col-1]
 		}
 	}
 
-	return result, nil
+	return data, nil
 }
 
 // PNGPredictor implements PNG prediction (predictors 10-15).
@@ -162,7 +169,13 @@ func (p *PNGPredictor) Decode(data []byte, columns int, colors int, bitsPerCompo
 	if len(data) == 0 {
 		return data, nil
 	}
+	owned := make([]byte, len(data))
+	copy(owned, data)
+	return p.DecodeInPlace(owned, columns, colors, bitsPerComponent)
+}
 
+// DecodeInPlace decodes PNG predictor rows in the provided buffer.
+func (p *PNGPredictor) DecodeInPlace(data []byte, columns int, colors int, bitsPerComponent int) ([]byte, error) {
 	// PDF PNG predictors use the PNG "bytes per pixel" distance for
 	// Sub/Average/Paeth left references, while rows remain bit-packed.
 	bytesPerPixel := (colors*bitsPerComponent + 7) / 8
@@ -180,7 +193,7 @@ func (p *PNGPredictor) Decode(data []byte, columns int, colors int, bitsPerCompo
 	}
 
 	rows := len(data) / totalRowSize
-	result := make([]byte, rows*bytesPerRow)
+	resultLen := rows * bytesPerRow
 
 	for row := 0; row < rows; row++ {
 		rowOffset := row * totalRowSize
@@ -188,25 +201,26 @@ func (p *PNGPredictor) Decode(data []byte, columns int, colors int, bitsPerCompo
 		resultOffset := row * bytesPerRow
 		var prevRow []byte
 		if row > 0 {
-			prevRow = result[resultOffset-bytesPerRow : resultOffset]
+			prevRow = data[resultOffset-bytesPerRow : resultOffset]
 		}
 
 		filterByte := data[rowOffset]
 		rowData = data[rowOffset+1 : rowOffset+1+bytesPerRow]
+		result := data[resultOffset : resultOffset+bytesPerRow]
 		algorithm := int(filterByte)
 
 		var err error
 		switch algorithm {
 		case 0: // None
-			err = p.decodeNone(rowData, result[resultOffset:resultOffset+bytesPerRow])
+			err = p.decodeNone(rowData, result)
 		case 1: // Sub
-			err = p.decodeSub(rowData, result[resultOffset:resultOffset+bytesPerRow], bytesPerPixel)
+			err = p.decodeSub(rowData, result, bytesPerPixel)
 		case 2: // Up
-			err = p.decodeUp(rowData, result[resultOffset:resultOffset+bytesPerRow], prevRow)
+			err = p.decodeUp(rowData, result, prevRow)
 		case 3: // Average
-			err = p.decodeAverage(rowData, result[resultOffset:resultOffset+bytesPerRow], bytesPerPixel, prevRow)
+			err = p.decodeAverage(rowData, result, bytesPerPixel, prevRow)
 		case 4: // Paeth
-			err = p.decodePaeth(rowData, result[resultOffset:resultOffset+bytesPerRow], bytesPerPixel, prevRow)
+			err = p.decodePaeth(rowData, result, bytesPerPixel, prevRow)
 		default:
 			return nil, fmt.Errorf("%w: unknown PNG filter type %d", ErrInvalidPredictor, algorithm)
 		}
@@ -216,7 +230,7 @@ func (p *PNGPredictor) Decode(data []byte, columns int, colors int, bitsPerCompo
 		}
 	}
 
-	return result, nil
+	return data[:resultLen], nil
 }
 
 // decodeNone implements PNG None filter (filter type 0).
@@ -359,6 +373,27 @@ func ApplyPredictor(data []byte, params *entity.Dict) ([]byte, error) {
 		return nil, err
 	}
 
+	return predictor.Decode(data, decodeParams.Columns, decodeParams.Colors, decodeParams.BitsPerComponent)
+}
+
+// ApplyPredictorInPlace applies the predictor to a caller-owned decoded buffer.
+func ApplyPredictorInPlace(data []byte, params *entity.Dict) ([]byte, error) {
+	decodeParams, err := GetDecodeParams(params)
+	if err != nil {
+		return nil, err
+	}
+
+	if decodeParams.Predictor == 1 {
+		return data, nil
+	}
+
+	predictor, err := GetPredictor(decodeParams.Predictor)
+	if err != nil {
+		return nil, err
+	}
+	if inPlace, ok := predictor.(inPlacePredictor); ok {
+		return inPlace.DecodeInPlace(data, decodeParams.Columns, decodeParams.Colors, decodeParams.BitsPerComponent)
+	}
 	return predictor.Decode(data, decodeParams.Columns, decodeParams.Colors, decodeParams.BitsPerComponent)
 }
 

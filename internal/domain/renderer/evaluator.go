@@ -32,6 +32,10 @@ var gsPool = sync.Pool{
 	New: func() interface{} { return new(GraphicsState) },
 }
 
+var graphicsStatePool = sync.Pool{
+	New: func() interface{} { return new(graphics.State) },
+}
+
 // Evaluator evaluates PDF content streams and builds an operator list.
 type Evaluator struct {
 	xref                 entity.XRef
@@ -42,6 +46,7 @@ type Evaluator struct {
 	textPlacement        textPlacement
 	textRenderer         textRenderer
 	graphics             *GraphicsState
+	type3PendingTemp     *type3PendingTemp
 	initialTransform     [6]float64
 	textMatrix           [6]float64
 	textLineMatrix       [6]float64
@@ -57,17 +62,26 @@ type Evaluator struct {
 	inlineImageDict      *entity.Dict
 	textBuffer           strings.Builder
 	operators            []Operator
+	recordOperators      bool
 	stateStack           []*GraphicsState
 	inlineImageData      []byte
 	formOperatorCache    map[*entity.Stream][]Operator
+	formStreamUseCount   map[*entity.Stream]int
 	charProcCache        map[*entity.Stream][]Operator
+	decodedStreamCache   map[*entity.Stream][]byte
+	softMaskDetailsCache map[*entity.Stream]softMaskDetails
+	rawRGBMatteCache     map[packedRawRGBMatteImageCacheKey]stdimage.Image
+	imageDecoder         *image.Decoder
 	fontCache            map[*entity.Dict]entity.Font
+	type1FontCache       map[embeddedFontCacheKey]entity.Font
+	trueTypeFontCache    map[embeddedFontCacheKey]entity.Font
 	sharedFormCache      FormOperatorCache
 	imageSamplingMode    string
 	debugDocumentID      string
 	debugPageNumber      int
 	debugImageSampling   bool
 	debugPath            []string
+	textCodeUnitScratch  []textCodeUnit
 	inInlineImage        bool
 	textCurrentValid     bool
 	textUserCurrentValid bool
@@ -75,10 +89,18 @@ type Evaluator struct {
 
 type textCodeUnit struct {
 	code uint32
-	raw  []byte
+	raw  string
+}
+
+type embeddedFontCacheKey struct {
+	sum  [32]byte
+	size int
 }
 
 var deviceCMYKColorSpace = colorspace.NewDeviceCMYK()
+
+// Keep repeated medium streams cached during one page render, but avoid retaining page-sized decoded images.
+const maxCachedDecodedStreamBytes = 2 << 20
 
 // NewEvaluator creates a new content stream evaluator.
 func NewEvaluator(xref entity.XRef) *Evaluator {
@@ -87,21 +109,107 @@ func NewEvaluator(xref entity.XRef) *Evaluator {
 		xref:              xref,
 		fontResolver:      defaultFontCandidateResolver{},
 		fontFallback:      defaultFontFallbackResolver{},
-		textPolicy:        defaultTextRenderPolicy{},
+		textPolicy:        newDefaultTextRenderPolicy(),
 		textPlacement:     defaultTextPlacement{},
 		textRenderer:      defaultTextRenderer{},
-		operators:         make([]Operator, 0, 128),
-		stateStack:        make([]*GraphicsState, 0, 16),
+		recordOperators:   true,
 		graphics:          NewGraphicsState(),
 		initialTransform:  identity,
 		textMatrix:        identity,
 		textLineMatrix:    identity,
 		textBaseMatrix:    identity,
-		formOperatorCache: make(map[*entity.Stream][]Operator),
-		charProcCache:     make(map[*entity.Stream][]Operator),
-		fontCache:         make(map[*entity.Dict]entity.Font),
 		imageSamplingMode: ImageSamplingModeLegacy,
 	}
+}
+
+func (e *Evaluator) ensureFormOperatorCache() map[*entity.Stream][]Operator {
+	if e.formOperatorCache == nil {
+		e.formOperatorCache = make(map[*entity.Stream][]Operator)
+	}
+	return e.formOperatorCache
+}
+
+func (e *Evaluator) ensureCharProcCache() map[*entity.Stream][]Operator {
+	if e.charProcCache == nil {
+		e.charProcCache = make(map[*entity.Stream][]Operator)
+	}
+	return e.charProcCache
+}
+
+func (e *Evaluator) ensureDecodedStreamCache() map[*entity.Stream][]byte {
+	if e.decodedStreamCache == nil {
+		e.decodedStreamCache = make(map[*entity.Stream][]byte)
+	}
+	return e.decodedStreamCache
+}
+
+func (e *Evaluator) ensureSoftMaskDetailsCache() map[*entity.Stream]softMaskDetails {
+	if e.softMaskDetailsCache == nil {
+		e.softMaskDetailsCache = make(map[*entity.Stream]softMaskDetails)
+	}
+	return e.softMaskDetailsCache
+}
+
+func (e *Evaluator) ensureRawRGBMatteCache() map[packedRawRGBMatteImageCacheKey]stdimage.Image {
+	if e.rawRGBMatteCache == nil {
+		e.rawRGBMatteCache = make(map[packedRawRGBMatteImageCacheKey]stdimage.Image)
+	}
+	return e.rawRGBMatteCache
+}
+
+func (e *Evaluator) ensureFontCache() map[*entity.Dict]entity.Font {
+	if e.fontCache == nil {
+		e.fontCache = make(map[*entity.Dict]entity.Font)
+	}
+	return e.fontCache
+}
+
+func (e *Evaluator) ensureType1FontCache() map[embeddedFontCacheKey]entity.Font {
+	if e.type1FontCache == nil {
+		e.type1FontCache = make(map[embeddedFontCacheKey]entity.Font)
+	}
+	return e.type1FontCache
+}
+
+func (e *Evaluator) ensureTrueTypeFontCache() map[embeddedFontCacheKey]entity.Font {
+	if e.trueTypeFontCache == nil {
+		e.trueTypeFontCache = make(map[embeddedFontCacheKey]entity.Font)
+	}
+	return e.trueTypeFontCache
+}
+
+func (e *Evaluator) decodeEntityStream(entityStream *entity.Stream) ([]byte, error) {
+	return e.decodeEntityStreamWithSizeHint(entityStream, 0)
+}
+
+func (e *Evaluator) decodeImageData(data *domainimage.ImageData) (domainimage.Image, error) {
+	if e.imageDecoder == nil {
+		e.imageDecoder = image.NewDecoder()
+	}
+	return e.imageDecoder.Decode(data)
+}
+
+func (e *Evaluator) decodeEntityStreamWithSizeHint(entityStream *entity.Stream, sizeHint int) ([]byte, error) {
+	if entityStream == nil {
+		return nil, errors.Invalid("decode_stream", fmt.Errorf("nil stream"))
+	}
+	if e.decodedStreamCache != nil {
+		if data, ok := e.decodedStreamCache[entityStream]; ok {
+			return data, nil
+		}
+	}
+	infra := stream.NewFromEntity(entityStream)
+	if sizeHint > 0 {
+		infra.SetDecodeSizeHint(sizeHint)
+	}
+	decoded, err := infra.Decode()
+	if err != nil {
+		return nil, err
+	}
+	if len(decoded) <= maxCachedDecodedStreamBytes {
+		e.ensureDecodedStreamCache()[entityStream] = decoded
+	}
+	return decoded, nil
 }
 
 // ColorSpace represents a color with its color space.
@@ -116,10 +224,17 @@ type Color struct {
 
 // Operator represents a PDF graphics operator.
 type Operator struct {
-	Resources  *entity.Dict
-	Opcode     string
-	Operands   []entity.Object
-	DebugIndex int
+	Opcode      string
+	Operands    []entity.Object
+	DebugIndex  int
+	InlineImage *InlineImageOperator
+}
+
+// InlineImageOperator stores the uncommon BI image payload out-of-line so the
+// common cached Operator stays compact on large Form streams.
+type InlineImageOperator struct {
+	Dict *entity.Dict
+	Data []byte
 }
 
 type debugPaintContextCanvas interface {
@@ -130,31 +245,37 @@ type popplerOrderStrokeCanvas interface {
 	StrokePathWithCTM(elements []PathElement, ctm [6]float64, lineWidth float64, dash []float64, phase float64)
 }
 
+type popplerOrderStrokePathCanvas interface {
+	StrokePathObjectWithCTM(path *Path, ctm [6]float64, lineWidth float64, dash []float64, phase float64)
+}
+
 type popplerOrderFillCanvas interface {
 	FillPathWithCTM(elements []PathElement, ctm [6]float64, evenOdd bool)
 }
 
-var contentOperatorKeywords = map[string]struct{}{
-	// Graphics state / compatibility
-	"q": {}, "Q": {}, "cm": {}, "w": {}, "J": {}, "j": {}, "M": {}, "d": {}, "ri": {}, "i": {}, "gs": {}, "BX": {}, "EX": {},
-	// Marked content operators are rendering no-ops, but they must be parsed
-	// as operators so following appearance-stream text operators stay aligned.
-	"BMC": {}, "BDC": {}, "EMC": {}, "MP": {}, "DP": {},
-	// Path construction / painting / clipping
-	"m": {}, "l": {}, "c": {}, "v": {}, "y": {}, "h": {}, "re": {},
-	"S": {}, "s": {}, "f": {}, "F": {}, "f*": {}, "B": {}, "B*": {}, "b": {}, "b*": {}, "n": {}, "W": {}, "W*": {},
-	// Color / pattern / shading
-	"CS": {}, "cs": {}, "SC": {}, "SCN": {}, "sc": {}, "scn": {}, "G": {}, "g": {}, "RG": {}, "rg": {}, "K": {}, "k": {}, "sh": {},
-	// Text
-	"BT": {}, "ET": {}, "Tc": {}, "Tw": {}, "Tz": {}, "TL": {}, "Tf": {}, "Tr": {}, "Ts": {},
-	"Td": {}, "TD": {}, "Tm": {}, "T*": {}, "Tj": {}, "TJ": {}, "'": {}, "\"": {},
-	// XObject / inline image
-	"Do": {}, "BI": {}, "ID": {}, "EI": {}, "d0": {}, "d1": {},
+type popplerOrderFillPathCanvas interface {
+	FillPathObjectWithCTM(path *Path, ctm [6]float64, evenOdd bool)
 }
 
 func isContentOperatorKeyword(keyword string) bool {
-	_, ok := contentOperatorKeywords[keyword]
-	return ok
+	switch len(keyword) {
+	case 1:
+		switch keyword[0] {
+		case '"', '\'', 'B', 'F', 'G', 'J', 'K', 'M', 'Q', 'S', 'W', 'b', 'c', 'd', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'q', 's', 'v', 'w', 'y':
+			return true
+		}
+	case 2:
+		switch keyword {
+		case "B*", "BI", "BT", "BX", "CS", "DP", "Do", "EI", "ET", "EX", "ID", "MP", "RG", "SC", "TD", "TJ", "TL", "T*", "Tc", "Td", "Tf", "Tj", "Tm", "Tr", "Ts", "Tw", "Tz", "W*", "b*", "cm", "cs", "d0", "d1", "f*", "gs", "re", "rg", "ri", "sc", "sh":
+			return true
+		}
+	case 3:
+		switch keyword {
+		case "BDC", "BMC", "EMC", "SCN", "scn":
+			return true
+		}
+	}
+	return false
 }
 
 // Evaluate evaluates the content stream for a page.
@@ -164,11 +285,13 @@ func (e *Evaluator) Evaluate(contents []entity.Object) error {
 		if !ok {
 			continue
 		}
-		popDebugPath := e.pushDebugPath(fmt.Sprintf("page.contents[%d]", i))
+		popDebugPath := func() {}
+		if debugRenderContextEnabled() {
+			popDebugPath = e.pushDebugPath(fmt.Sprintf("page.contents[%d]", i))
+		}
 
-		// Convert entity.Stream to infrastructure/stream.Stream for proper filter decoding
-		infraStream := stream.NewFromEntity(entityStream)
-		data, err := infraStream.Decode()
+		// Convert entity.Stream to decoded bytes, reusing repeated stream decodes within the page.
+		data, err := e.decodeEntityStream(entityStream)
 		if err != nil {
 			// Some malformed/encrypted PDFs contain stream bytes that fail declared filter decoding.
 			// Fall back to raw stream bytes as best-effort, and skip this stream on failure.
@@ -193,17 +316,22 @@ func (e *Evaluator) Evaluate(contents []entity.Object) error {
 
 // parseOperators parses PDF operators from binary stream data.
 func (e *Evaluator) parseOperators(data []byte) error {
-	return e.parseOperatorsWithHandler(data, func(op Operator) {
-		e.operators = append(e.operators, op)
+	if e.recordOperators && e.operators == nil {
+		e.operators = make([]Operator, 0, operatorCapacityHint(data))
+	}
+	return e.parseOperatorsWithHandlerMode(data, func(op Operator) {
+		if e.recordOperators {
+			e.operators = append(e.operators, op)
+		}
 		if err := e.executeOperator(op); err != nil {
 			// Keep rendering even if a single operator is malformed.
 			return
 		}
-	})
+	}, e.recordOperators)
 }
 
 func (e *Evaluator) parseOperatorsOnly(data []byte) ([]Operator, error) {
-	ops := make([]Operator, 0, 64)
+	ops := make([]Operator, 0, operatorCapacityHint(data))
 	err := e.parseOperatorsWithHandler(data, func(op Operator) {
 		ops = append(ops, op)
 	})
@@ -213,9 +341,261 @@ func (e *Evaluator) parseOperatorsOnly(data []byte) ([]Operator, error) {
 	return ops, nil
 }
 
+func operatorCapacityHint(data []byte) int {
+	const (
+		minOperatorCapacity = 64
+		maxOperatorCapacity = 262144
+		bytesPerOperator    = 8
+	)
+	if estimated := estimateContentOperatorCount(data); estimated > 0 {
+		hint := estimated + operatorCapacitySlack(estimated)
+		if hint < minOperatorCapacity {
+			return minOperatorCapacity
+		}
+		if hint > maxOperatorCapacity {
+			return maxOperatorCapacity
+		}
+		return hint
+	}
+	dataLen := len(data)
+	if dataLen <= 0 {
+		return minOperatorCapacity
+	}
+	hint := dataLen / bytesPerOperator
+	if hint < minOperatorCapacity {
+		return minOperatorCapacity
+	}
+	if hint > maxOperatorCapacity {
+		return maxOperatorCapacity
+	}
+	return hint
+}
+
+func operatorCapacitySlack(estimated int) int {
+	switch {
+	case estimated >= 4096:
+		return estimated/128 + 128
+	case estimated >= 1024:
+		return estimated/16 + 64
+	default:
+		return estimated/4 + 64
+	}
+}
+
+func estimateContentOperatorCount(data []byte) int {
+	count := 0
+	for i := 0; i < len(data); {
+		i = skipContentWhitespace(data, i)
+		if i >= len(data) {
+			break
+		}
+
+		switch data[i] {
+		case '%':
+			i = skipContentComment(data, i+1)
+			continue
+		case '(':
+			i = skipContentLiteralString(data, i+1)
+			continue
+		case '<':
+			if i+1 < len(data) && data[i+1] == '<' {
+				i += 2
+				continue
+			}
+			i = skipContentHexString(data, i+1)
+			continue
+		case '/':
+			i = skipContentRegularToken(data, i+1)
+			continue
+		}
+
+		if isContentDelimiter(data[i]) {
+			i++
+			continue
+		}
+
+		start := i
+		i = skipContentRegularToken(data, i)
+		token := data[start:i]
+		switch contentOperatorTokenKind(token) {
+		case contentOperatorTokenNormal:
+			count++
+		case contentOperatorTokenInlineImage:
+			count++
+			i = skipInlineImageDataForOperatorHint(data, i)
+		}
+	}
+	return count
+}
+
+const (
+	contentOperatorTokenNone = iota
+	contentOperatorTokenNormal
+	contentOperatorTokenInlineImage
+)
+
+func contentOperatorTokenKind(token []byte) int {
+	switch len(token) {
+	case 1:
+		switch token[0] {
+		case '"', '\'', 'B', 'F', 'G', 'J', 'K', 'M', 'Q', 'S', 'W', 'b', 'c', 'd', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'q', 's', 'v', 'w', 'y':
+			return contentOperatorTokenNormal
+		}
+	case 2:
+		switch string(token) {
+		case "BI":
+			return contentOperatorTokenInlineImage
+		case "BT", "BX", "CS", "DP", "Do", "EI", "ET", "EX", "ID", "MP", "RG", "SC", "TD", "TJ", "TL", "Tc", "Td", "Tf", "Tj", "Tm", "Tr", "Ts", "Tw", "Tz", "W*", "b*", "cm", "cs", "d0", "d1", "f*", "re", "rg", "ri", "sc", "sh":
+			return contentOperatorTokenNormal
+		}
+	case 3:
+		switch string(token) {
+		case "BDC", "BMC", "EMC", "SCN", "scn":
+			return contentOperatorTokenNormal
+		}
+	}
+	return contentOperatorTokenNone
+}
+
+func skipInlineImageDataForOperatorHint(data []byte, start int) int {
+	idEnd := findContentOperatorTokenEnd(data, start, []byte("ID"))
+	if idEnd < 0 {
+		return len(data)
+	}
+	imageStart := skipInlineImageLeadingWhitespace(data, idEnd)
+	end, err := findInlineImageEndOffset(data, imageStart)
+	if err != nil {
+		return len(data)
+	}
+	return end + 2
+}
+
+func findContentOperatorTokenEnd(data []byte, start int, want []byte) int {
+	for i := start; i < len(data); {
+		i = skipContentWhitespace(data, i)
+		if i >= len(data) {
+			return -1
+		}
+		switch data[i] {
+		case '%':
+			i = skipContentComment(data, i+1)
+			continue
+		case '(':
+			i = skipContentLiteralString(data, i+1)
+			continue
+		case '<':
+			if i+1 < len(data) && data[i+1] == '<' {
+				i += 2
+				continue
+			}
+			i = skipContentHexString(data, i+1)
+			continue
+		case '/':
+			i = skipContentRegularToken(data, i+1)
+			continue
+		}
+		if isContentDelimiter(data[i]) {
+			i++
+			continue
+		}
+		tokenStart := i
+		i = skipContentRegularToken(data, i)
+		if contentTokenEqual(data[tokenStart:i], want) {
+			return i
+		}
+	}
+	return -1
+}
+
+func contentTokenEqual(got []byte, want []byte) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func skipContentWhitespace(data []byte, i int) int {
+	for i < len(data) && isContentWhitespace(data[i]) {
+		i++
+	}
+	return i
+}
+
+func skipContentComment(data []byte, i int) int {
+	for i < len(data) && data[i] != '\n' && data[i] != '\r' {
+		i++
+	}
+	return i
+}
+
+func skipContentLiteralString(data []byte, i int) int {
+	depth := 1
+	for i < len(data) && depth > 0 {
+		switch data[i] {
+		case '\\':
+			i += 2
+			continue
+		case '(':
+			depth++
+		case ')':
+			depth--
+		}
+		i++
+	}
+	return i
+}
+
+func skipContentHexString(data []byte, i int) int {
+	for i < len(data) && data[i] != '>' {
+		i++
+	}
+	if i < len(data) {
+		i++
+	}
+	return i
+}
+
+func skipContentRegularToken(data []byte, i int) int {
+	for i < len(data) && !isContentWhitespace(data[i]) && !isContentDelimiter(data[i]) {
+		i++
+	}
+	return i
+}
+
+func isContentWhitespace(b byte) bool {
+	switch b {
+	case 0x00, 0x09, 0x0A, 0x0C, 0x0D, 0x20:
+		return true
+	default:
+		return false
+	}
+}
+
+func isContentDelimiter(b byte) bool {
+	switch b {
+	case '(', ')', '<', '>', '[', ']', '{', '}', '/', '%':
+		return true
+	default:
+		return false
+	}
+}
+
 func (e *Evaluator) parseOperatorsWithHandler(data []byte, handler func(op Operator)) error {
+	return e.parseOperatorsWithHandlerMode(data, handler, true)
+}
+
+func (e *Evaluator) parseOperatorsForImmediateExecution(data []byte, handler func(op Operator)) error {
+	return e.parseOperatorsWithHandlerMode(data, handler, false)
+}
+
+func (e *Evaluator) parseOperatorsWithHandlerMode(data []byte, handler func(op Operator), copyOperands bool) error {
 	// Create lexer and parser for the content stream
-	lexer := parser.NewLexerBytes(data)
+	lexer := parser.NewLexerBytesNoNumberValue(data)
 	p := parser.NewParser(lexer, e.xref)
 	operands := make([]entity.Object, 0, 8)
 	opIndex := 0
@@ -259,26 +639,43 @@ func (e *Evaluator) parseOperatorsWithHandler(data []byte, handler func(op Opera
 					return err
 				}
 				operands = operands[:0]
-				// Parse BI/ID/EI inline image block and continue remaining operators in-place.
-				_ = e.parseInlineImageFromLexer(lexer, p, data)
-				return nil
+				op, next, ok, err := e.parseInlineImageOperatorFromLexer(lexer, p, data)
+				if err != nil {
+					return err
+				}
+				if ok {
+					op.DebugIndex = opIndex
+					opIndex++
+					handler(op)
+				}
+				if next >= len(data) {
+					return nil
+				}
+				// Continue the same handler after EI so cached/preparsed streams
+				// keep trailing operators such as the Q that balances a BI-time q.
+				data = data[next:]
+				lexer = parser.NewLexerBytesNoNumberValue(data)
+				p = parser.NewParser(lexer, e.xref)
+				continue
 			}
 
 			_, err := lexer.NextToken()
 			if err != nil {
 				return err
 			}
-			opOperands := append([]entity.Object(nil), operands...)
+			opOperands := operands
+			if copyOperands {
+				opOperands = append([]entity.Object(nil), operands...)
+			}
 			// Create operator
 			op := Operator{
 				Opcode:     token.Value,
 				Operands:   opOperands,
-				Resources:  e.resources,
 				DebugIndex: opIndex,
 			}
 			opIndex++
-			operands = operands[:0]
 			handler(op)
+			operands = operands[:0]
 			continue
 		}
 
@@ -300,9 +697,22 @@ func (e *Evaluator) parseOperatorsWithHandler(data []byte, handler func(op Opera
 }
 
 func (e *Evaluator) parseInlineImageFromLexer(lexer *parser.Lexer, p *parser.Parser, data []byte) error {
-	if err := e.beginInlineImage(); err != nil {
+	op, next, ok, err := e.parseInlineImageOperatorFromLexer(lexer, p, data)
+	if err != nil {
+		return err
+	}
+	if !ok {
 		return nil
 	}
+	if err := e.executeInlineImageOperator(op); err != nil {
+		return e.skipInlineImageAndContinue(data, next)
+	}
+	return e.parseOperators(data[next:])
+}
+
+func (e *Evaluator) parseInlineImageOperatorFromLexer(lexer *parser.Lexer, p *parser.Parser, data []byte) (Operator, int, bool, error) {
+	op := Operator{Opcode: "BI"}
+	dict := entity.NewDict()
 
 	searchFrom := lexer.Pos()
 
@@ -310,16 +720,19 @@ func (e *Evaluator) parseInlineImageFromLexer(lexer *parser.Lexer, p *parser.Par
 	for {
 		tok, err := lexer.Peek()
 		if err != nil {
-			return e.skipInlineImageAndContinue(data, searchFrom)
+			next := e.findInlineImageRecoveryOffset(data, searchFrom)
+			return op, next, false, nil
 		}
 
 		if tok.Type == parser.TokenEOF {
-			return e.skipInlineImageAndContinue(data, searchFrom)
+			next := e.findInlineImageRecoveryOffset(data, searchFrom)
+			return op, next, false, nil
 		}
 
 		if tok.Type == parser.TokenKeyword && tok.Value == "ID" {
 			if _, err := lexer.NextToken(); err != nil {
-				return e.skipInlineImageAndContinue(data, searchFrom)
+				next := e.findInlineImageRecoveryOffset(data, searchFrom)
+				return op, next, false, nil
 			}
 			searchFrom = lexer.Pos()
 			break
@@ -327,45 +740,64 @@ func (e *Evaluator) parseInlineImageFromLexer(lexer *parser.Lexer, p *parser.Par
 
 		keyToken, err := lexer.NextToken()
 		if err != nil {
-			return e.skipInlineImageAndContinue(data, searchFrom)
+			next := e.findInlineImageRecoveryOffset(data, searchFrom)
+			return op, next, false, nil
 		}
 		if keyToken.Type != parser.TokenKeyword {
-			return e.skipInlineImageAndContinue(data, searchFrom)
+			next := e.findInlineImageRecoveryOffset(data, searchFrom)
+			return op, next, false, nil
 		}
 
 		key := "/" + keyToken.Value
 		value, err := p.ParseObject()
 		if err != nil {
-			return e.skipInlineImageAndContinue(data, searchFrom)
+			next := e.findInlineImageRecoveryOffset(data, searchFrom)
+			return op, next, false, nil
 		}
-		e.inlineImageDict.Set(entity.Name(key), value)
+		dict.Set(entity.Name(key), value)
 	}
 
 	// Parse image data bytes until EI token boundary.
 	start := searchFrom
 	if start < 0 || start >= len(data) {
-		return e.skipInlineImageAndContinue(data, searchFrom)
+		next := e.findInlineImageRecoveryOffset(data, searchFrom)
+		return op, next, false, nil
 	}
 
 	start = skipInlineImageLeadingWhitespace(data, start)
 	if start >= len(data) {
-		return e.skipInlineImageAndContinue(data, searchFrom)
+		next := e.findInlineImageRecoveryOffset(data, searchFrom)
+		return op, next, false, nil
 	}
 
 	end, err := findInlineImageEndOffset(data, start)
 	if err != nil {
-		return e.skipInlineImageAndContinue(data, searchFrom)
+		next := e.findInlineImageRecoveryOffset(data, searchFrom)
+		return op, next, false, nil
 	}
 
-	e.inlineImageData = make([]byte, end-start)
-	copy(e.inlineImageData, data[start:end])
+	imageData := make([]byte, end-start)
+	copy(imageData, data[start:end])
 
-	if err := e.endInlineImage(); err != nil {
-		return e.skipInlineImageAndContinue(data, end+2)
+	op.InlineImage = &InlineImageOperator{
+		Dict: dict,
+		Data: imageData,
 	}
+	return op, end + 2, true, nil
+}
 
-	// Continue parsing remaining operators after EI.
-	return e.parseOperators(data[end+2:])
+func (e *Evaluator) findInlineImageRecoveryOffset(data []byte, searchFrom int) int {
+	if searchFrom < 0 {
+		searchFrom = 0
+	}
+	if searchFrom >= len(data) {
+		return len(data)
+	}
+	end, err := findInlineImageEndOffset(data, searchFrom)
+	if err != nil {
+		return len(data)
+	}
+	return end + 2
 }
 
 func (e *Evaluator) skipInlineImageAndContinue(data []byte, searchFrom int) error {
@@ -438,24 +870,7 @@ func findInlineImageEndOffset(data []byte, start int) (int, error) {
 }
 
 func (e *Evaluator) executeCachedOperators(ops []Operator) {
-	if len(ops) == 0 {
-		return
-	}
-	// Bulk-extend the operators slice once to avoid repeated growslice.
-	n := len(ops)
-	base := len(e.operators)
-	if cap(e.operators) < base+n {
-		newCap := base + n
-		if newCap < 2*cap(e.operators) {
-			newCap = 2 * cap(e.operators)
-		}
-		grown := make([]Operator, base, newCap)
-		copy(grown, e.operators[:base])
-		e.operators = grown
-	}
-	e.operators = append(e.operators[:base], make([]Operator, n)...)
-	for i, op := range ops {
-		e.operators[base+i] = op
+	for _, op := range ops {
 		if err := e.executeOperator(op); err != nil {
 			continue
 		}
@@ -520,23 +935,23 @@ func (e *Evaluator) debugOperatorResource(op Operator) string {
 	switch op.Opcode {
 	case "Do":
 		if name := nameValue(op.Operands[0]); name != "" {
-			return e.describeDebugResource(entity.Name("XObject"), entity.Name(name), "XObject:"+name)
+			return e.describeDebugResource(pdfNameXObject, entity.Name(name), "XObject:"+name)
 		}
 	case "gs":
 		if name := nameValue(op.Operands[0]); name != "" {
-			return e.describeDebugResource(entity.Name("ExtGState"), entity.Name(name), "ExtGState:"+name)
+			return e.describeDebugResource(pdfNameExtGState, entity.Name(name), "ExtGState:"+name)
 		}
 	case "sh":
 		if name := nameValue(op.Operands[0]); name != "" {
-			return e.describeDebugResource(entity.Name("Shading"), entity.Name(name), "Shading:"+name)
+			return e.describeDebugResource(pdfNameShading, entity.Name(name), "Shading:"+name)
 		}
 	case "Tf":
 		if name := nameValue(op.Operands[0]); name != "" {
-			return e.describeDebugResource(entity.Name("Font"), entity.Name(name), "Font:"+name)
+			return e.describeDebugResource(pdfNameFont, entity.Name(name), "Font:"+name)
 		}
 	case "scn", "SCN":
 		if name := nameValue(op.Operands[len(op.Operands)-1]); name != "" {
-			return e.describeDebugResource(entity.Name("Pattern"), entity.Name(name), "PatternOrColorant:"+name)
+			return e.describeDebugResource(pdfNamePattern, entity.Name(name), "PatternOrColorant:"+name)
 		}
 	}
 	return "-"
@@ -621,13 +1036,13 @@ func debugDictTypeSummary(dict *entity.Dict) string {
 		return "-"
 	}
 	parts := make([]string, 0, 3)
-	if subtype, ok := dict.Get(entity.Name("Subtype")).(entity.Name); ok {
+	if subtype, ok := dict.Get(pdfNameSubtype).(entity.Name); ok {
 		parts = append(parts, "Subtype="+strings.TrimPrefix(subtype.Value(), "/"))
 	}
-	if typ, ok := dict.Get(entity.Name("Type")).(entity.Name); ok {
+	if typ, ok := dict.Get(pdfNameType).(entity.Name); ok {
 		parts = append(parts, "Type="+strings.TrimPrefix(typ.Value(), "/"))
 	}
-	if shadingType, ok := dict.Get(entity.Name("ShadingType")).(*entity.Integer); ok {
+	if shadingType, ok := dict.Get(pdfNameShadingType).(*entity.Integer); ok {
 		parts = append(parts, fmt.Sprintf("ShadingType=%d", shadingType.Value()))
 	}
 	if len(parts) == 0 {
@@ -636,7 +1051,13 @@ func debugDictTypeSummary(dict *entity.Dict) string {
 	return strings.Join(parts, ",")
 }
 
+var debugRenderContext = debugRenderContextFromEnv()
+
 func debugRenderContextEnabled() bool {
+	return debugRenderContext
+}
+
+func debugRenderContextFromEnv() bool {
 	return os.Getenv("PDF_DEBUG_RENDER_CONTEXT") != "" ||
 		os.Getenv("PDF_DEBUG_SPLASH_LAST_WRITER") != "" ||
 		os.Getenv("PDF_DEBUG_SPLASH_IMAGE_TRACE") != "" ||
@@ -653,8 +1074,10 @@ func debugRenderContextEnabled() bool {
 
 // executeOperator executes a single graphics operator.
 func (e *Evaluator) executeOperator(op Operator) error {
-	restoreDebugContext := e.installDebugPaintContext(op)
-	defer restoreDebugContext()
+	if debugRenderContextEnabled() {
+		restoreDebugContext := e.installDebugPaintContext(op)
+		defer restoreDebugContext()
+	}
 
 	// Debug: log all operators (skip frequent ones)
 	if op.Opcode != "m" && op.Opcode != "l" && op.Opcode != "c" {
@@ -855,6 +1278,9 @@ func (e *Evaluator) executeOperator(op Operator) error {
 		return e.invokeXObject(op)
 	case "BI":
 		// Begin inline image
+		if op.InlineImage != nil {
+			return e.executeInlineImageOperator(op)
+		}
 		return e.beginInlineImage()
 	case "ID":
 		// Begin inline image data
@@ -890,8 +1316,7 @@ func (e *Evaluator) renderType3Glyph(font *entity.Type3Font, charCode uint32, x,
 	// Use cached parsed operators if available, otherwise parse and cache.
 	ops, ok := e.charProcCache[charProcStream]
 	if !ok {
-		infraStream := stream.NewFromEntity(charProcStream)
-		data, err := infraStream.Decode()
+		data, err := e.decodeEntityStream(charProcStream)
 		if err != nil {
 			return fmt.Errorf("type3 font: decode charproc: %w", err)
 		}
@@ -900,10 +1325,21 @@ func (e *Evaluator) renderType3Glyph(font *entity.Type3Font, charCode uint32, x,
 		if err != nil {
 			return fmt.Errorf("type3 font: parse charproc: %w", err)
 		}
-		e.charProcCache[charProcStream] = ops
+		e.ensureCharProcCache()[charProcStream] = ops
 	}
 
 	glyphCTM := e.type3GlyphCTM(font, x, y, fontSize)
+	if os.Getenv("PDF_DEBUG_TYPE3_CTM") != "" {
+		fm := font.FontMatrix()
+		oc := e.graphics.transform
+		tm := e.textMatrix
+		hs := e.graphics.currentState.GetHorizontalScaling() / 100.0
+		fmt.Fprintf(os.Stderr, "T3CTM code=%d fs=%.17g hs=%.17g fm=[%.17g %.17g %.17g %.17g] tm=[%.17g %.17g %.17g %.17g %.17g %.17g] octm=[%.17g %.17g %.17g %.17g %.17g %.17g] lin=[%.17g %.17g %.17g %.17g] xy=[%.17g %.17g]\n",
+			charCode, fontSize, hs, fm[0], fm[1], fm[2], fm[3],
+			tm[0], tm[1], tm[2], tm[3], tm[4], tm[5],
+			oc[0], oc[1], oc[2], oc[3], oc[4], oc[5],
+			glyphCTM[0], glyphCTM[1], glyphCTM[2], glyphCTM[3], x, y)
+	}
 	usesD1Cache := type3CharProcUsesD1Cache(font, ops, glyphCTM)
 	if usesD1Cache {
 		if quantizer, ok := e.canvas.(interface {
@@ -913,6 +1349,7 @@ func (e *Evaluator) renderType3Glyph(font *entity.Type3Font, charCode uint32, x,
 			glyphCTM = e.type3GlyphCTM(font, x, y, fontSize)
 		}
 	}
+
 	if usesD1Cache {
 		if marker, ok := e.canvas.(interface {
 			BeginType3GlyphCache()
@@ -934,6 +1371,7 @@ func (e *Evaluator) renderType3Glyph(font *entity.Type3Font, charCode uint32, x,
 	if err := e.saveState(); err != nil {
 		return err
 	}
+	e.preserveNonEmptyCallerPathOnSavedState()
 	defer func() { _ = e.restoreState() }()
 
 	e.graphics.transform = glyphCTM
@@ -942,13 +1380,52 @@ func (e *Evaluator) renderType3Glyph(font *entity.Type3Font, charCode uint32, x,
 		defer e.pushResources(glyphResources)()
 	}
 	if charProcStream.Dict() != nil {
-		if charProcResources := e.resourceDictFromObject(charProcStream.Dict().Get(entity.Name("Resources"))); charProcResources != nil {
+		if charProcResources := e.resourceDictFromObject(charProcStream.Dict().Get(pdfNameResources)); charProcResources != nil {
 			defer e.pushResources(charProcResources)()
+		}
+	}
+
+	// Poppler-matching temp-bitmap render (SplashOutputDev::type3D1 →
+	// drawType3Glyph) for cacheable (d1, cache-fitting) glyphs. Replaying the
+	// CharProc in y-down cell space at glyph-relative magnitude eliminates the
+	// page-height flip float cancellation at 45° cap edges (doc_027 DejaVuSans
+	// Type3: 97px → 0). The temp splash is created when the d1 OPERATOR
+	// executes (Poppler creates it in type3D1) — ops BEFORE d1 (e.g. samsung's
+	// color set) must apply to the page state, not the glyph cell. Default on;
+	// set PDF_TYPE3_TEMPBITMAP=0 to fall back to the direct quantized-pen
+	// render.
+	if usesD1Cache && os.Getenv("PDF_TYPE3_TEMPBITMAP") != "0" {
+		if tb, ok := e.canvas.(type3TempBitmapCanvas); ok {
+			llx, lly, urx, ury := font.GetBoundingBox()
+			pending := &type3PendingTemp{
+				canvas:   tb,
+				glyphCTM: glyphCTM,
+				fontBBox: [4]float64{llx, lly, urx, ury},
+			}
+			e.type3PendingTemp = pending
+			defer func() {
+				e.type3PendingTemp = nil
+				if pending.active {
+					tb.FinishType3TempBitmap()
+				}
+			}()
 		}
 	}
 
 	e.executeCachedOperators(ops)
 	return nil
+}
+
+type type3TempBitmapCanvas interface {
+	PrepareType3TempBitmap(glyphCTM [6]float64, fontBBox [4]float64) (tempCTM [6]float64, w, h, blitX, blitY int, ok bool)
+	FinishType3TempBitmap()
+}
+
+type type3PendingTemp struct {
+	canvas   type3TempBitmapCanvas
+	glyphCTM [6]float64
+	fontBBox [4]float64
+	active   bool
 }
 
 func type3CharProcUsesD1Cache(font *entity.Type3Font, ops []Operator, glyphCTM [6]float64) bool {
@@ -1099,8 +1576,22 @@ func (e *Evaluator) executeD0(op Operator) error {
 // d1: wx wy llx lly urx ury d1 — sets glyph width and cache bounding box.
 // After d1, the glyph description is assumed to describe only the bbox region.
 func (e *Evaluator) executeD1(op Operator) error {
-	// d1 is a no-op during rendering; width and bbox are already known.
-	// It only matters during glyph metrics calculation.
+	// Width and bbox are already known from glyph metrics. Rendering-wise this
+	// mirrors SplashOutputDev::type3D1: for a cacheable glyph the temp cell
+	// splash is created HERE — ops before d1 applied to the page state.
+	if pending := e.type3PendingTemp; pending != nil && !pending.active {
+		tempCTM, _, _, _, _, tempOK := pending.canvas.PrepareType3TempBitmap(pending.glyphCTM, pending.fontBBox)
+		if tempOK {
+			pending.active = true
+			e.graphics.transform = tempCTM
+			// Poppler's temp splash starts from a DEFAULT SplashState
+			// (fill/stroke alpha 1 — type3D1's "this should copy other
+			// state" is deliberately not done); the page alpha applies ONCE
+			// at the drawType3Glyph blit.
+			e.graphics.fillAlpha = 1
+			e.graphics.strokeAlpha = 1
+		}
+	}
 	return nil
 }
 
@@ -1141,17 +1632,22 @@ func (e *Evaluator) saveState() error {
 	stateCopy.textUserCurrentValid = e.textUserCurrentValid
 	stateCopy.currentState = cloneCurrentState(e.graphics.currentState)
 
-	// Only clone the path when it has elements — empty paths are cheap to share.
-	if !e.graphics.path.IsEmpty() {
-		stateCopy.path = e.graphics.path.Clone()
-	}
-	if e.graphics.rawPath != nil && !e.graphics.rawPath.IsEmpty() {
-		stateCopy.rawPath = e.graphics.rawPath.Clone()
-	}
-
 	// Push onto stack (pre-allocated with capacity to reduce growslice).
 	e.stateStack = append(e.stateStack, stateCopy)
 	return nil
+}
+
+func (e *Evaluator) preserveNonEmptyCallerPathOnSavedState() {
+	if e == nil || e.graphics == nil || len(e.stateStack) == 0 {
+		return
+	}
+	saved := e.stateStack[len(e.stateStack)-1]
+	if e.graphics.path != nil && !e.graphics.path.IsEmpty() {
+		saved.path = e.graphics.path.Clone()
+	}
+	if e.graphics.rawPath != nil && !e.graphics.rawPath.IsEmpty() {
+		saved.rawPath = e.graphics.rawPath.Clone()
+	}
 }
 
 // restoreState restores the last saved graphics state (for 'Q' operator).
@@ -1159,6 +1655,8 @@ func (e *Evaluator) restoreState() error {
 	if len(e.stateStack) == 0 {
 		return fmt.Errorf("graphics state stack is empty")
 	}
+
+	currentState := e.graphics.currentState
 
 	// Pop from stack
 	state := e.stateStack[len(e.stateStack)-1]
@@ -1191,7 +1689,9 @@ func (e *Evaluator) restoreState() error {
 	e.graphics.font = state.font
 	e.graphics.fontDebugName = state.fontDebugName
 	e.graphics.fontSize = state.fontSize
-	e.graphics.currentState = state.currentState
+	restoredCurrentState := state.currentState
+	e.graphics.currentState = restoredCurrentState
+	e.graphics.strokeAdjust = state.strokeAdjust
 	e.syncTextMatricesState(state.textMatrix, state.textLine)
 	e.textBaseMatrix = state.textBaseMatrix
 	e.textLineX = state.textLineX
@@ -1209,6 +1709,9 @@ func (e *Evaluator) restoreState() error {
 	// Return state to pool for reuse.
 	*state = GraphicsState{}
 	gsPool.Put(state)
+	if currentState != restoredCurrentState {
+		releaseCurrentState(currentState)
+	}
 
 	if e.canvas != nil {
 		e.canvas.Restore()
@@ -1236,6 +1739,9 @@ func (e *Evaluator) concatenateMatrix(op Operator) error {
 
 	// Concatenate with current transform.
 	// PDF cm semantics: newCTM = currentCTM × matrix.
+	if os.Getenv("PDF_DEBUG_CM") == "1" {
+		fmt.Fprintf(os.Stderr, "CM: matrix=[%f %f %f %f %f %f]\n", matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5])
+	}
 	e.graphics.transform = multiplyMatrix(e.graphics.transform, matrix)
 
 	return nil
@@ -1328,58 +1834,113 @@ func (e *Evaluator) moveTextBy(tx, ty float64) {
 }
 
 func splitTextCodeUnits(text string, font entity.Font) []textCodeUnit {
-	raw := []byte(text)
-	if len(raw) == 0 {
+	if len(text) == 0 {
 		return nil
 	}
 
 	if font != nil && font.IsCIDFont() {
-		out := make([]textCodeUnit, 0, (len(raw)+1)/2)
-		for i := 0; i < len(raw); {
-			if i+1 < len(raw) {
+		out := make([]textCodeUnit, 0, (len(text)+1)/2)
+		for i := 0; i < len(text); {
+			if i+1 < len(text) {
 				out = append(out, textCodeUnit{
-					code: uint32(raw[i])<<8 | uint32(raw[i+1]),
-					raw:  raw[i : i+2],
+					code: uint32(text[i])<<8 | uint32(text[i+1]),
+					raw:  text[i : i+2],
 				})
 				i += 2
 				continue
 			}
 			out = append(out, textCodeUnit{
-				code: uint32(raw[i]),
-				raw:  raw[i : i+1],
+				code: uint32(text[i]),
+				raw:  text[i : i+1],
 			})
 			i++
 		}
 		return out
 	}
 
-	out := make([]textCodeUnit, 0, len(raw))
-	for i := range raw {
+	out := make([]textCodeUnit, 0, len(text))
+	for i := range text {
 		out = append(out, textCodeUnit{
-			code: uint32(raw[i]),
-			raw:  raw[i : i+1],
+			code: uint32(text[i]),
+			raw:  text[i : i+1],
 		})
 	}
+	return out
+}
+
+func (e *Evaluator) splitTextCodeUnitsScratch(text string, font entity.Font) []textCodeUnit {
+	if len(text) == 0 {
+		return nil
+	}
+	if e == nil {
+		return splitTextCodeUnits(text, font)
+	}
+
+	needed := len(text)
+	if font != nil && font.IsCIDFont() {
+		needed = (len(text) + 1) / 2
+	}
+	if cap(e.textCodeUnitScratch) < needed {
+		e.textCodeUnitScratch = make([]textCodeUnit, 0, needed)
+	} else {
+		e.textCodeUnitScratch = e.textCodeUnitScratch[:0]
+	}
+	out := e.textCodeUnitScratch
+
+	if font != nil && font.IsCIDFont() {
+		for i := 0; i < len(text); {
+			if i+1 < len(text) {
+				out = append(out, textCodeUnit{
+					code: uint32(text[i])<<8 | uint32(text[i+1]),
+					raw:  text[i : i+2],
+				})
+				i += 2
+				continue
+			}
+			out = append(out, textCodeUnit{
+				code: uint32(text[i]),
+				raw:  text[i : i+1],
+			})
+			i++
+		}
+		e.textCodeUnitScratch = out
+		return out
+	}
+
+	for i := range text {
+		out = append(out, textCodeUnit{
+			code: uint32(text[i]),
+			raw:  text[i : i+1],
+		})
+	}
+	e.textCodeUnitScratch = out
 	return out
 }
 
 func (e *Evaluator) glyphAdvance(charCode uint32, font entity.Font, fontSize float64) float64 {
 	width := 500.0
 	hasWidth := false
-	type charCodeWidthFont interface {
-		GetCharCodeWidth(code uint32) (float64, bool)
-	}
-	if typed, ok := font.(charCodeWidthFont); ok {
+	if typed, ok := unwrapCharCodeWidthFont(font); ok {
 		if codeWidth, found := typed.GetCharCodeWidth(charCode); found {
 			width = codeWidth
 			hasWidth = true
 		}
 	}
 	if !hasWidth {
-		glyph, err := font.CharCodeToGlyph(charCode)
-		if err == nil {
-			if glyphWidth, widthErr := font.GetGlyphWidth(glyph); widthErr == nil {
+		// For CID fonts, look up width by CID directly (not by CIDToGID-mapped GID).
+		// This matches Poppler's behavior where /W array is indexed by CID.
+		if font.IsCIDFont() {
+			if glyphWidth, widthErr := font.GetGlyphWidth(charCode); widthErr == nil {
 				width = glyphWidth
+				hasWidth = true
+			}
+		}
+		if !hasWidth {
+			glyph, err := font.CharCodeToGlyph(charCode)
+			if err == nil {
+				if glyphWidth, widthErr := font.GetGlyphWidth(glyph); widthErr == nil {
+					width = glyphWidth
+				}
 			}
 		}
 	}
@@ -1405,24 +1966,45 @@ func (e *Evaluator) glyphAdvance(charCode uint32, font entity.Font, fontSize flo
 
 func cloneCurrentState(src *graphics.State) *graphics.State {
 	if src == nil {
-		return graphics.NewState()
+		return graphics.NewStateWithoutCurrentPath()
 	}
 
 	// Value copy captures all scalar fields; only slices/pointers need deep copy.
-	dst := *src
+	dst := graphicsStatePool.Get().(*graphics.State)
+	*dst = *src
 
 	if dash := src.GetDashArray(); len(dash) > 0 {
 		copiedDash := append([]float64(nil), dash...)
 		dst.SetDashArray(copiedDash, src.GetDashPhase())
 	}
-	if currentPath := src.GetCurrentPath(); currentPath != nil {
-		dst.SetCurrentPath(currentPath.Clone())
-	}
-	if clipPath := src.GetClipPath(); clipPath != nil {
-		dst.SetClipPath(clipPath.Clone())
-	}
+	// Renderer path/clip state is tracked on GraphicsState itself; the embedded
+	// graphics.State path fields are legacy content-operator state and are not
+	// consulted by this evaluator.
+	dst.SetCurrentPath(nil)
+	dst.SetClipPath(nil)
 
-	return &dst
+	return dst
+}
+
+func releaseCurrentState(state *graphics.State) {
+	if state == nil {
+		return
+	}
+	*state = graphics.State{}
+	graphicsStatePool.Put(state)
+}
+
+func (e *Evaluator) releaseSavedGraphicsStates() {
+	for i, state := range e.stateStack {
+		if state == nil {
+			continue
+		}
+		releaseCurrentState(state.currentState)
+		*state = GraphicsState{}
+		gsPool.Put(state)
+		e.stateStack[i] = nil
+	}
+	e.stateStack = e.stateStack[:0]
 }
 
 // Text operators
@@ -1488,7 +2070,7 @@ func (e *Evaluator) setFont(op Operator) error {
 	}
 
 	// Get font dictionary from resources
-	fontObj := e.getResourceEntry(entity.Name("Font"), fontName)
+	fontObj := e.getResourceEntry(pdfNameFont, fontName)
 	if fontObj == nil {
 		// Font not found in resources, try to use a default font
 		// For now, just set the font size and continue
@@ -1517,7 +2099,7 @@ func (e *Evaluator) setFont(op Operator) error {
 
 	// Get font type
 	baseFont := ""
-	if obj := fontDict.Get(entity.Name("BaseFont")); obj != nil {
+	if obj := fontDict.Get(pdfNameBaseFont); obj != nil {
 		if name, ok := obj.(entity.Name); ok {
 			baseFont = name.Value()
 		}
@@ -1533,14 +2115,8 @@ func (e *Evaluator) setFont(op Operator) error {
 		if resolveErr != nil {
 			font, _ = e.getDefaultFont(baseFont)
 		}
-		subtypeStr := nameValueForEncoding(fontDict.Get(entity.Name("Subtype")))
-		embeddedFontData, embeddedErr := e.getEmbeddedFontData(fontDict)
-		trustEmbeddedSubset := embeddedErr == nil && shouldSkipRenderabilityProbe(subtypeStr, embeddedFontData)
-		if !trustEmbeddedSubset && !e.isRenderableFont(font) {
-			font, _ = e.getDefaultFont(baseFont)
-		}
 		if font != nil {
-			e.fontCache[fontDict] = font
+			e.ensureFontCache()[fontDict] = font
 		}
 	}
 
@@ -1561,7 +2137,7 @@ func (e *Evaluator) getFontFromDict(dict *entity.Dict, baseFont string) (entity.
 	}
 
 	// Check font subtype
-	subtypeObj := dict.Get(entity.Name("Subtype"))
+	subtypeObj := dict.Get(pdfNameSubtype)
 	if subtypeObj == nil {
 		return nil, fmt.Errorf("font dictionary missing Subtype")
 	}
@@ -1587,7 +2163,7 @@ func (e *Evaluator) getFontFromDict(dict *entity.Dict, baseFont string) (entity.
 		}
 	}
 
-	candidateFont = e.applyFontEncodingFromDict(dict, candidateFont)
+	candidateFont = e.applyFontEncodingFromDictWithEmbeddedData(dict, candidateFont, embeddedFontData)
 	candidateFont = e.applyFontMetricsFromDict(dict, candidateFont)
 	candidateFont = e.applyEmbeddedType1CGlyphSourceFromDict(dict, candidateFont, embeddedFontData)
 	candidateFont = e.applyEmbeddedSimpleFontBBoxFromDict(dict, candidateFont, embeddedFontData)
@@ -1602,7 +2178,7 @@ func (e *Evaluator) resolveType3FontCandidate(dict *entity.Dict, baseFont string
 
 	// Parse FontMatrix [a b c d e f]
 	var fontMatrix [6]float64
-	if fmObj := dict.Get(entity.Name("FontMatrix")); fmObj != nil {
+	if fmObj := dict.Get(pdfNameFontMatrix); fmObj != nil {
 		if fmArr, ok := fmObj.(*entity.Array); ok && fmArr.Len() == 6 {
 			for i := 0; i < 6; i++ {
 				if num, err := getNumberOperand(fmArr.Get(i)); err == nil {
@@ -1617,7 +2193,7 @@ func (e *Evaluator) resolveType3FontCandidate(dict *entity.Dict, baseFont string
 
 	// Parse FontBBox
 	var bbox [4]float64
-	if bbObj := dict.Get(entity.Name("FontBBox")); bbObj != nil {
+	if bbObj := dict.Get(pdfNameFontBBox); bbObj != nil {
 		if bbArr, ok := bbObj.(*entity.Array); ok && bbArr.Len() == 4 {
 			for i := 0; i < 4; i++ {
 				if num, err := getNumberOperand(bbArr.Get(i)); err == nil {
@@ -1629,7 +2205,7 @@ func (e *Evaluator) resolveType3FontCandidate(dict *entity.Dict, baseFont string
 
 	// Parse CharProcs dictionary
 	charProcs := make(map[string]*entity.Stream)
-	if cpObj := dict.Get(entity.Name("CharProcs")); cpObj != nil {
+	if cpObj := dict.Get(pdfNameCharProcs); cpObj != nil {
 		if cpDict, ok := cpObj.(*entity.Dict); ok {
 			for _, key := range cpDict.Keys() {
 				val := cpDict.Get(key)
@@ -1648,9 +2224,9 @@ func (e *Evaluator) resolveType3FontCandidate(dict *entity.Dict, baseFont string
 
 	// Parse Encoding /Differences
 	encoding := make(map[uint32]string)
-	if encObj := dict.Get(entity.Name("Encoding")); encObj != nil {
+	if encObj := dict.Get(pdfNameEncoding); encObj != nil {
 		if encDict, ok := encObj.(*entity.Dict); ok {
-			if diffObj := encDict.Get(entity.Name("Differences")); diffObj != nil {
+			if diffObj := encDict.Get(pdfNameDifferences); diffObj != nil {
 				if diffArr, ok := diffObj.(*entity.Array); ok {
 					parseEncodingDifferences(diffArr, encoding)
 				}
@@ -1660,19 +2236,19 @@ func (e *Evaluator) resolveType3FontCandidate(dict *entity.Dict, baseFont string
 
 	// Parse Widths array
 	var firstChar, lastChar uint32
-	if fcObj := dict.Get(entity.Name("FirstChar")); fcObj != nil {
+	if fcObj := dict.Get(pdfNameFirstChar); fcObj != nil {
 		if num, err := getNumberOperand(fcObj); err == nil {
 			firstChar = uint32(num)
 		}
 	}
-	if lcObj := dict.Get(entity.Name("LastChar")); lcObj != nil {
+	if lcObj := dict.Get(pdfNameLastChar); lcObj != nil {
 		if num, err := getNumberOperand(lcObj); err == nil {
 			lastChar = uint32(num)
 		}
 	}
 
 	widths := make(map[uint32]float64)
-	if wObj := dict.Get(entity.Name("Widths")); wObj != nil {
+	if wObj := dict.Get(pdfNameWidths); wObj != nil {
 		if wArr, ok := wObj.(*entity.Array); ok {
 			for i := 0; i < wArr.Len() && firstChar+uint32(i) <= lastChar; i++ {
 				if num, err := getNumberOperand(wArr.Get(i)); err == nil {
@@ -1688,7 +2264,7 @@ func (e *Evaluator) resolveType3FontCandidate(dict *entity.Dict, baseFont string
 	}
 
 	font := entity.NewType3Font(name, fontMatrix, charProcs, encoding, widths, firstChar, lastChar, bbox)
-	if resources := e.resourceDictFromObject(dict.Get(entity.Name("Resources"))); resources != nil {
+	if resources := e.resourceDictFromObject(dict.Get(pdfNameResources)); resources != nil {
 		font.SetResources(resources)
 	}
 	return font
@@ -1934,7 +2510,7 @@ func (e *Evaluator) invokeXObject(op Operator) error {
 		return errors.NotFound("get_xobject", fmt.Errorf("no resources available"))
 	}
 
-	xobjVal := e.getResourceEntry(entity.Name("XObject"), xname)
+	xobjVal := e.getResourceEntry(pdfNameXObject, xname)
 	if xobjVal == nil {
 		return errors.NotFound("get_xobject", fmt.Errorf("xobject %s not found", xname))
 	}
@@ -1947,7 +2523,7 @@ func (e *Evaluator) invokeXObject(op Operator) error {
 
 	// Get XObject subtype to determine how to handle it
 	dict := xobj.Dict()
-	subtypeVal := dict.Get(entity.Name("Subtype"))
+	subtypeVal := dict.Get(pdfNameSubtype)
 	if subtypeVal == nil {
 		return fmt.Errorf("xobject %s has no subtype", xname)
 	}
@@ -1971,7 +2547,7 @@ func (e *Evaluator) invokeXObject(op Operator) error {
 
 // evaluateFormXObject evaluates a form XObject's content stream.
 func (e *Evaluator) evaluateFormXObject(xobj *entity.Stream, name entity.Name) error {
-	ops, err := e.cachedFormOperators(xobj)
+	content, err := e.formOperatorContentForExecution(xobj)
 	if err != nil {
 		return err
 	}
@@ -1982,6 +2558,7 @@ func (e *Evaluator) evaluateFormXObject(xobj *entity.Stream, name entity.Name) e
 	if err := e.saveState(); err != nil {
 		return err
 	}
+	e.preserveNonEmptyCallerPathOnSavedState()
 	restoreState := true
 	defer func() {
 		if restoreState {
@@ -1996,8 +2573,17 @@ func (e *Evaluator) evaluateFormXObject(xobj *entity.Stream, name entity.Name) e
 	// Get form's dictionary for additional parameters
 	dict := xobj.Dict()
 
+	if os.Getenv("PDF_DEBUG_EVAL_GS") != "" {
+		hasGroup := "no"
+		if d, ok := e.resolveDictObject(dict.Get(pdfNameGroup)); ok && isTransparencyGroupDict(d) {
+			hasGroup = "GROUP"
+		}
+		fmt.Fprintf(os.Stderr, "FORMENTER name=%v hasGroup=%s fillAlpha=%.4f blend=%v\n",
+			name, hasGroup, e.graphics.fillAlpha, e.graphics.blendMode)
+	}
+
 	// Get form's matrix (transformation) if present
-	matrixVal := dict.Get(entity.Name("Matrix"))
+	matrixVal := dict.Get(pdfNameMatrix)
 	if matrixVal != nil {
 		if matrixArr, ok := matrixVal.(*entity.Array); ok && matrixArr.Len() == 6 {
 			var formMatrix [6]float64
@@ -2017,7 +2603,7 @@ func (e *Evaluator) evaluateFormXObject(xobj *entity.Stream, name entity.Name) e
 
 	// Get form's resources if present, otherwise use current resources
 	var formResources *entity.Dict
-	resourcesVal := dict.Get(entity.Name("Resources"))
+	resourcesVal := dict.Get(pdfNameResources)
 	if resourcesVal != nil {
 		if ref, ok := resourcesVal.(entity.Ref); ok && e.xref != nil {
 			fetched, err := e.xref.Fetch(ref)
@@ -2035,7 +2621,7 @@ func (e *Evaluator) evaluateFormXObject(xobj *entity.Stream, name entity.Name) e
 	defer e.pushResources(formResources)()
 
 	// Apply form bounding box clipping when present.
-	bboxVal := dict.Get(entity.Name("BBox"))
+	bboxVal := dict.Get(pdfNameBBox)
 	var bbox [4]float64
 	hasBBox := false
 	if bboxVal != nil {
@@ -2049,31 +2635,39 @@ func (e *Evaluator) evaluateFormXObject(xobj *entity.Stream, name entity.Name) e
 	}
 
 	if groupController, ok := e.canvas.(transparencyGroupCanvas); ok && hasBBox && enableFormTransparencyGroup() {
-		if groupDict, ok := e.resolveDictObject(dict.Get(entity.Name("Group"))); ok && isTransparencyGroupDict(groupDict) {
-			isolated := boolDictValue(groupDict, entity.Name("I"), false)
-			knockout := boolDictValue(groupDict, entity.Name("K"), false)
+		if groupDict, ok := e.resolveDictObject(dict.Get(pdfNameGroup)); ok && isTransparencyGroupDict(groupDict) {
+			isolated := boolDictValue(groupDict, pdfNameI, false)
+			knockout := boolDictValue(groupDict, pdfNameK, false)
+			if os.Getenv("PDF_DEBUG_EVAL_GS") != "" {
+				inNonIso := false
+				if c, ok := e.canvas.(nonIsolatedGroupCanvas); ok {
+					inNonIso = c.InNonIsolatedGroup()
+				}
+				fmt.Fprintf(os.Stderr, "FORMGATE name=%v isolated=%t knockout=%t required=%t fillAlpha=%.4f blend=%v inNonIso=%t\n",
+					name, isolated, knockout, e.formTransparencyGroupRequired(isolated, knockout, formResources),
+					e.graphics.fillAlpha, e.graphics.blendMode, inNonIso)
+			}
 			if e.formTransparencyGroupRequired(isolated, knockout, formResources) {
-				if setter, ok := e.canvas.(blendModeSetter); ok {
-					setter.SetBlendMode("Normal")
-				}
-				e.graphics.blendMode = "Normal"
-				e.graphics.fillAlpha = 1
-				e.graphics.strokeAlpha = 1
-				e.syncCanvasFillAlpha()
-				e.syncCanvasStrokeAlpha()
-				if softMaskController, ok := e.canvas.(softMaskGroupCanvas); ok {
-					softMaskController.ClearSoftMask()
-				}
 				if deviceGroupController, ok := e.canvas.(transparencyGroupDeviceBBoxCanvas); ok {
 					x0, y0, x1, y1 := transformedBBoxBounds(e.graphics.transform, bbox)
 					deviceBBox := [4]float64{x0, y0, x1, y1}
+					if os.Getenv("PDF_DEBUG_EVAL_GS") != "" {
+						fmt.Fprintf(os.Stderr, "FORMBEGIN name=%v devbbox=[%.0f %.0f %.0f %.0f] savedFillAlpha=%.4f savedBlend=%v\n",
+							name, x0, y0, x1, y1, e.graphics.fillAlpha, e.graphics.blendMode)
+					}
 					if croppedController, ok := e.canvas.(transparencyGroupCroppedDeviceBBoxCanvas); ok && enableFormTransparencyGroupCropped() {
 						tx, ty, err := croppedController.BeginTransparencyGroupCroppedDeviceBBox(deviceBBox, isolated, knockout)
 						if err != nil {
 							return err
 						}
 						e.graphics.transform[4] -= float64(tx)
-						e.graphics.transform[5] += float64(ty)
+						if e.canvasYDownBase() {
+							// y-down CTM: the cropped group origin shift is a
+							// plain device translation in both axes.
+							e.graphics.transform[5] -= float64(ty)
+						} else {
+							e.graphics.transform[5] += float64(ty)
+						}
 						e.graphics.baseTransform = e.graphics.transform
 					} else if err := deviceGroupController.BeginTransparencyGroupDeviceBBox(deviceBBox, isolated, knockout); err != nil {
 						return err
@@ -2081,19 +2675,71 @@ func (e *Evaluator) evaluateFormXObject(xobj *entity.Stream, name entity.Name) e
 				} else if err := groupController.BeginTransparencyGroup(bbox, isolated, knockout); err != nil {
 					return err
 				}
-				e.executeCachedOperators(ops)
+				// A Form transparency group composites through the soft mask active
+				// at Do time (Poppler's parent Splash state keeps its softMask for
+				// the paintTransparencyGroup composite). Begin captured the parent
+				// mask as savedSoftMask (restored by PaintTransparencyGroup); only
+				// now — AFTER capture — clear it so the group's content renders in a
+				// fresh-child state. Clearing before Begin snapshotted a nil mask, so
+				// an ExtGState luminosity SMask at Do (e.g. an Illustrator drop
+				// shadow) was ignored at composite and the group flooded its bbox.
+				if softMaskController, ok := e.canvas.(softMaskGroupCanvas); ok {
+					softMaskController.ClearSoftMask()
+				}
+				// A Form transparency group composites with the fill/stroke alpha
+				// active at Do time (Poppler restores the parent state before
+				// paintTransparencyGroup). BeginTransparencyGroup captured that
+				// parent alpha above as the group's savedFillAlpha/savedStrokeAlpha
+				// (restored by PaintTransparencyGroup for the composite). Only now —
+				// AFTER the parent alpha is captured — reset to 1.0 so the group's
+				// content renders in a fresh-child state. Resetting before Begin
+				// clobbered a low parent /ca (e.g. 0.05), making the composite opaque
+				// where Poppler shows a faint tint.
+				e.graphics.fillAlpha = 1
+				e.graphics.strokeAlpha = 1
+				e.syncCanvasFillAlpha()
+				e.syncCanvasStrokeAlpha()
+				// A Form transparency group composites with the blend mode active at
+				// Do time (Poppler restores the parent state before paint), so
+				// BeginTransparencyGroup captured the parent blend as savedBlendFunc
+				// (restored by PaintTransparencyGroup for the composite). Only now —
+				// AFTER capture — reset to Normal so the group's content renders in a
+				// fresh-child state (Poppler's child Splash uses Normal blend). Resetting
+				// before Begin captured Normal instead of the parent's Multiply/Overlay,
+				// so the composite used Normal where Poppler used the parent blend.
+				if setter, ok := e.canvas.(blendModeSetter); ok {
+					setter.SetBlendMode("Normal")
+				}
+				e.graphics.blendMode = "Normal"
+				if err := e.executeFormOperatorContent(content); err != nil {
+					_ = groupController.DiscardTransparencyGroup()
+					return errors.Invalid("evaluate_form_xobject", err)
+				}
+				// Restore the caller state BEFORE compositing: Poppler's
+				// Gfx::drawForm calls restoreStateStack and only then
+				// paintTransparencyGroup, so the form BBox clip (applied before
+				// Begin) is NOT active at composite time — only the caller's
+				// clip is. Compositing under the BBox clip binary-rejected the
+				// fractional edge column that Poppler's composite keeps (DallE
+				// p63/p67: card right edge at x=700.0 exactly, xMaxI=699 cut
+				// the 12.5%-coverage column the group content carried).
 				if err := e.restoreState(); err != nil {
 					restoreState = false
 					_ = groupController.DiscardTransparencyGroup()
 					return err
 				}
 				restoreState = false
-				return groupController.PaintTransparencyGroup()
+				if err := groupController.PaintTransparencyGroup(); err != nil {
+					return err
+				}
+				return nil
 			}
 		}
 	}
 
-	e.executeCachedOperators(ops)
+	if err := e.executeFormOperatorContent(content); err != nil {
+		return errors.Invalid("evaluate_form_xobject", err)
+	}
 
 	return nil
 }
@@ -2138,24 +2784,91 @@ func (e *Evaluator) currentRawPath() *Path {
 	return e.graphics.rawPath
 }
 
-func (e *Evaluator) cachedFormOperators(xobj *entity.Stream) ([]Operator, error) {
+type formOperatorContent struct {
+	ops  []Operator
+	data []byte
+}
+
+func (e *Evaluator) formOperatorContentForExecution(xobj *entity.Stream) (formOperatorContent, error) {
 	if xobj == nil {
-		return nil, errors.Invalid("decode_form_xobject", fmt.Errorf("nil form xobject"))
+		return formOperatorContent{}, errors.Invalid("decode_form_xobject", fmt.Errorf("nil form xobject"))
+	}
+
+	if cached, ok := e.formOperatorCache[xobj]; ok {
+		return formOperatorContent{ops: cached}, nil
 	}
 
 	if e.sharedFormCache != nil {
 		if cached, ok := e.sharedFormCache.Get(xobj); ok {
-			e.formOperatorCache[xobj] = cached
-			return cached, nil
+			e.ensureFormOperatorCache()[xobj] = cached
+			return formOperatorContent{ops: cached}, nil
 		}
+	}
+
+	data, err := e.decodeEntityStreamWithSizeHint(xobj, formStreamDecodeSizeHint(xobj))
+	if err != nil {
+		return formOperatorContent{}, errors.Invalid("decode_form_xobject", err)
+	}
+
+	if e.shouldStreamFirstFormUse(xobj, data) {
+		return formOperatorContent{data: data}, nil
+	}
+
+	ops, err := e.parseOperatorsOnly(data)
+	if err != nil {
+		return formOperatorContent{}, errors.Invalid("evaluate_form_xobject", err)
+	}
+	e.ensureFormOperatorCache()[xobj] = ops
+	if e.sharedFormCache != nil {
+		e.sharedFormCache.Set(xobj, ops)
+	}
+	return formOperatorContent{ops: ops}, nil
+}
+
+func (e *Evaluator) shouldStreamFirstFormUse(xobj *entity.Stream, data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	if e.formStreamUseCount == nil {
+		e.formStreamUseCount = make(map[*entity.Stream]int)
+	}
+	count := e.formStreamUseCount[xobj]
+	e.formStreamUseCount[xobj] = count + 1
+	return count == 0
+}
+
+func (e *Evaluator) executeFormOperatorContent(content formOperatorContent) error {
+	if content.ops != nil {
+		e.executeCachedOperators(content.ops)
+		return nil
+	}
+	if len(content.data) == 0 {
+		return nil
+	}
+	return e.parseOperatorsForImmediateExecution(content.data, func(op Operator) {
+		if err := e.executeOperator(op); err != nil {
+			return
+		}
+	})
+}
+
+func (e *Evaluator) cachedFormOperators(xobj *entity.Stream) ([]Operator, error) {
+	if xobj == nil {
+		return nil, errors.Invalid("decode_form_xobject", fmt.Errorf("nil form xobject"))
 	}
 
 	if cached, ok := e.formOperatorCache[xobj]; ok {
 		return cached, nil
 	}
 
-	infraStream := stream.NewFromEntity(xobj)
-	data, err := infraStream.Decode()
+	if e.sharedFormCache != nil {
+		if cached, ok := e.sharedFormCache.Get(xobj); ok {
+			e.ensureFormOperatorCache()[xobj] = cached
+			return cached, nil
+		}
+	}
+
+	data, err := e.decodeEntityStreamWithSizeHint(xobj, formStreamDecodeSizeHint(xobj))
 	if err != nil {
 		return nil, errors.Invalid("decode_form_xobject", err)
 	}
@@ -2164,11 +2877,37 @@ func (e *Evaluator) cachedFormOperators(xobj *entity.Stream) ([]Operator, error)
 	if err != nil {
 		return nil, errors.Invalid("evaluate_form_xobject", err)
 	}
-	e.formOperatorCache[xobj] = ops
+	e.ensureFormOperatorCache()[xobj] = ops
 	if e.sharedFormCache != nil {
 		e.sharedFormCache.Set(xobj, ops)
 	}
 	return ops, nil
+}
+
+func formStreamDecodeSizeHint(xobj *entity.Stream) int {
+	if xobj == nil || xobj.Dict() == nil {
+		return 0
+	}
+	subtype, _ := xobj.Dict().Get(pdfNameSubtype).(entity.Name)
+	if strings.TrimPrefix(subtype.Value(), "/") != "Form" {
+		return 0
+	}
+	rawLen := len(xobj.RawBytes())
+	const mediumFormDecodeHintMin = 32 << 10
+	const largeFormDecodeHintMin = 128 << 10
+	if rawLen < mediumFormDecodeHintMin {
+		return 0
+	}
+	const maxFormDecodeSizeHint = 64 << 20
+	multiplier := 6
+	if rawLen >= largeFormDecodeHintMin {
+		multiplier = 16
+	}
+	hint := rawLen * multiplier
+	if hint <= 0 || hint > maxFormDecodeSizeHint {
+		return 0
+	}
+	return hint
 }
 
 func (e *Evaluator) applyFormBBoxClip(bboxArr *entity.Array) error {
@@ -2199,13 +2938,10 @@ func (e *Evaluator) applyFormBBoxClip(bboxArr *entity.Array) error {
 	tx3, ty3 := e.transformPoint(x0, y1)
 
 	clipPath := NewPath()
-	clipPath.AddElement(&MoveTo{X: tx0, Y: ty0})
-	clipPath.AddElement(&LineTo{X: tx1, Y: ty1})
-	clipPath.AddElement(&LineTo{X: tx2, Y: ty2})
-	clipPath.AddElement(&LineTo{X: tx3, Y: ty3})
-	clipPath.AddElement(&Close{})
+	clipPath.AddRect(tx0, ty0, tx1, ty1, tx2, ty2, tx3, ty3)
 
 	e.graphics.pathClip = clipPath
+	e.setCurrentPathClipBounds(clipPath)
 	e.graphics.clipMode = ClipNonZeroWinding
 	if e.canvas != nil {
 		e.applyClippingPath()
@@ -2397,7 +3133,7 @@ func (e *Evaluator) resolveImageColorSpaceWithDepth(colorSpaceVal entity.Object,
 		if isSupportedImageColorSpace(colorSpace) {
 			return colorSpace, true
 		}
-		if resourceObj := e.getResourceEntry(entity.Name("ColorSpace"), cs); resourceObj != nil {
+		if resourceObj := e.getResourceEntry(pdfNameColorSpace, cs); resourceObj != nil {
 			return e.resolveImageColorSpaceWithDepth(resourceObj, depth+1)
 		}
 		return colorSpace, false
@@ -2646,8 +3382,9 @@ func (e *Evaluator) resolveMaskArray(obj entity.Object, depth int) *entity.Array
 }
 
 type softMaskDetails struct {
-	mask  domainimage.ImageMask
-	matte []float64
+	stream *entity.Stream
+	mask   domainimage.ImageMask
+	matte  []float64
 }
 
 func (e *Evaluator) resolveSoftMask(maskObj entity.Object) domainimage.ImageMask {
@@ -2663,24 +3400,29 @@ func (e *Evaluator) resolveSoftMaskDetails(maskObj entity.Object) softMaskDetail
 	if !ok || maskStream == nil {
 		return softMaskDetails{}
 	}
+	if e.softMaskDetailsCache != nil {
+		if details, ok := e.softMaskDetailsCache[maskStream]; ok {
+			return details
+		}
+	}
 
 	maskDict := maskStream.Dict()
-	width, ok := objectInt(dictGetAny(maskDict, entity.Name("Width"), entity.Name("W")))
+	width, ok := objectInt(dictGetAny(maskDict, pdfNameWidth, pdfNameW))
 	if !ok || width <= 0 {
 		return softMaskDetails{}
 	}
-	height, ok := objectInt(dictGetAny(maskDict, entity.Name("Height"), entity.Name("H")))
+	height, ok := objectInt(dictGetAny(maskDict, pdfNameHeight, pdfNameH))
 	if !ok || height <= 0 {
 		return softMaskDetails{}
 	}
 
-	data, maskFilter, err := decodeSoftMaskImageStream(maskStream)
+	data, maskFilter, err := e.decodeSoftMaskImageStream(maskStream)
 	if err != nil {
 		return softMaskDetails{}
 	}
 
 	maskCS := "DeviceGray"
-	if csObj := dictGetAny(maskDict, entity.Name("ColorSpace"), entity.Name("CS")); csObj != nil {
+	if csObj := dictGetAny(maskDict, pdfNameColorSpace, pdfNameCS); csObj != nil {
 		cs, ok := e.resolveImageColorSpace(csObj)
 		if !ok || !strings.EqualFold(cs, "DeviceGray") {
 			return softMaskDetails{}
@@ -2688,34 +3430,101 @@ func (e *Evaluator) resolveSoftMaskDetails(maskObj entity.Object) softMaskDetail
 		maskCS = cs
 	}
 	bpc := 8
-	if v, ok := objectInt(dictGetAny(maskDict, entity.Name("BitsPerComponent"), entity.Name("BPC"))); ok && v > 0 {
+	if v, ok := objectInt(dictGetAny(maskDict, pdfNameBitsPerComponent, pdfNameBPC)); ok && v > 0 {
 		bpc = v
 	}
 
-	decoded, err := image.NewDecoder().Decode(&domainimage.ImageData{
-		Data:             data,
-		Width:            width,
-		Height:           height,
-		BitsPerComponent: bpc,
-		ColorSpace:       domainimage.ColorSpace(maskCS),
-		Filter:           maskFilter,
-		Decode:           e.resolveImageDecodeArray(dictGetAny(maskDict, entity.Name("Decode"), entity.Name("D"))),
-	})
-	if err != nil || decoded == nil || decoded.Image() == nil {
-		return softMaskDetails{}
+	var gray *stdimage.Gray
+	decode := e.resolveImageDecodeArray(dictGetAny(maskDict, pdfNameDecode, pdfNameD))
+	if maskFilter == domainimage.FilterNone {
+		rawGray, ok := rawDeviceGraySoftMask(data, width, height, bpc, decode)
+		if ok {
+			gray = rawGray
+		}
 	}
+	if gray == nil {
+		decoded, err := e.decodeImageData(&domainimage.ImageData{
+			Data:             data,
+			Width:            width,
+			Height:           height,
+			BitsPerComponent: bpc,
+			ColorSpace:       domainimage.ColorSpace(maskCS),
+			Filter:           maskFilter,
+			Decode:           decode,
+		})
+		if err != nil || decoded == nil || decoded.Image() == nil {
+			return softMaskDetails{}
+		}
 
-	gray := stdimage.NewGray(decoded.Image().Bounds())
-	for y := gray.Bounds().Min.Y; y < gray.Bounds().Max.Y; y++ {
-		for x := gray.Bounds().Min.X; x < gray.Bounds().Max.X; x++ {
-			gray.Set(x, y, color.GrayModel.Convert(decoded.Image().At(x, y)))
+		srcImg := decoded.Image()
+		bounds := srcImg.Bounds()
+		switch m := srcImg.(type) {
+		case *stdimage.Gray:
+			gray = m
+		case *stdimage.Alpha:
+			gray = stdimage.NewGray(bounds)
+			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+				srcOff := m.PixOffset(bounds.Min.X, y)
+				dstOff := gray.PixOffset(bounds.Min.X, y)
+				for x := bounds.Min.X; x < bounds.Max.X; x++ {
+					gray.Pix[dstOff] = m.Pix[srcOff]
+					srcOff++
+					dstOff++
+				}
+			}
+		case *stdimage.RGBA:
+			gray = stdimage.NewGray(bounds)
+			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+				srcOff := m.PixOffset(bounds.Min.X, y)
+				dstOff := gray.PixOffset(bounds.Min.X, y)
+				for x := bounds.Min.X; x < bounds.Max.X; x++ {
+					r := uint32(m.Pix[srcOff])
+					r |= r << 8
+					g := uint32(m.Pix[srcOff+1])
+					g |= g << 8
+					b := uint32(m.Pix[srcOff+2])
+					b |= b << 8
+					yVal := (19595*r + 38470*g + 7471*b + 1<<15) >> 16
+					gray.Pix[dstOff] = byte(yVal >> 8)
+					srcOff += 4
+					dstOff++
+				}
+			}
+		case *stdimage.NRGBA:
+			gray = stdimage.NewGray(bounds)
+			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+				srcOff := m.PixOffset(bounds.Min.X, y)
+				dstOff := gray.PixOffset(bounds.Min.X, y)
+				for x := bounds.Min.X; x < bounds.Max.X; x++ {
+					a := uint32(m.Pix[srcOff+3])
+					r := (uint32(m.Pix[srcOff]) | uint32(m.Pix[srcOff])<<8) * a / 0xff
+					g := (uint32(m.Pix[srcOff+1]) | uint32(m.Pix[srcOff+1])<<8) * a / 0xff
+					b := (uint32(m.Pix[srcOff+2]) | uint32(m.Pix[srcOff+2])<<8) * a / 0xff
+					yVal := (19595*r + 38470*g + 7471*b + 1<<15) >> 16
+					gray.Pix[dstOff] = byte(yVal >> 8)
+					srcOff += 4
+					dstOff++
+				}
+			}
+		default:
+			gray = stdimage.NewGray(bounds)
+			for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+				for x := bounds.Min.X; x < bounds.Max.X; x++ {
+					gray.Set(x, y, color.GrayModel.Convert(srcImg.At(x, y)))
+				}
+			}
 		}
 	}
 
-	return softMaskDetails{
-		mask:  image.NewBitmapMaskFromImage(gray, false),
-		matte: e.resolveSoftMaskMatte(maskDict.Get(entity.Name("Matte"))),
+	details := softMaskDetails{
+		stream: maskStream,
+		mask:   image.NewBitmapMaskFromImage(gray, false),
+		matte:  e.resolveSoftMaskMatte(maskDict.Get(pdfNameMatte)),
 	}
+	if details.mask != nil {
+		e.ensureSoftMaskDetailsCache()[maskStream] = details
+	}
+	return details
 }
 
 func dictGetAny(dict *entity.Dict, names ...entity.Name) entity.Object {
@@ -2728,6 +3537,25 @@ func dictGetAny(dict *entity.Dict, names ...entity.Name) entity.Object {
 		}
 	}
 	return nil
+}
+
+func rawDeviceGraySoftMask(data []byte, width, height, bpc int, decode []float64) (*stdimage.Gray, bool) {
+	if width <= 0 || height <= 0 || bpc != 8 || !isDefaultGrayDecodeArray(decode) {
+		return nil, false
+	}
+	needed := width * height
+	if needed <= 0 || len(data) < needed {
+		return nil, false
+	}
+	return &stdimage.Gray{
+		Pix:    data[:needed],
+		Stride: width,
+		Rect:   stdimage.Rect(0, 0, width, height),
+	}, true
+}
+
+func isDefaultGrayDecodeArray(decode []float64) bool {
+	return len(decode) == 0 || (len(decode) == 2 && decode[0] == 0 && decode[1] == 1)
 }
 
 func (e *Evaluator) resolveSoftMaskMatte(obj entity.Object) []float64 {
@@ -2756,22 +3584,22 @@ func (e *Evaluator) resolveExplicitImageMask(maskObj entity.Object) domainimage.
 		return nil
 	}
 
-	width, ok := dictIntWithAliases(maskStream.Dict(), entity.Name("Width"), entity.Name("W"))
+	width, ok := dictIntWithAliases(maskStream.Dict(), pdfNameWidth, pdfNameW)
 	if !ok || width <= 0 {
 		return nil
 	}
-	height, ok := dictIntWithAliases(maskStream.Dict(), entity.Name("Height"), entity.Name("H"))
+	height, ok := dictIntWithAliases(maskStream.Dict(), pdfNameHeight, pdfNameH)
 	if !ok || height <= 0 {
 		return nil
 	}
 
-	data, err := stream.NewFromEntity(maskStream).Decode()
+	data, err := e.decodeEntityStream(maskStream)
 	if err != nil {
 		return nil
 	}
 	decodeObj := firstNonNilObject(
-		maskStream.Dict().Get(entity.Name("Decode")),
-		maskStream.Dict().Get(entity.Name("D")),
+		maskStream.Dict().Get(pdfNameDecode),
+		maskStream.Dict().Get(pdfNameD),
 	)
 	paintBitOne := popplerExplicitImageMaskPaintBitOne(e.resolveImageDecodeArray(decodeObj))
 	return decodeExplicitImageMaskData(data, width, height, paintBitOne)
@@ -2783,8 +3611,8 @@ func (e *Evaluator) resolveImageMaskInterpolate(maskObj entity.Object) bool {
 		return false
 	}
 	interpolate, _ := resolveImageInterpolateOption(firstNonNilObject(
-		maskStream.Dict().Get(entity.Name("Interpolate")),
-		maskStream.Dict().Get(entity.Name("I")),
+		maskStream.Dict().Get(pdfNameInterpolate),
+		maskStream.Dict().Get(pdfNameI),
 	), false)
 	return interpolate
 }
@@ -2827,7 +3655,7 @@ func decodeExplicitImageMaskData(data []byte, width, height int, paintBitOne boo
 }
 
 func decodeSoftMaskImageStream(maskStream *entity.Stream) ([]byte, domainimage.ImageFilter, error) {
-	filterObj := maskStream.Dict().Get(entity.Name("Filter"))
+	filterObj := maskStream.Dict().Get(pdfNameFilter)
 	maskFilter, useEncodedData := resolveXObjectImageFilter(filterObj)
 	encodedPrefixLen := 0
 	if encodedFilter, prefixLen, ok := resolveXObjectEncodedFilterPipeline(filterObj); ok {
@@ -2844,11 +3672,65 @@ func decodeSoftMaskImageStream(maskStream *entity.Stream) ([]byte, domainimage.I
 		return data, maskFilter, nil
 	}
 
-	data, err := stream.NewFromEntity(maskStream).Decode()
+	infra := stream.NewFromEntity(maskStream)
+	if hint := softMaskDecodeSizeHint(maskStream.Dict()); hint > 0 {
+		infra.SetDecodeSizeHint(hint)
+	}
+	data, err := infra.Decode()
 	if err != nil {
 		return nil, domainimage.FilterNone, err
 	}
 	return data, domainimage.FilterNone, nil
+}
+
+func (e *Evaluator) decodeSoftMaskImageStream(maskStream *entity.Stream) ([]byte, domainimage.ImageFilter, error) {
+	filterObj := maskStream.Dict().Get(pdfNameFilter)
+	maskFilter, useEncodedData := resolveXObjectImageFilter(filterObj)
+	encodedPrefixLen := 0
+	if encodedFilter, prefixLen, ok := resolveXObjectEncodedFilterPipeline(filterObj); ok {
+		maskFilter = encodedFilter
+		useEncodedData = true
+		encodedPrefixLen = prefixLen
+	}
+
+	if useEncodedData {
+		data, err := decodeImageEncodedFilterPrefix(maskStream, encodedPrefixLen)
+		if err != nil {
+			return nil, domainimage.FilterNone, err
+		}
+		return data, maskFilter, nil
+	}
+
+	data, err := e.decodeEntityStreamWithSizeHint(maskStream, softMaskDecodeSizeHint(maskStream.Dict()))
+	if err != nil {
+		return nil, domainimage.FilterNone, err
+	}
+	return data, domainimage.FilterNone, nil
+}
+
+func softMaskDecodeSizeHint(maskDict *entity.Dict) int {
+	width, ok := objectInt(dictGetAny(maskDict, pdfNameWidth, pdfNameW))
+	if !ok || width <= 0 {
+		return 0
+	}
+	height, ok := objectInt(dictGetAny(maskDict, pdfNameHeight, pdfNameH))
+	if !ok || height <= 0 {
+		return 0
+	}
+	bpc := 8
+	if v, ok := objectInt(dictGetAny(maskDict, pdfNameBitsPerComponent, pdfNameBPC)); ok && v > 0 {
+		bpc = v
+	}
+	rowBits := int64(width) * int64(bpc)
+	if rowBits <= 0 {
+		return 0
+	}
+	size := ((rowBits + 7) / 8) * int64(height)
+	const maxDecodeSizeHint = 512 << 20
+	if size <= 0 || size > maxDecodeSizeHint {
+		return 0
+	}
+	return int(size)
 }
 
 func (e *Evaluator) resolveStreamObject(obj entity.Object) (*entity.Stream, bool) {
@@ -2970,7 +3852,7 @@ func parseICCBasedN(dict *entity.Dict) (int, bool) {
 	if dict == nil {
 		return 0, false
 	}
-	nObj := dict.Get(entity.Name("N"))
+	nObj := dict.Get(pdfNameN)
 	switch n := nObj.(type) {
 	case *entity.Integer:
 		return int(n.Value()), true
@@ -3056,23 +3938,23 @@ func decodeImageEncodedFilterPrefix(xobj *entity.Stream, prefixLen int) ([]byte,
 		return xobj.RawBytes(), nil
 	}
 
-	filterArray, ok := xobj.Dict().Get(entity.Name("Filter")).(*entity.Array)
+	filterArray, ok := xobj.Dict().Get(pdfNameFilter).(*entity.Array)
 	if !ok || filterArray.Len() < prefixLen {
 		return xobj.RawBytes(), nil
 	}
 
 	prefixDict := entity.NewDict()
 	if prefixLen == 1 {
-		prefixDict.Set(entity.Name("Filter"), filterArray.Get(0))
+		prefixDict.Set(pdfNameFilter, filterArray.Get(0))
 	} else {
 		filters := make([]entity.Object, 0, prefixLen)
 		for i := 0; i < prefixLen; i++ {
 			filters = append(filters, filterArray.Get(i))
 		}
-		prefixDict.Set(entity.Name("Filter"), entity.NewArray(filters...))
+		prefixDict.Set(pdfNameFilter, entity.NewArray(filters...))
 	}
-	if decodeParms := prefixDecodeParms(xobj.Dict().Get(entity.Name("DecodeParms")), prefixLen); decodeParms != nil {
-		prefixDict.Set(entity.Name("DecodeParms"), decodeParms)
+	if decodeParms := prefixDecodeParms(xobj.Dict().Get(pdfNameDecodeParms), prefixLen); decodeParms != nil {
+		prefixDict.Set(pdfNameDecodeParms, decodeParms)
 	}
 
 	return stream.NewFromEntity(entity.NewStream(prefixDict, xobj.RawBytes())).Decode()
@@ -3102,7 +3984,25 @@ func prefixDecodeParms(decodeParms entity.Object, prefixLen int) entity.Object {
 
 func normalizeImageFilterName(name string) domainimage.ImageFilter {
 	normalized := strings.TrimSpace(strings.TrimPrefix(name, "/"))
-	switch strings.ToLower(normalized) {
+	switch normalized {
+	case "AHx", "ASCIIHex", "ASCIIHexDecode":
+		return domainimage.FilterASCIIHex
+	case "A85", "ASCII85", "ASCII85Decode":
+		return domainimage.FilterASCII85
+	case "Fl", "Flate", "FlateDecode":
+		return domainimage.FilterFlate
+	case "LZW", "LZWDecode":
+		return domainimage.FilterLZW
+	case "RL", "RunLength", "RunLengthDecode":
+		return domainimage.FilterRunLength
+	case "CCF", "CCITT", "CCITTFax", "CCITTFaxDecode":
+		return domainimage.FilterCCITTFax
+	case "DCT", "DCTDecode":
+		return domainimage.FilterDCT
+	case "JPX", "JPXDecode":
+		return domainimage.FilterJPX
+	case "JBIG2", "JBIG2Decode":
+		return domainimage.FilterJBIG2
 	case "ahx", "asciihex", "asciihexdecode":
 		return domainimage.FilterASCIIHex
 	case "a85", "ascii85", "ascii85decode":
@@ -3122,7 +4022,32 @@ func normalizeImageFilterName(name string) domainimage.ImageFilter {
 	case "jbig2", "jbig2decode":
 		return domainimage.FilterJBIG2
 	default:
-		return domainimage.ImageFilter(normalized)
+		return normalizeImageFilterNameFolded(normalized)
+	}
+}
+
+func normalizeImageFilterNameFolded(name string) domainimage.ImageFilter {
+	switch {
+	case strings.EqualFold(name, "AHx"), strings.EqualFold(name, "ASCIIHex"), strings.EqualFold(name, "ASCIIHexDecode"):
+		return domainimage.FilterASCIIHex
+	case strings.EqualFold(name, "A85"), strings.EqualFold(name, "ASCII85"), strings.EqualFold(name, "ASCII85Decode"):
+		return domainimage.FilterASCII85
+	case strings.EqualFold(name, "Fl"), strings.EqualFold(name, "Flate"), strings.EqualFold(name, "FlateDecode"):
+		return domainimage.FilterFlate
+	case strings.EqualFold(name, "LZW"), strings.EqualFold(name, "LZWDecode"):
+		return domainimage.FilterLZW
+	case strings.EqualFold(name, "RL"), strings.EqualFold(name, "RunLength"), strings.EqualFold(name, "RunLengthDecode"):
+		return domainimage.FilterRunLength
+	case strings.EqualFold(name, "CCF"), strings.EqualFold(name, "CCITT"), strings.EqualFold(name, "CCITTFax"), strings.EqualFold(name, "CCITTFaxDecode"):
+		return domainimage.FilterCCITTFax
+	case strings.EqualFold(name, "DCT"), strings.EqualFold(name, "DCTDecode"):
+		return domainimage.FilterDCT
+	case strings.EqualFold(name, "JPX"), strings.EqualFold(name, "JPXDecode"):
+		return domainimage.FilterJPX
+	case strings.EqualFold(name, "JBIG2"), strings.EqualFold(name, "JBIG2Decode"):
+		return domainimage.FilterJBIG2
+	default:
+		return domainimage.ImageFilter(name)
 	}
 }
 
@@ -3173,6 +4098,9 @@ func (e *Evaluator) renderPlaceholderImage(width, height float64) {
 
 // concatenateMatrixToCTM concatenates a matrix to the current transformation matrix.
 func (e *Evaluator) concatenateMatrixToCTM(matrix [6]float64) {
+	if os.Getenv("PDF_DEBUG_CM") == "1" {
+		fmt.Fprintf(os.Stderr, "CM: matrix=[%f %f %f %f %f %f]\n", matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5])
+	}
 	e.graphics.transform = multiplyMatrix(e.graphics.transform, matrix)
 }
 
@@ -3236,7 +4164,7 @@ func (e *Evaluator) resolveGraphicsColorSpaceDetails(name entity.Name) (string, 
 	}
 
 	if e.hasResourceFrames() {
-		if csObj := e.getResourceEntry(entity.Name("ColorSpace"), name); csObj != nil {
+		if csObj := e.getResourceEntry(pdfNameColorSpace, name); csObj != nil {
 			if parsed, ok := e.resolveTypedGraphicsColorSpace(csObj); ok {
 				return parsed.Type().String(), "", parsed
 			}
@@ -3289,7 +4217,7 @@ func (e *Evaluator) resolvePatternColorSpaceBase(name entity.Name) (string, bool
 	if !e.hasResourceFrames() {
 		return "", false
 	}
-	colorSpaceObj := e.getResourceEntry(entity.Name("ColorSpace"), name)
+	colorSpaceObj := e.getResourceEntry(pdfNameColorSpace, name)
 	return e.resolvePatternColorSpaceBaseObject(colorSpaceObj, 0)
 }
 
@@ -3327,7 +4255,7 @@ func (e *Evaluator) resolvePatternColorSpaceBaseObject(obj entity.Object, depth 
 			return resolved, true
 		}
 		if baseRef, ok := typed.Get(1).(entity.Name); ok && e.hasResourceFrames() {
-			if resolvedObj := e.getResourceEntry(entity.Name("ColorSpace"), baseRef); resolvedObj != nil {
+			if resolvedObj := e.getResourceEntry(pdfNameColorSpace, baseRef); resolvedObj != nil {
 				if resolved, ok := e.resolveImageColorSpaceWithDepth(resolvedObj, depth+1); ok {
 					return resolved, true
 				}
@@ -3667,7 +4595,7 @@ func (e *Evaluator) resolvePattern(name entity.Name) (entity.Pattern, error) {
 		return nil, fmt.Errorf("no resources for pattern %s", name)
 	}
 
-	patternObj, patternFrames := e.getResourceEntryWithFrames(entity.Name("Pattern"), name)
+	patternObj, patternFrames := e.getResourceEntryWithFrames(pdfNamePattern, name)
 	if patternObj == nil {
 		return nil, fmt.Errorf("pattern %s not found", name)
 	}
@@ -3697,7 +4625,7 @@ func (e *Evaluator) resolvePattern(name entity.Name) (entity.Pattern, error) {
 	}
 
 	patternType := 1
-	if v := patternDict.Get(entity.Name("PatternType")); v != nil {
+	if v := patternDict.Get(pdfNamePatternType); v != nil {
 		parsed, err := objectIntStrict(v)
 		if err != nil {
 			return nil, fmt.Errorf("invalid pattern type: %w", err)
@@ -3705,7 +4633,7 @@ func (e *Evaluator) resolvePattern(name entity.Name) (entity.Pattern, error) {
 		patternType = parsed
 	}
 
-	matrix, ok := parseMatrix(patternDict.Get(entity.Name("Matrix")))
+	matrix, ok := parseMatrix(patternDict.Get(pdfNameMatrix))
 	if !ok {
 		matrix = [6]float64{1, 0, 0, 1, 0, 0}
 	}
@@ -3715,12 +4643,12 @@ func (e *Evaluator) resolvePattern(name entity.Name) (entity.Pattern, error) {
 		paintType := 1
 		tilingType := entity.TilingConstantSpacing
 
-		if v := patternDict.Get(entity.Name("PaintType")); v != nil {
+		if v := patternDict.Get(pdfNamePaintType); v != nil {
 			if parsed, err := objectIntStrict(v); err == nil {
 				paintType = parsed
 			}
 		}
-		if v := patternDict.Get(entity.Name("TilingType")); v != nil {
+		if v := patternDict.Get(pdfNameTilingType); v != nil {
 			if parsed, err := objectIntStrict(v); err == nil {
 				tilingType = entity.TilingType(parsed)
 			}
@@ -3730,7 +4658,7 @@ func (e *Evaluator) resolvePattern(name entity.Name) (entity.Pattern, error) {
 		pattern.SetXRef(e.xref)
 		pattern.SetMatrix(matrix)
 
-		if bboxObj := patternDict.Get(entity.Name("BBox")); bboxObj != nil {
+		if bboxObj := patternDict.Get(pdfNameBBox); bboxObj != nil {
 			if arr, ok := bboxObj.(*entity.Array); ok && arr.Len() >= 4 {
 				bbox := [4]float64{
 					getNumericOrZero(arr.Get(0)),
@@ -3741,17 +4669,17 @@ func (e *Evaluator) resolvePattern(name entity.Name) (entity.Pattern, error) {
 				pattern.SetBBox(bbox)
 			}
 		}
-		if xStep := patternDict.Get(entity.Name("XStep")); xStep != nil {
+		if xStep := patternDict.Get(pdfNameXStep); xStep != nil {
 			if value, err := getNumberOperand(xStep); err == nil {
 				pattern.SetXStep(value)
 			}
 		}
-		if yStep := patternDict.Get(entity.Name("YStep")); yStep != nil {
+		if yStep := patternDict.Get(pdfNameYStep); yStep != nil {
 			if value, err := getNumberOperand(yStep); err == nil {
 				pattern.SetYStep(value)
 			}
 		}
-		if resourcesObj := patternDict.Get(entity.Name("Resources")); resourcesObj != nil {
+		if resourcesObj := patternDict.Get(pdfNameResources); resourcesObj != nil {
 			if resources, ok := resourcesObj.(*entity.Dict); ok {
 				pattern.SetResources(resources)
 			}
@@ -3760,7 +4688,7 @@ func (e *Evaluator) resolvePattern(name entity.Name) (entity.Pattern, error) {
 		return pattern, nil
 
 	case 2:
-		shadingObj := patternDict.Get(entity.Name("Shading"))
+		shadingObj := patternDict.Get(pdfNameShading)
 		shading, err := e.parsePatternShading(shadingObj)
 		if err != nil {
 			return nil, err
@@ -4143,7 +5071,7 @@ func (e *Evaluator) applyGraphicsStateParameters(op Operator) error {
 		return nil
 	}
 
-	gsObj := e.getResourceEntry(entity.Name("ExtGState"), gsName)
+	gsObj := e.getResourceEntry(pdfNameExtGState, gsName)
 	if gsObj == nil {
 		return nil
 	}
@@ -4169,19 +5097,19 @@ func (e *Evaluator) applyGraphicsStateParameters(op Operator) error {
 		return nil
 	}
 
-	if lw := gsDict.Get(entity.Name("LW")); lw != nil {
+	if lw := gsDict.Get(pdfNameLW); lw != nil {
 		_ = e.setLineWidth(Operator{Opcode: "w", Operands: []entity.Object{lw}})
 	}
-	if lc := gsDict.Get(entity.Name("LC")); lc != nil {
+	if lc := gsDict.Get(pdfNameLC); lc != nil {
 		_ = e.setLineCap(Operator{Opcode: "J", Operands: []entity.Object{lc}})
 	}
-	if lj := gsDict.Get(entity.Name("LJ")); lj != nil {
+	if lj := gsDict.Get(pdfNameLJ); lj != nil {
 		_ = e.setLineJoin(Operator{Opcode: "j", Operands: []entity.Object{lj}})
 	}
-	if ml := gsDict.Get(entity.Name("ML")); ml != nil {
+	if ml := gsDict.Get(pdfNameML); ml != nil {
 		_ = e.setMiterLimit(Operator{Opcode: "M", Operands: []entity.Object{ml}})
 	}
-	if dash := gsDict.Get(entity.Name("D")); dash != nil {
+	if dash := gsDict.Get(pdfNameD); dash != nil {
 		if dashArray, ok := dash.(*entity.Array); ok && dashArray.Len() >= 2 {
 			_ = e.setDashPattern(Operator{
 				Opcode:   "d",
@@ -4190,35 +5118,46 @@ func (e *Evaluator) applyGraphicsStateParameters(op Operator) error {
 		}
 	}
 
-	if strokeAlpha := gsDict.Get(entity.Name("CA")); strokeAlpha != nil {
+	if strokeAlpha := gsDict.Get(pdfNameCA); strokeAlpha != nil {
 		if value, err := getNumberOperand(strokeAlpha); err == nil {
 			e.graphics.strokeAlpha = clamp(value, 0, 1)
 			e.syncCanvasStrokeAlpha()
 		}
 	}
-	if fillAlpha := gsDict.Get(entity.Name("ca")); fillAlpha != nil {
+	if fillAlpha := gsDict.Get(pdfNameca); fillAlpha != nil {
 		if value, err := getNumberOperand(fillAlpha); err == nil {
 			e.graphics.fillAlpha = clamp(value, 0, 1)
 			e.syncCanvasFillAlpha()
 		}
 	}
-	if blendMode := gsDict.Get(entity.Name("BM")); blendMode != nil {
+	if blendMode := gsDict.Get(pdfNameBM); blendMode != nil {
 		e.applyBlendModeObject(blendMode)
 	}
-	if alphaIsShape := gsDict.Get(entity.Name("AIS")); alphaIsShape != nil {
+	if alphaIsShape := gsDict.Get(pdfNameAIS); alphaIsShape != nil {
 		if value, ok := alphaIsShape.(*entity.Boolean); ok {
 			e.graphics.alphaIsShape = value.Value()
 		}
 	}
-	if transfer := gsDict.Get(entity.Name("TR2")); transfer != nil {
+	if transfer := gsDict.Get(pdfNameTR2); transfer != nil {
 		e.applyTransferObject(transfer)
-	} else if transfer := gsDict.Get(entity.Name("TR")); transfer != nil {
+	} else if transfer := gsDict.Get(pdfNameTR); transfer != nil {
 		e.applyTransferObject(transfer)
 	}
-	if softMask := gsDict.Get(entity.Name("SMask")); softMask != nil && enableExtGStateSoftMask() {
+	if strokeAdjust := gsDict.Get(pdfNameSA); strokeAdjust != nil {
+		if value, ok := strokeAdjust.(*entity.Boolean); ok {
+			e.graphics.strokeAdjust = value.Value()
+			e.syncCanvasStrokeAdjust()
+		}
+	}
+	if softMask := gsDict.Get(pdfNameSMask); softMask != nil && enableExtGStateSoftMask() {
 		if err := e.applyExtGStateSoftMask(softMask); err != nil {
 			return err
 		}
+	}
+
+	if os.Getenv("PDF_DEBUG_EVAL_GS") != "" {
+		fmt.Fprintf(os.Stderr, "GSAPPLY name=%v fillAlpha=%.4f blendMode=%v\n",
+			gsName, e.graphics.fillAlpha, e.graphics.blendMode)
 	}
 
 	return nil
@@ -4234,6 +5173,10 @@ type fillAlphaSetter interface {
 
 type strokeAlphaSetter interface {
 	SetStrokeAlpha(alpha float64)
+}
+
+type strokeAdjustSetter interface {
+	SetStrokeAdjust(adj bool)
 }
 
 type softMaskGroupCanvas interface {
@@ -4268,6 +5211,12 @@ type softMaskGroupCanvasWithOptions interface {
 
 type softMaskPresenceCanvas interface {
 	HasSoftMask() bool
+}
+
+// nonIsolatedGroupCanvas reports whether the current Splash state is rendering
+// inside a non-isolated transparency group (Poppler's setInNonIsolatedGroup).
+type nonIsolatedGroupCanvas interface {
+	InNonIsolatedGroup() bool
 }
 
 type transparencyGroupCanvas interface {
@@ -4335,6 +5284,23 @@ func (e *Evaluator) syncCanvasStrokeAlpha() {
 	}
 }
 
+func (e *Evaluator) syncCanvasStrokeAdjust() {
+	if e.canvas == nil {
+		return
+	}
+	if setter, ok := e.canvas.(strokeAdjustSetter); ok {
+		setter.SetStrokeAdjust(e.graphics.strokeAdjust)
+	}
+}
+
+// canvasYDownBase reports whether the canvas consumes y-down composed CTMs.
+func (e *Evaluator) canvasYDownBase() bool {
+	if c, ok := e.canvas.(interface{ YDownBase() bool }); ok {
+		return c.YDownBase()
+	}
+	return false
+}
+
 func (e *Evaluator) applyExtGStateSoftMask(obj entity.Object) error {
 	controller, ok := e.canvas.(softMaskGroupCanvas)
 	if !ok {
@@ -4358,15 +5324,22 @@ func (e *Evaluator) evaluateExtGStateSoftMask(maskDict *entity.Dict, controller 
 	if maskDict == nil || controller == nil {
 		return nil
 	}
-	groupStream, ok := e.resolveStreamObject(maskDict.Get(entity.Name("G")))
+	if os.Getenv("PDF_DEBUG_EVAL_GS") != "" {
+		subtype := "(none)"
+		if s, ok := e.resolveResourceEntryObject(maskDict.Get(pdfNameS), 0).(entity.Name); ok {
+			subtype = s.Value()
+		}
+		fmt.Fprintf(os.Stderr, "SMASKENTER subtype=%s bbox-pending fillAlpha=%.4f\n", subtype, e.graphics.fillAlpha)
+	}
+	groupStream, ok := e.resolveStreamObject(maskDict.Get(pdfNameG))
 	if !ok || groupStream == nil || groupStream.Dict() == nil {
 		return nil
 	}
-	groupDict, ok := e.resolveDictObject(groupStream.Dict().Get(entity.Name("Group")))
+	groupDict, ok := e.resolveDictObject(groupStream.Dict().Get(pdfNameGroup))
 	if !ok || !isTransparencyGroupDict(groupDict) {
 		return nil
 	}
-	bboxArr, ok := e.resolveArrayObject(groupStream.Dict().Get(entity.Name("BBox")))
+	bboxArr, ok := e.resolveArrayObject(groupStream.Dict().Get(pdfNameBBox))
 	if !ok || bboxArr.Len() != 4 {
 		return nil
 	}
@@ -4374,7 +5347,7 @@ func (e *Evaluator) evaluateExtGStateSoftMask(maskDict *entity.Dict, controller 
 	if !ok {
 		return nil
 	}
-	ops, err := e.cachedFormOperators(groupStream)
+	content, err := e.formOperatorContentForExecution(groupStream)
 	if err != nil {
 		return err
 	}
@@ -4382,6 +5355,7 @@ func (e *Evaluator) evaluateExtGStateSoftMask(maskDict *entity.Dict, controller 
 	if err := e.saveState(); err != nil {
 		return err
 	}
+	e.preserveNonEmptyCallerPathOnSavedState()
 	restore := true
 	defer func() {
 		if restore {
@@ -4390,13 +5364,13 @@ func (e *Evaluator) evaluateExtGStateSoftMask(maskDict *entity.Dict, controller 
 	}()
 
 	e.clearCurrentPathForForm()
-	if matrixArr, ok := e.resolveArrayObject(groupStream.Dict().Get(entity.Name("Matrix"))); ok && matrixArr.Len() == 6 {
+	if matrixArr, ok := e.resolveArrayObject(groupStream.Dict().Get(pdfNameMatrix)); ok && matrixArr.Len() == 6 {
 		e.concatenateMatrixToCTM(numericMatrix6(matrixArr))
 	}
 	e.graphics.baseTransform = e.graphics.transform
 
 	var maskResources *entity.Dict
-	if resourcesDict, ok := e.resolveFormResources(groupStream.Dict().Get(entity.Name("Resources"))); ok {
+	if resourcesDict, ok := e.resolveFormResources(groupStream.Dict().Get(pdfNameResources)); ok {
 		maskResources = resourcesDict
 	}
 	defer e.pushResources(maskResources)()
@@ -4426,7 +5400,11 @@ func (e *Evaluator) evaluateExtGStateSoftMask(maskDict *entity.Dict, controller 
 			return err
 		}
 		e.graphics.transform[4] -= float64(tx)
-		e.graphics.transform[5] += float64(ty)
+		if e.canvasYDownBase() {
+			e.graphics.transform[5] -= float64(ty)
+		} else {
+			e.graphics.transform[5] += float64(ty)
+		}
 		e.graphics.baseTransform = e.graphics.transform
 	} else if deviceController, ok := controller.(softMaskGroupDeviceBBoxCanvas); ok {
 		if err := deviceController.BeginSoftMaskGroupDeviceBBox(deviceBBox, isolated, knockout); err != nil {
@@ -4438,11 +5416,19 @@ func (e *Evaluator) evaluateExtGStateSoftMask(maskDict *entity.Dict, controller 
 		}
 	}
 	alpha := false
-	if subtype, ok := e.resolveResourceEntryObject(maskDict.Get(entity.Name("S")), 0).(entity.Name); ok {
+	if subtype, ok := e.resolveResourceEntryObject(maskDict.Get(pdfNameS), 0).(entity.Name); ok {
 		alpha = strings.EqualFold(subtype.Value(), "Alpha")
 	}
 	options := e.resolveSoftMaskOptions(maskDict, groupDict, alpha)
-	e.executeCachedOperators(ops)
+	if os.Getenv("PDF_DEBUG_EVAL_GS") != "" {
+		fmt.Fprintf(os.Stderr, "SMASKEXEC alpha=%t isolated=%t knockout=%t bbox=%.1f,%.1f,%.1f,%.1f\n", alpha, isolated, knockout, bbox[0], bbox[1], bbox[2], bbox[3])
+	}
+	if err := e.executeFormOperatorContent(content); err != nil {
+		return errors.Invalid("soft_mask_form", err)
+	}
+	if os.Getenv("PDF_DEBUG_EVAL_GS") != "" {
+		fmt.Fprintf(os.Stderr, "SMASKDONE\n")
+	}
 	if advanced, ok := controller.(softMaskGroupCanvasWithOptions); ok {
 		if err := advanced.EndSoftMaskGroupWithOptions(options); err != nil {
 			return err
@@ -4463,7 +5449,7 @@ func (e *Evaluator) resolveSoftMaskOptions(maskDict, groupDict *entity.Dict, alp
 	if maskDict == nil {
 		return options
 	}
-	if transfer := maskDict.Get(entity.Name("TR")); transfer != nil {
+	if transfer := maskDict.Get(pdfNameTR); transfer != nil {
 		if fn, err := e.parseTransferFunction(transfer); err == nil {
 			for i := 0; i < 256; i++ {
 				options.Transfer[i] = evaluateTransferByte(fn, float64(i)/255.0)
@@ -4477,7 +5463,7 @@ func (e *Evaluator) resolveSoftMaskOptions(maskDict, groupDict *entity.Dict, alp
 		return options
 	}
 	values := defaultColorValues(colorSpace.Type().String(), colorSpace)
-	if bc, ok := e.resolveArrayObject(maskDict.Get(entity.Name("BC"))); ok {
+	if bc, ok := e.resolveArrayObject(maskDict.Get(pdfNameBC)); ok {
 		values = numericColorOperandsFromArray(bc)
 	}
 	rgba := colorSpace.ConvertToRGBA(values)
@@ -4491,7 +5477,7 @@ func (e *Evaluator) resolveSoftMaskBlendingColorSpace(groupDict *entity.Dict) (c
 	if groupDict == nil {
 		return nil, false
 	}
-	csObj := groupDict.Get(entity.Name("CS"))
+	csObj := groupDict.Get(pdfNameCS)
 	if csObj == nil {
 		return nil, false
 	}
@@ -4556,7 +5542,7 @@ func isTransparencyGroupDict(dict *entity.Dict) bool {
 	if dict == nil {
 		return false
 	}
-	if subtype, ok := dict.Get(entity.Name("S")).(entity.Name); ok {
+	if subtype, ok := dict.Get(pdfNameS).(entity.Name); ok {
 		return strings.EqualFold(subtype.Value(), "Transparency")
 	}
 	return false
@@ -4589,7 +5575,7 @@ func (e *Evaluator) resourcesNeedTransparencyGroup(resources *entity.Dict) bool 
 	if resources == nil {
 		return false
 	}
-	extGStateObj := e.resolveResourceEntryObject(resources.Get(entity.Name("ExtGState")), 0)
+	extGStateObj := e.resolveResourceEntryObject(resources.Get(pdfNameExtGState), 0)
 	if streamObj, ok := extGStateObj.(*entity.Stream); ok {
 		extGStateObj = streamObj.Dict()
 	}
@@ -4613,7 +5599,7 @@ func (e *Evaluator) extGStateNeedsTransparencyGroup(gsDict *entity.Dict) bool {
 	if gsDict == nil {
 		return false
 	}
-	if blendMode := gsDict.Get(entity.Name("BM")); blendMode != nil {
+	if blendMode := gsDict.Get(pdfNameBM); blendMode != nil {
 		if name, ok := e.firstSupportedBlendModeName(blendMode, 0); ok && normalizeBlendModeName(name) != "Normal" {
 			return true
 		}
@@ -4625,10 +5611,10 @@ func (e *Evaluator) extGStateNeedsTransparencyGroup(gsDict *entity.Dict) bool {
 			}
 		}
 	}
-	if alphaIsShape, ok := gsDict.Get(entity.Name("AIS")).(*entity.Boolean); ok && alphaIsShape.Value() {
+	if alphaIsShape, ok := gsDict.Get(pdfNameAIS).(*entity.Boolean); ok && alphaIsShape.Value() {
 		return true
 	}
-	if softMask := gsDict.Get(entity.Name("SMask")); softMask != nil {
+	if softMask := gsDict.Get(pdfNameSMask); softMask != nil {
 		if name, ok := softMask.(entity.Name); !ok || !strings.EqualFold(name.Value(), "None") {
 			return true
 		}
@@ -4896,9 +5882,9 @@ func (e *Evaluator) moveTo(op Operator) error {
 	tx, ty := e.transformPoint(x, y)
 
 	// Add move-to element to path
-	e.graphics.path.AddElement(&MoveTo{X: tx, Y: ty})
+	e.graphics.path.MoveTo(tx, ty)
 	if rawPath := e.currentRawPath(); rawPath != nil {
-		rawPath.AddElement(&MoveTo{X: x, Y: y})
+		rawPath.MoveTo(x, y)
 	}
 
 	return nil
@@ -4924,9 +5910,9 @@ func (e *Evaluator) lineTo(op Operator) error {
 	tx, ty := e.transformPoint(x, y)
 
 	// Add line-to element to path
-	e.graphics.path.AddElement(&LineTo{X: tx, Y: ty})
+	e.graphics.path.LineTo(tx, ty)
 	if rawPath := e.currentRawPath(); rawPath != nil {
-		rawPath.AddElement(&LineTo{X: x, Y: y})
+		rawPath.LineTo(x, y)
 	}
 
 	return nil
@@ -4975,17 +5961,9 @@ func (e *Evaluator) curveTo(op Operator) error {
 	tx, ty := e.transformPoint(x, y)
 
 	// Add curve-to element to path
-	e.graphics.path.AddElement(&CurveTo{
-		X1: tx1, Y1: ty1,
-		X2: tx2, Y2: ty2,
-		X: tx, Y: ty,
-	})
+	e.graphics.path.CurveTo(tx1, ty1, tx2, ty2, tx, ty)
 	if rawPath := e.currentRawPath(); rawPath != nil {
-		rawPath.AddElement(&CurveTo{
-			X1: x1, Y1: y1,
-			X2: x2, Y2: y2,
-			X: x, Y: y,
-		})
+		rawPath.CurveTo(x1, y1, x2, y2, x, y)
 	}
 
 	return nil
@@ -5030,17 +6008,9 @@ func (e *Evaluator) curveToNoFirstControl(op Operator) error {
 	tx, ty := e.transformPoint(x, y)
 
 	// Add curve-to element to path
-	e.graphics.path.AddElement(&CurveTo{
-		X1: cx, Y1: cy,
-		X2: tx2, Y2: ty2,
-		X: tx, Y: ty,
-	})
+	e.graphics.path.CurveTo(cx, cy, tx2, ty2, tx, ty)
 	if rawPath := e.currentRawPath(); rawPath != nil {
-		rawPath.AddElement(&CurveTo{
-			X1: rawCX, Y1: rawCY,
-			X2: x2, Y2: y2,
-			X: x, Y: y,
-		})
+		rawPath.CurveTo(rawCX, rawCY, x2, y2, x, y)
 	}
 
 	return nil
@@ -5078,17 +6048,9 @@ func (e *Evaluator) curveToNoLastControl(op Operator) error {
 	tx, ty := e.transformPoint(x, y)
 
 	// Add curve-to element to path (last control point equals end point)
-	e.graphics.path.AddElement(&CurveTo{
-		X1: tx1, Y1: ty1,
-		X2: tx, Y2: ty,
-		X: tx, Y: ty,
-	})
+	e.graphics.path.CurveTo(tx1, ty1, tx, ty, tx, ty)
 	if rawPath := e.currentRawPath(); rawPath != nil {
-		rawPath.AddElement(&CurveTo{
-			X1: x1, Y1: y1,
-			X2: x, Y2: y,
-			X: x, Y: y,
-		})
+		rawPath.CurveTo(x1, y1, x, y, x, y)
 	}
 
 	return nil
@@ -5096,9 +6058,9 @@ func (e *Evaluator) curveToNoLastControl(op Operator) error {
 
 // closePath closes the current subpath - 'h' operator.
 func (e *Evaluator) closePath(op Operator) error {
-	e.graphics.path.AddElement(&Close{})
+	e.graphics.path.ClosePath()
 	if rawPath := e.currentRawPath(); rawPath != nil {
-		rawPath.AddElement(&Close{})
+		rawPath.ClosePath()
 	}
 	return nil
 }
@@ -5177,9 +6139,9 @@ func (e *Evaluator) strokePath() error {
 // strokeAndClosePath closes and strokes the current path - 's' operator.
 func (e *Evaluator) strokeAndClosePath() error {
 	// Close the path first
-	e.graphics.path.AddElement(&Close{})
+	e.graphics.path.ClosePath()
 	if rawPath := e.currentRawPath(); rawPath != nil {
-		rawPath.AddElement(&Close{})
+		rawPath.ClosePath()
 	}
 
 	return e.strokePath()
@@ -5334,9 +6296,9 @@ func (e *Evaluator) shouldPaintStrokePath() bool {
 // closeFillAndStrokePath closes, fills, and strokes the current path - 'b' operator.
 func (e *Evaluator) closeFillAndStrokePath() error {
 	// Close the path first
-	e.graphics.path.AddElement(&Close{})
+	e.graphics.path.ClosePath()
 	if rawPath := e.currentRawPath(); rawPath != nil {
-		rawPath.AddElement(&Close{})
+		rawPath.ClosePath()
 	}
 
 	return e.fillAndStrokePath()
@@ -5345,9 +6307,9 @@ func (e *Evaluator) closeFillAndStrokePath() error {
 // closeFillAndStrokePathEvenOdd closes, fills, and strokes using even-odd rule - 'b*' operator.
 func (e *Evaluator) closeFillAndStrokePathEvenOdd() error {
 	// Close the path first
-	e.graphics.path.AddElement(&Close{})
+	e.graphics.path.ClosePath()
 	if rawPath := e.currentRawPath(); rawPath != nil {
-		rawPath.AddElement(&Close{})
+		rawPath.ClosePath()
 	}
 
 	return e.fillAndStrokePathEvenOdd()
@@ -5425,6 +6387,10 @@ func (e *Evaluator) tryRenderFillPathInPopplerOrder(evenOdd bool) bool {
 		return false
 	}
 	tracePopplerOrderFillPathCandidate("use", rawPath, e.graphics.transform, evenOdd)
+	if pathCanvas, ok := e.canvas.(popplerOrderFillPathCanvas); ok {
+		pathCanvas.FillPathObjectWithCTM(rawPath, e.graphics.transform, evenOdd)
+		return true
+	}
 	canvas.FillPathWithCTM(rawPath.Elements(), e.graphics.transform, evenOdd)
 	return true
 }
@@ -5449,13 +6415,23 @@ func (e *Evaluator) tryRenderStrokePathInPopplerOrder() bool {
 	if len(dash) > 0 {
 		dash = append([]float64(nil), dash...)
 	}
-	canvas.StrokePathWithCTM(
-		rawPath.Elements(),
-		e.graphics.transform,
-		e.graphics.lineWidth,
-		dash,
-		e.graphics.currentState.GetDashPhase(),
-	)
+	if pathCanvas, ok := e.canvas.(popplerOrderStrokePathCanvas); ok {
+		pathCanvas.StrokePathObjectWithCTM(
+			rawPath,
+			e.graphics.transform,
+			e.graphics.lineWidth,
+			dash,
+			e.graphics.currentState.GetDashPhase(),
+		)
+	} else {
+		canvas.StrokePathWithCTM(
+			rawPath.Elements(),
+			e.graphics.transform,
+			e.graphics.lineWidth,
+			dash,
+			e.graphics.currentState.GetDashPhase(),
+		)
+	}
 	return true
 }
 
@@ -5513,20 +6489,24 @@ func popplerOrderFillPathCandidate(path *Path) bool {
 	if path == nil || path.IsEmpty() {
 		return false
 	}
-	elements := path.Elements()
-	if len(elements) > 64 {
+	elementCount := path.ElementCount()
+	if elementCount > 64 {
 		return false
 	}
 	moveCount := 0
 	curveCount := 0
 	closeCount := 0
-	for _, elem := range elements {
-		switch elem.(type) {
-		case *MoveTo:
+	for i := 0; i < elementCount; i++ {
+		typ, _, _, _, _, _, _, ok := path.ElementAt(i)
+		if !ok {
+			continue
+		}
+		switch typ {
+		case PathMoveTo:
 			moveCount++
-		case *Close:
+		case PathClose:
 			closeCount++
-		case *CurveTo:
+		case PathCurveTo:
 			curveCount++
 		}
 	}
@@ -5548,7 +6528,7 @@ func popplerOrderFillPathCandidate(path *Path) bool {
 	if width <= 40 && height <= 40 {
 		return true
 	}
-	return moderateClosedCurvedPopplerOrderFillPathCandidate(len(elements), moveCount, curveCount, closeCount, width, height)
+	return moderateClosedCurvedPopplerOrderFillPathCandidate(elementCount, moveCount, curveCount, closeCount, width, height)
 }
 
 func moderateClosedCurvedPopplerOrderFillPathCandidate(elementCount, moveCount, curveCount, closeCount int, width, height float64) bool {
@@ -5562,20 +6542,24 @@ func tracePopplerOrderFillPathCandidate(decision string, path *Path, ctm [6]floa
 	if os.Getenv("PDF_DEBUG_SPLASH_POPPLER_ORDER_FILL_CANDIDATE_TRACE") != "1" {
 		return
 	}
-	elements := path.Elements()
 	moveCount := 0
 	lineCount := 0
 	curveCount := 0
 	closeCount := 0
-	for _, elem := range elements {
-		switch elem.(type) {
-		case *MoveTo:
+	elementCount := path.ElementCount()
+	for i := 0; i < elementCount; i++ {
+		typ, _, _, _, _, _, _, ok := path.ElementAt(i)
+		if !ok {
+			continue
+		}
+		switch typ {
+		case PathMoveTo:
 			moveCount++
-		case *LineTo:
+		case PathLineTo:
 			lineCount++
-		case *CurveTo:
+		case PathCurveTo:
 			curveCount++
-		case *Close:
+		case PathClose:
 			closeCount++
 		}
 	}
@@ -5585,7 +6569,7 @@ func tracePopplerOrderFillPathCandidate(decision string, path *Path, ctm [6]floa
 	fmt.Fprintf(
 		os.Stderr,
 		"poppler-fill-candidate decision=%s evenOdd=%v elems=%d moves=%d lines=%d curves=%d closes=%d raw=[%.6f %.6f %.6f %.6f] rawSize=[%.6f %.6f] dev=[%.6f %.6f %.6f %.6f] devSize=[%.6f %.6f]\n",
-		decision, evenOdd, len(elements), moveCount, lineCount, curveCount, closeCount,
+		decision, evenOdd, elementCount, moveCount, lineCount, curveCount, closeCount,
 		xMin, yMin, xMax, yMax, xMax-xMin, yMax-yMin,
 		dxMin, dyMin, dxMax, dyMax, dxMax-dxMin, dyMax-dyMin,
 	)
@@ -5616,21 +6600,25 @@ func transformRendererPath(path *Path, matrix [6]float64) *Path {
 		return nil
 	}
 	out := NewPath()
-	for _, elem := range path.Elements() {
-		switch el := elem.(type) {
-		case *MoveTo:
-			x, y := transformPointWithMatrix(matrix, el.X, el.Y)
-			out.AddElement(&MoveTo{X: x, Y: y})
-		case *LineTo:
-			x, y := transformPointWithMatrix(matrix, el.X, el.Y)
-			out.AddElement(&LineTo{X: x, Y: y})
-		case *CurveTo:
-			x1, y1 := transformPointWithMatrix(matrix, el.X1, el.Y1)
-			x2, y2 := transformPointWithMatrix(matrix, el.X2, el.Y2)
-			x, y := transformPointWithMatrix(matrix, el.X, el.Y)
-			out.AddElement(&CurveTo{X1: x1, Y1: y1, X2: x2, Y2: y2, X: x, Y: y})
-		case *Close:
-			out.AddElement(&Close{})
+	for i := 0; i < path.ElementCount(); i++ {
+		typ, x1, y1, x2, y2, x, y, ok := path.ElementAt(i)
+		if !ok {
+			continue
+		}
+		switch typ {
+		case PathMoveTo:
+			tx, ty := transformPointWithMatrix(matrix, x, y)
+			out.MoveTo(tx, ty)
+		case PathLineTo:
+			tx, ty := transformPointWithMatrix(matrix, x, y)
+			out.LineTo(tx, ty)
+		case PathCurveTo:
+			tx1, ty1 := transformPointWithMatrix(matrix, x1, y1)
+			tx2, ty2 := transformPointWithMatrix(matrix, x2, y2)
+			tx, ty := transformPointWithMatrix(matrix, x, y)
+			out.CurveTo(tx1, ty1, tx2, ty2, tx, ty)
+		case PathClose:
+			out.ClosePath()
 		}
 	}
 	return out
@@ -5640,15 +6628,20 @@ func (e *Evaluator) replayPathToCanvas() {
 	if e.canvas == nil {
 		return
 	}
-	for _, elem := range e.graphics.path.Elements() {
-		switch el := elem.(type) {
-		case *MoveTo:
-			e.canvas.MoveTo(el.X, el.Y)
-		case *LineTo:
-			e.canvas.LineTo(el.X, el.Y)
-		case *CurveTo:
-			e.canvas.CurveTo(el.X1, el.Y1, el.X2, el.Y2, el.X, el.Y)
-		case *Close:
+	path := e.graphics.path
+	for i := 0; i < path.ElementCount(); i++ {
+		typ, x1, y1, x2, y2, x, y, ok := path.ElementAt(i)
+		if !ok {
+			continue
+		}
+		switch typ {
+		case PathMoveTo:
+			e.canvas.MoveTo(x, y)
+		case PathLineTo:
+			e.canvas.LineTo(x, y)
+		case PathCurveTo:
+			e.canvas.CurveTo(x1, y1, x2, y2, x, y)
+		case PathClose:
 			e.canvas.ClosePath()
 		}
 	}
@@ -5713,6 +6706,15 @@ func (e *Evaluator) syncCanvasColors() {
 	e.canvas.SetStrokeColor(colorFromGraphicsState(e.graphics.strokeColor, e.graphics.strokeAlpha))
 	e.canvas.SetFillPattern(e.patternForCanvas(e.graphics.fillPattern))
 	e.canvas.SetStrokePattern(e.patternForCanvas(e.graphics.strokePattern))
+	// Re-assert the ExtGState (/ca, /CA) opacities after the color setters. The
+	// splash canvas derives stroke/fill alpha from the color.Color's alpha channel
+	// (quantized through the color-component byte conversion), which clobbers the
+	// exact /ca-/CA float (e.g. 0.7 -> 178/255 instead of splashRound(0.7*255)=179).
+	// Poppler keeps color (setFillPattern, opaque) and opacity (setFillAlpha, double)
+	// fully decoupled (SplashOutputDev.cc:1738-1757); mirror that by restoring the
+	// unquantized opacity here so the pipe computes splashRound(alpha*255) exactly.
+	e.syncCanvasFillAlpha()
+	e.syncCanvasStrokeAlpha()
 	strokeScale := e.ctmStrokeScale()
 	e.canvas.SetLineWidth(e.graphics.lineWidth * strokeScale)
 	e.canvas.SetLineCap(e.graphics.currentState.GetLineCap())
@@ -5744,6 +6746,46 @@ func (e *Evaluator) ctmStrokeScale() float64 {
 	return math.Sqrt(d1)
 }
 
+// popplerShadingPatternCTM replicates Gfx::doShadingPatternFill's matrix
+// construction bit-for-bit: ictm = adjugate-inverse of the current CTM
+// (det reciprocal FIRST), m1 = ptm×btm, m = m1×ictm, result = concat(m, ctm)
+// with GfxState::concatCTM's exact expression order.
+func popplerShadingPatternCTM(ptm, btm, ctm [6]float64) [6]float64 {
+	det := ctm[0]*ctm[3] - ctm[1]*ctm[2]
+	if math.Abs(det) < 0.000001 {
+		return multiplyMatrix(btm, ptm)
+	}
+	det = 1 / det
+	var ictm [6]float64
+	ictm[0] = ctm[3] * det
+	ictm[1] = -ctm[1] * det
+	ictm[2] = -ctm[2] * det
+	ictm[3] = ctm[0] * det
+	ictm[4] = (ctm[2]*ctm[5] - ctm[3]*ctm[4]) * det
+	ictm[5] = (ctm[1]*ctm[4] - ctm[0]*ctm[5]) * det
+	var m1, m, out [6]float64
+	m1[0] = ptm[0]*btm[0] + ptm[1]*btm[2]
+	m1[1] = ptm[0]*btm[1] + ptm[1]*btm[3]
+	m1[2] = ptm[2]*btm[0] + ptm[3]*btm[2]
+	m1[3] = ptm[2]*btm[1] + ptm[3]*btm[3]
+	m1[4] = ptm[4]*btm[0] + ptm[5]*btm[2] + btm[4]
+	m1[5] = ptm[4]*btm[1] + ptm[5]*btm[3] + btm[5]
+	m[0] = m1[0]*ictm[0] + m1[1]*ictm[2]
+	m[1] = m1[0]*ictm[1] + m1[1]*ictm[3]
+	m[2] = m1[2]*ictm[0] + m1[3]*ictm[2]
+	m[3] = m1[2]*ictm[1] + m1[3]*ictm[3]
+	m[4] = m1[4]*ictm[0] + m1[5]*ictm[2] + ictm[4]
+	m[5] = m1[4]*ictm[1] + m1[5]*ictm[3] + ictm[5]
+	// GfxState::concatCTM(m): new = m ∘ ctm
+	out[0] = m[0]*ctm[0] + m[1]*ctm[2]
+	out[1] = m[0]*ctm[1] + m[1]*ctm[3]
+	out[2] = m[2]*ctm[0] + m[3]*ctm[2]
+	out[3] = m[2]*ctm[1] + m[3]*ctm[3]
+	out[4] = m[4]*ctm[0] + m[5]*ctm[2] + ctm[4]
+	out[5] = m[4]*ctm[1] + m[5]*ctm[3] + ctm[5]
+	return out
+}
+
 func (e *Evaluator) patternForCanvas(pattern entity.Pattern) entity.Pattern {
 	if pattern == nil {
 		return nil
@@ -5757,6 +6799,15 @@ func (e *Evaluator) patternForCanvas(pattern entity.Pattern) entity.Pattern {
 			// Probe Poppler Gfx::doShadingPatternFill's explicit PTM * baseMatrix
 			// order without changing the current default matrix convention.
 			effectiveMatrix = multiplyMatrix(typed.Matrix(), e.graphics.baseTransform)
+		}
+		if e.canvasYDownBase() {
+			// Poppler Gfx::doShadingPatternFill (Gfx.cc:2229-2264) does NOT use
+			// PTM×BTM directly: it composes m = (PTM×BTM)×inverse(CTM) and then
+			// concatCTM(m), i.e. the effective pattern CTM makes a float
+			// ROUND-TRIP through inverse(ctm)×ctm. That round-trip leaves ~2e-13
+			// residue (e.g. day1 f: 1125.0 → 1125.0000000000002) which decides
+			// shading colour bands (t at band edges). Replicate it verbatim.
+			effectiveMatrix = popplerShadingPatternCTM(typed.Matrix(), e.graphics.baseTransform, e.graphics.transform)
 		}
 		clone.SetMatrix(effectiveMatrix)
 		return clone
@@ -5850,18 +6901,52 @@ func (e *Evaluator) applyPendingClipAtPathEnd() {
 		return
 	}
 
-	e.graphics.pathClip = e.graphics.path.Clone()
-	e.graphics.clipMode = e.graphics.pendingClipMode
+	clipMode := e.graphics.pendingClipMode
+	clipPath := e.graphics.path
 
 	if e.canvas != nil {
-		if e.graphics.pendingClipMode == ClipEvenOdd {
-			e.applyClippingPathEvenOdd()
-		} else {
-			e.applyClippingPath()
-		}
+		e.applyClippingPathObject(clipPath, clipMode)
 	}
 
+	e.graphics.pathClip = nil
+	e.setCurrentPathClipBounds(clipPath)
+	e.graphics.clipMode = clipMode
 	e.graphics.pendingClip = false
+}
+
+func (e *Evaluator) setCurrentPathClipBounds(path *Path) {
+	if e == nil || e.graphics == nil {
+		return
+	}
+	e.graphics.pathClipBounds = [4]float64{}
+	e.graphics.pathClipBoundsValid = false
+	if path == nil || path.IsEmpty() {
+		return
+	}
+	xMin, yMin, xMax, yMax := path.GetBounds()
+	if xMax <= xMin || yMax <= yMin {
+		return
+	}
+	e.graphics.pathClipBounds = [4]float64{xMin, yMin, xMax, yMax}
+	e.graphics.pathClipBoundsValid = true
+}
+
+func (e *Evaluator) currentPathClipBounds() (float64, float64, float64, float64, bool) {
+	if e == nil || e.graphics == nil {
+		return 0, 0, 0, 0, false
+	}
+	if e.graphics.pathClipBoundsValid {
+		b := e.graphics.pathClipBounds
+		return b[0], b[1], b[2], b[3], true
+	}
+	if e.graphics.pathClip == nil || e.graphics.pathClip.IsEmpty() {
+		return 0, 0, 0, 0, false
+	}
+	xMin, yMin, xMax, yMax := e.graphics.pathClip.GetBounds()
+	if xMax <= xMin || yMax <= yMin {
+		return 0, 0, 0, 0, false
+	}
+	return xMin, yMin, xMax, yMax, true
 }
 
 // applyClippingPath applies the current clipping path to the canvas.
@@ -5869,7 +6954,13 @@ func (e *Evaluator) applyClippingPath() {
 	if e.canvas == nil || e.graphics.pathClip == nil {
 		return
 	}
+	e.applyClippingPathObject(e.graphics.pathClip, ClipNonZeroWinding)
+}
 
+func (e *Evaluator) applyClippingPathObject(path *Path, mode ClipMode) {
+	if e.canvas == nil || path == nil {
+		return
+	}
 	// Try to use the canvas implementation's SetClipPathDirect method
 	type clipCanvas interface {
 		SetClipPathDirect(elements []interface{}, fillRule graphics.FillRule)
@@ -5877,30 +6968,28 @@ func (e *Evaluator) applyClippingPath() {
 
 	if clipImpl, ok := e.canvas.(clipCanvas); ok {
 		// Convert []PathElement to []interface{}
-		elements := make([]interface{}, len(e.graphics.pathClip.Elements()))
-		for i, elem := range e.graphics.pathClip.Elements() {
+		pathElements := path.Elements()
+		elements := make([]interface{}, len(pathElements))
+		for i, elem := range pathElements {
 			elements[i] = elem
 		}
-		clipImpl.SetClipPathDirect(elements, graphics.FillRuleNonZero)
+		fillRule := graphics.FillRuleNonZero
+		if mode == ClipEvenOdd {
+			fillRule = graphics.FillRuleEvenOdd
+		}
+		clipImpl.SetClipPathDirect(elements, fillRule)
 		return
 	}
 
 	// Fallback: replay clipping path elements to canvas (may interfere with current path)
-	for _, elem := range e.graphics.pathClip.Elements() {
-		switch el := elem.(type) {
-		case *MoveTo:
-			e.canvas.MoveTo(el.X, el.Y)
-		case *LineTo:
-			e.canvas.LineTo(el.X, el.Y)
-		case *CurveTo:
-			e.canvas.CurveTo(el.X1, el.Y1, el.X2, el.Y2, el.X, el.Y)
-		case *Close:
-			e.canvas.ClosePath()
-		}
-	}
+	e.replayPathObjectToCanvas(path)
 
 	// Apply clipping
-	e.canvas.Clip()
+	if mode == ClipEvenOdd {
+		e.canvas.EoClip()
+	} else {
+		e.canvas.Clip()
+	}
 }
 
 // applyClippingPathEvenOdd applies the clipping path using even-odd rule.
@@ -5908,23 +6997,29 @@ func (e *Evaluator) applyClippingPathEvenOdd() {
 	if e.canvas == nil || e.graphics.pathClip == nil {
 		return
 	}
+	e.applyClippingPathObject(e.graphics.pathClip, ClipEvenOdd)
+}
 
-	// Replay clipping path elements to canvas
-	for _, elem := range e.graphics.pathClip.Elements() {
-		switch el := elem.(type) {
-		case *MoveTo:
-			e.canvas.MoveTo(el.X, el.Y)
-		case *LineTo:
-			e.canvas.LineTo(el.X, el.Y)
-		case *CurveTo:
-			e.canvas.CurveTo(el.X1, el.Y1, el.X2, el.Y2, el.X, el.Y)
-		case *Close:
+func (e *Evaluator) replayPathObjectToCanvas(path *Path) {
+	if e == nil || e.canvas == nil || path == nil {
+		return
+	}
+	for i := 0; i < path.ElementCount(); i++ {
+		typ, x1, y1, x2, y2, x, y, ok := path.ElementAt(i)
+		if !ok {
+			continue
+		}
+		switch typ {
+		case PathMoveTo:
+			e.canvas.MoveTo(x, y)
+		case PathLineTo:
+			e.canvas.LineTo(x, y)
+		case PathCurveTo:
+			e.canvas.CurveTo(x1, y1, x2, y2, x, y)
+		case PathClose:
 			e.canvas.ClosePath()
 		}
 	}
-
-	// Apply even-odd clipping
-	e.canvas.EoClip()
 }
 
 // Helper function to get a numeric value from an operand
@@ -5948,6 +7043,14 @@ func (e *Evaluator) transformPoint(x, y float64) (float64, float64) {
 // GetOperators returns the parsed operators.
 func (e *Evaluator) GetOperators() []Operator {
 	return e.operators
+}
+
+// SetOperatorRecording controls whether Evaluate/EvaluateContent retains parsed operators for GetOperators.
+func (e *Evaluator) SetOperatorRecording(enabled bool) {
+	e.recordOperators = enabled
+	if !enabled {
+		e.operators = e.operators[:0]
+	}
 }
 
 // GetGraphicsState returns the current graphics state.
@@ -5992,6 +7095,38 @@ func (e *Evaluator) SetInitialTransform(matrix [6]float64) {
 	e.graphics.baseTransform = matrix
 }
 
+// ResetForTilingPatternTile restores volatile rendering state before replaying a pattern tile.
+func (e *Evaluator) ResetForTilingPatternTile(matrix [6]float64) {
+	if e == nil {
+		return
+	}
+	identity := [6]float64{1, 0, 0, 1, 0, 0}
+	e.releaseSavedGraphicsStates()
+	if e.graphics == nil {
+		e.graphics = NewGraphicsState()
+	} else {
+		e.graphics.ResetForReuse()
+	}
+	e.initialTransform = matrix
+	e.graphics.transform = matrix
+	e.graphics.baseTransform = matrix
+	e.textMatrix = identity
+	e.textLineMatrix = identity
+	e.textBaseMatrix = identity
+	e.textLineX = 0
+	e.textLineY = 0
+	e.textCurrentX = 0
+	e.textCurrentY = 0
+	e.textUserCurrentX = 0
+	e.textUserCurrentY = 0
+	e.textCurrentValid = false
+	e.textUserCurrentValid = false
+	e.resetInlineImageState()
+	e.operators = e.operators[:0]
+	e.debugPath = e.debugPath[:0]
+	e.textBuffer.Reset()
+}
+
 // SetImageSamplingDebug toggles image sampling trace output.
 func (e *Evaluator) SetImageSamplingDebug(enabled bool, documentID string, pageNumber int) {
 	e.debugImageSampling = enabled
@@ -6007,7 +7142,7 @@ func (e *Evaluator) SetImageSamplingMode(mode string) {
 // SetFillColor sets the current fill color for evaluator-rendered content.
 func (e *Evaluator) SetFillColor(c color.Color) {
 	if c == nil {
-		e.graphics.fillColor = &ColorSpace{Color: &Color{Hex: "000000"}}
+		e.graphics.fillColor = defaultBlackColorSpace
 		e.graphics.fillAlpha = 1.0
 		e.graphics.fillCS = "DeviceRGB"
 		e.graphics.fillParsedCS = nil
@@ -6024,7 +7159,7 @@ func (e *Evaluator) SetFillColor(c color.Color) {
 // SetStrokeColor sets the current stroke color for evaluator-rendered content.
 func (e *Evaluator) SetStrokeColor(c color.Color) {
 	if c == nil {
-		e.graphics.strokeColor = &ColorSpace{Color: &Color{Hex: "000000"}}
+		e.graphics.strokeColor = defaultBlackColorSpace
 		e.graphics.strokeAlpha = 1.0
 		e.graphics.strokeCS = "DeviceRGB"
 		e.graphics.strokeParsedCS = nil
@@ -6046,6 +7181,18 @@ func (e *Evaluator) SetFillPattern(pattern entity.Pattern) {
 // SetStrokePattern sets the current stroke pattern for evaluator-rendered content.
 func (e *Evaluator) SetStrokePattern(pattern entity.Pattern) {
 	e.graphics.strokePattern = pattern
+}
+
+// SetLineWidthValue sets the line width without allocating a synthetic operator.
+func (e *Evaluator) SetLineWidthValue(width float64) {
+	if e == nil || e.graphics == nil || e.graphics.currentState == nil {
+		return
+	}
+	if width < 0 {
+		width = 0
+	}
+	e.graphics.lineWidth = width
+	e.graphics.currentState.SetLineWidth(width)
 }
 
 // EvaluateContent evaluates raw content stream bytes (for pattern cells).
@@ -6243,12 +7390,32 @@ func (e *Evaluator) endInlineImage() error {
 	return nil
 }
 
+func (e *Evaluator) executeInlineImageOperator(op Operator) error {
+	if op.InlineImage == nil || op.InlineImage.Dict == nil {
+		return nil
+	}
+
+	prevInInlineImage := e.inInlineImage
+	prevInlineImageDict := e.inlineImageDict
+	prevInlineImageData := e.inlineImageData
+	defer func() {
+		e.inInlineImage = prevInInlineImage
+		e.inlineImageDict = prevInlineImageDict
+		e.inlineImageData = prevInlineImageData
+	}()
+
+	e.inInlineImage = true
+	e.inlineImageDict = op.InlineImage.Dict
+	e.inlineImageData = op.InlineImage.Data
+	return e.endInlineImage()
+}
+
 // renderInlineImage renders an inline image to the canvas.
 func (e *Evaluator) renderInlineImage() error {
 	dict := e.inlineImageDict
 
 	// Get image dimensions
-	widthVal := dict.GetTry(entity.Name("W"), entity.Name("Width"))
+	widthVal := dict.GetTry(pdfNameW, pdfNameWidth)
 	if widthVal == nil {
 		return fmt.Errorf("inline image has no Width")
 	}
@@ -6257,7 +7424,7 @@ func (e *Evaluator) renderInlineImage() error {
 		return fmt.Errorf("inline image: invalid Width: %w", err)
 	}
 
-	heightVal := dict.GetTry(entity.Name("H"), entity.Name("Height"))
+	heightVal := dict.GetTry(pdfNameH, pdfNameHeight)
 	if heightVal == nil {
 		return fmt.Errorf("inline image has no Height")
 	}
@@ -6266,9 +7433,9 @@ func (e *Evaluator) renderInlineImage() error {
 		return fmt.Errorf("inline image: invalid Height: %w", err)
 	}
 
-	bpcObj := dict.GetTry(entity.Name("BPC"), entity.Name("BitsPerComponent"))
+	bpcObj := dict.GetTry(pdfNameBPC, pdfNameBitsPerComponent)
 	bpc := getImageBitsPerComponent(bpcObj)
-	filterObj := dict.GetTry(entity.Name("Filter"), entity.Name("F"))
+	filterObj := dict.GetTry(pdfNameFilter, pdfNameF)
 	imageFilter, useEncodedData := resolveXObjectImageFilter(filterObj)
 	data := e.inlineImageData
 	if !useEncodedData {
@@ -6281,9 +7448,9 @@ func (e *Evaluator) renderInlineImage() error {
 		imageFilter = domainimage.FilterNone
 	}
 
-	imageMask := isImageMaskDictValue(dict.Get(entity.Name("ImageMask")))
+	imageMask := isImageMaskDictValue(dict.Get(pdfNameImageMask))
 	if !imageMask {
-		imageMask = isImageMaskDictValue(dict.Get(entity.Name("IM")))
+		imageMask = isImageMaskDictValue(dict.Get(pdfNameIM))
 	}
 	if imageMask && bpcObj == nil {
 		bpc = 1
@@ -6292,11 +7459,11 @@ func (e *Evaluator) renderInlineImage() error {
 		return nil
 	}
 	if imageMask {
-		interpolate, interpolateExplicit := resolveImageInterpolateOption(dict.Get(entity.Name("I")), false)
+		interpolate, interpolateExplicit := resolveImageInterpolateOption(dict.Get(pdfNameI), false)
 		if !interpolateExplicit {
-			interpolate, interpolateExplicit = resolveImageInterpolateOption(dict.Get(entity.Name("Interpolate")), false)
+			interpolate, interpolateExplicit = resolveImageInterpolateOption(dict.Get(pdfNameInterpolate), false)
 		}
-		decode := e.resolveImageDecodeArray(dict.Get(entity.Name("Decode")))
+		decode := e.resolveImageDecodeArray(dict.Get(pdfNameDecode))
 		paintBitOne := resolveImageMaskPaintBit(decode)
 		if e.canvas != nil {
 			if err := e.renderImageMaskToCanvas(
@@ -6315,7 +7482,7 @@ func (e *Evaluator) renderInlineImage() error {
 		return nil
 	}
 
-	colorSpaceVal := dict.GetTry(entity.Name("CS"), entity.Name("ColorSpace"))
+	colorSpaceVal := dict.GetTry(pdfNameCS, pdfNameColorSpace)
 	colorSpace, ok := e.resolveImageColorSpace(colorSpaceVal)
 	if !ok {
 		return nil
@@ -6338,9 +7505,9 @@ func (e *Evaluator) renderInlineImage() error {
 
 	// If canvas is set, render the image
 	if e.canvas != nil {
-		interpolate, interpolateExplicit := resolveImageInterpolateOption(dict.Get(entity.Name("I")), false)
+		interpolate, interpolateExplicit := resolveImageInterpolateOption(dict.Get(pdfNameI), false)
 		if !interpolateExplicit {
-			interpolate, interpolateExplicit = resolveImageInterpolateOption(dict.Get(entity.Name("Interpolate")), false)
+			interpolate, interpolateExplicit = resolveImageInterpolateOption(dict.Get(pdfNameInterpolate), false)
 		}
 		sourceICCBased := e.isICCBasedColorSpace(colorSpaceVal)
 		var iccProfile []byte
@@ -6349,8 +7516,8 @@ func (e *Evaluator) renderInlineImage() error {
 			iccProfile, _ = e.resolveICCBasedProfile(colorSpaceVal, 0)
 			iccComponents = e.resolveICCBasedComponentCount(colorSpaceVal)
 		}
-		decode := e.resolveImageDecodeArray(dict.GetTry(entity.Name("Decode"), entity.Name("D")))
-		smaskObj := dict.Get(entity.Name("SMask"))
+		decode := e.resolveImageDecodeArray(dict.GetTry(pdfNameDecode, pdfNameD))
+		smaskObj := dict.Get(pdfNameSMask)
 		softMask := e.resolveSoftMaskDetails(smaskObj)
 		mask := softMask.mask
 		maskMatte := softMask.matte
@@ -6359,7 +7526,7 @@ func (e *Evaluator) renderInlineImage() error {
 			maskInterpolate = e.resolveImageMaskInterpolate(smaskObj)
 		}
 		if mask == nil {
-			maskObj := dict.Get(entity.Name("Mask"))
+			maskObj := dict.Get(pdfNameMask)
 			// Inline image masks follow the same Poppler default as XObject masks:
 			// mask interpolation is false unless the mask image explicitly opts in.
 			softMask = e.resolveSoftMaskDetails(maskObj)
@@ -6369,12 +7536,18 @@ func (e *Evaluator) renderInlineImage() error {
 				maskInterpolate = e.resolveImageMaskInterpolate(maskObj)
 			}
 		}
-		colorKeyMask := e.resolveColorKeyMask(dict.Get(entity.Name("Mask")), colorSpace)
+		colorKeyMask := e.resolveColorKeyMask(dict.Get(pdfNameMask), colorSpace)
 		if mask != nil {
 			// When soft mask is present, favor SMask alpha and ignore color-key masking.
 			colorKeyMask = nil
 		}
+		if os.Getenv("PDF_DEBUG_EVAL_GS") != "" {
+			fmt.Fprintf(os.Stderr, "IMGDRAW w=%.0f h=%.0f cs=%s filter=%s smask=%t mask=%t matte=%t colorKey=%t fillAlpha=%.4f blend=%s\n",
+				width, height, colorSpace, imageFilter, dict.Get(pdfNameSMask) != nil, dict.Get(pdfNameMask) != nil, maskMatte != nil, colorKeyMask != nil,
+				e.graphics.fillAlpha, e.graphics.blendMode)
+		}
 		e.renderImageToCanvas(
+			nil,
 			data,
 			width,
 			height,
@@ -6388,10 +7561,11 @@ func (e *Evaluator) renderInlineImage() error {
 			bpc,
 			imageFilter,
 			resolveXObjectImageSourceFilter(filterObj),
-			e.resolveImageDecodeParms(dict.GetTry(entity.Name("DecodeParms"), entity.Name("DP")), 0),
+			e.resolveImageDecodeParms(dict.GetTry(pdfNameDecodeParms, pdfNameDP), 0),
 			decode,
 			mask,
 			maskMatte,
+			softMask.stream,
 			false,
 			maskInterpolate,
 			colorKeyMask,
@@ -6413,11 +7587,11 @@ func normalizeInlineImageStreamDict(dict *entity.Dict) *entity.Dict {
 		normalized.Set(key, dict.GetRaw(key))
 	}
 
-	if filter := dict.GetTry(entity.Name("Filter"), entity.Name("F")); filter != nil {
-		normalized.Set(entity.Name("Filter"), normalizeInlineImageFilterObject(filter))
+	if filter := dict.GetTry(pdfNameFilter, pdfNameF); filter != nil {
+		normalized.Set(pdfNameFilter, normalizeInlineImageFilterObject(filter))
 	}
-	if decodeParms := dict.GetTry(entity.Name("DecodeParms"), entity.Name("DP")); decodeParms != nil {
-		normalized.Set(entity.Name("DecodeParms"), decodeParms)
+	if decodeParms := dict.GetTry(pdfNameDecodeParms, pdfNameDP); decodeParms != nil {
+		normalized.Set(pdfNameDecodeParms, decodeParms)
 	}
 
 	return normalized

@@ -3859,8 +3859,8 @@ func TestAdvanceTextWithoutRendering(t *testing.T) {
 	e.textLineMatrix = identity
 
 	units := []textCodeUnit{
-		{code: 'A', raw: []byte("A")},
-		{code: 'B', raw: []byte("B")},
+		{code: 'A', raw: "A"},
+		{code: 'B', raw: "B"},
 	}
 
 	e.advanceTextWithoutRendering(units, font, 12)
@@ -5788,8 +5788,8 @@ func TestCaptureTextWithoutRendering(t *testing.T) {
 		names:  map[uint32]string{65: "A", 66: "B"},
 	}
 	units := []textCodeUnit{
-		{code: 'A', raw: []byte("A")},
-		{code: 'B', raw: []byte("B")},
+		{code: 'A', raw: "A"},
+		{code: 'B', raw: "B"},
 	}
 	e.captureTextWithoutRendering(units, font, 12)
 	assert.Contains(t, e.ExtractedText(), "AB")
@@ -5839,7 +5839,7 @@ func TestTextRenderStrategyRender_AllBranches(t *testing.T) {
 		identity := [6]float64{1, 0, 0, 1, 0, 0}
 		e.textMatrix = identity
 		e.textLineMatrix = identity
-		units := []textCodeUnit{{code: 'A', raw: []byte("A")}}
+		units := []textCodeUnit{{code: 'A', raw: "A"}}
 		renderer := defaultTextRenderer{}
 		require.NoError(t, renderer.Render(e, "A", font, 12, units))
 		assert.NotEqual(t, identity, e.textMatrix) // advanced
@@ -5853,7 +5853,7 @@ func TestTextRenderStrategyRender_AllBranches(t *testing.T) {
 		e.graphics.currentState.SetFontSize(12)
 		e.textMatrix = [6]float64{1, 0, 0, 1, 0, 0}
 		e.textLineMatrix = [6]float64{1, 0, 0, 1, 0, 0}
-		units := []textCodeUnit{{code: 'A', raw: []byte("A")}}
+		units := []textCodeUnit{{code: 'A', raw: "A"}}
 		renderer := defaultTextRenderer{}
 		require.NoError(t, renderer.Render(e, "A", font, 12, units))
 		assert.Contains(t, e.ExtractedText(), "A")
@@ -5868,7 +5868,7 @@ func TestTextRenderStrategyRender_AllBranches(t *testing.T) {
 		e.graphics.currentState.SetFontSize(12)
 		e.textMatrix = [6]float64{1, 0, 0, 1, 0, 0}
 		e.textLineMatrix = [6]float64{1, 0, 0, 1, 0, 0}
-		units := []textCodeUnit{{code: 'A', raw: []byte("A")}}
+		units := []textCodeUnit{{code: 'A', raw: "A"}}
 		renderer := defaultTextRenderer{}
 		require.NoError(t, renderer.Render(e, "A", font, 12, units))
 		// char-by-char path should capture text
@@ -5882,7 +5882,7 @@ func TestTextRenderStrategyRender_AllBranches(t *testing.T) {
 		e.graphics.currentState.SetFontSize(12)
 		e.textMatrix = [6]float64{1, 0, 0, 1, 0, 0}
 		e.textLineMatrix = [6]float64{1, 0, 0, 1, 0, 0}
-		units := []textCodeUnit{{code: 'A', raw: []byte("A")}}
+		units := []textCodeUnit{{code: 'A', raw: "A"}}
 		renderer := defaultTextRenderer{}
 		require.NoError(t, renderer.Render(e, "A", font, 12, units))
 		assert.Contains(t, e.ExtractedText(), "A")
@@ -5897,7 +5897,7 @@ func TestTextRenderStrategyRender_AllBranches(t *testing.T) {
 		e.graphics.currentState.SetFontSize(12)
 		e.textMatrix = [6]float64{1, 0, 0, 1, 0, 0}
 		e.textLineMatrix = [6]float64{1, 0, 0, 1, 0, 0}
-		units := []textCodeUnit{{code: 'A', raw: []byte("A")}}
+		units := []textCodeUnit{{code: 'A', raw: "A"}}
 		renderer := defaultTextRenderer{}
 		require.NoError(t, renderer.Render(e, "A", font, 12, units))
 		assert.Greater(t, canvas.drawTextCalls, 0)

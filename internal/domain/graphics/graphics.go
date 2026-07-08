@@ -38,7 +38,25 @@ type State struct {
 
 // NewState creates a new graphics state with default values.
 func NewState() *State {
-	return &State{
+	state := &State{}
+	state.Reset()
+	state.currentPath = NewPath()
+	return state
+}
+
+// NewStateWithoutCurrentPath creates a default state without legacy path storage.
+func NewStateWithoutCurrentPath() *State {
+	state := &State{}
+	state.ResetWithoutCurrentPath()
+	return state
+}
+
+// Reset restores the graphics state defaults and clears any saved parent state.
+func (s *State) Reset() {
+	if s == nil {
+		return
+	}
+	*s = State{
 		ctm:               [6]float64{1, 0, 0, 1, 0, 0},
 		fillColor:         color.Black,
 		strokeColor:       color.Black,
@@ -56,8 +74,13 @@ func NewState() *State {
 		wordSpacing:       0.0,
 		horizontalScaling: 100.0,
 		textRenderMode:    0,
-		currentPath:       NewPath(),
 	}
+}
+
+// ResetWithoutCurrentPath restores defaults without allocating legacy path state.
+func (s *State) ResetWithoutCurrentPath() {
+	s.Reset()
+	s.currentPath = nil
 }
 
 // Save creates a copy of the current state and pushes it onto the stack.

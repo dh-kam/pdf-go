@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"image"
 	_ "image/png"
@@ -11,15 +12,21 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Println("Usage: compare_pixels <pdf_file> <page_number> <poppler_png>")
+	dpiFlag := flag.Float64("dpi", 150.0, "DPI for rendering")
+	backendFlag := flag.String("backend", "image-canvas", "Renderer backend (image-canvas, splash)")
+
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) < 3 {
+		fmt.Println("Usage: compare_pixels [-dpi <dpi>] [-backend <backend>] <pdf_file> <page_number> <poppler_png>")
 		return
 	}
 
-	pdfPath := os.Args[1]
+	pdfPath := args[0]
 	pageNum := 0
-	fmt.Sscanf(os.Args[2], "%d", &pageNum)
-	popplerPath := os.Args[3]
+	fmt.Sscanf(args[1], "%d", &pageNum)
+	popplerPath := args[2]
 
 	// Render our version
 	doc, err := pdf.Open(pdfPath)
@@ -35,9 +42,15 @@ func main() {
 		return
 	}
 
-	r := pdf.NewRenderer(pdf.DefaultRendererOptions())
+	renderOpts := pdf.DefaultRendererOptions()
+	renderOpts.Backend = *backendFlag
+	if backend := os.Getenv("PDF_BACKEND"); backend != "" {
+		renderOpts.Backend = backend
+	}
+	r := pdf.NewRenderer(renderOpts)
+
 	opts := pdf.DefaultRenderOptions()
-	opts.DPI = 150
+	opts.DPI = *dpiFlag
 
 	ctx := context.Background()
 	ourImg, err := r.RenderPage(ctx, page, opts)
@@ -92,24 +105,23 @@ func main() {
 			ourColor := ourImg.At(x, y)
 			popplerColor := popplerImg.At(x, y)
 
-			ourR, ourG, ourB, ourA := ourColor.RGBA()
-			popR, popG, popB, popA := popplerColor.RGBA()
+			ourR, ourG, ourB, _ := ourColor.RGBA()
+			popR, popG, popB, _ := popplerColor.RGBA()
 
 			diffR := abs(int(ourR>>8) - int(popR>>8))
 			diffG := abs(int(ourG>>8) - int(popG>>8))
 			diffB := abs(int(ourB>>8) - int(popB>>8))
-			diffA := abs(int(ourA>>8) - int(popA>>8))
 
-			totalDiff += diffR + diffG + diffB + diffA
+			totalDiff += diffR + diffG + diffB
 
-			if diffR > 0 || diffG > 0 || diffB > 0 || diffA > 0 {
+			if diffR > 0 || diffG > 0 || diffB > 0 {
 				differentPixels++
 				if count < 20 {
-					fmt.Printf("(%d,%d): Our[%3d,%3d,%3d,%3d] Poppler[%3d,%3d,%3d,%3d] Diff[%d,%d,%d,%d]\n",
+					fmt.Printf("(%d,%d): Our[%3d,%3d,%3d] Poppler[%3d,%3d,%3d] Diff[%d,%d,%d]\n",
 						x, y,
-						ourR>>8, ourG>>8, ourB>>8, ourA>>8,
-						popR>>8, popG>>8, popB>>8, popA>>8,
-						diffR, diffG, diffB, diffA)
+						ourR>>8, ourG>>8, ourB>>8,
+						popR>>8, popG>>8, popB>>8,
+						diffR, diffG, diffB)
 					count++
 				}
 			}

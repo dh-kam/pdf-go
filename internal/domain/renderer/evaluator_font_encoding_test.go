@@ -607,8 +607,8 @@ func TestCaptureTextWithoutRendering_UsesInjectedTextPlacement(t *testing.T) {
 	eval.textPlacement = placement
 
 	eval.captureTextWithoutRendering([]textCodeUnit{
-		{code: 65, raw: []byte("A")},
-		{code: 66, raw: []byte("B")},
+		{code: 65, raw: "A"},
+		{code: 66, raw: "B"},
 	}, font, 12)
 
 	assert.Equal(t, "AB", eval.textBuffer.String())

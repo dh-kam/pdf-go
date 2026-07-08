@@ -80,9 +80,9 @@ func pipeRunAARGB8(p *pipe) {
 		// Splash.cc:535-541 — compute cBlend from src + dst, then alpha-mix
 		// per Splash.cc:644-647. Non-isolated groups adjust alphaI/alphaIm1
 		// with alpha0Ptr before the result-color equation.
-		var dst, blend Color
-		dst[0], dst[1], dst[2] = dR, dG, dB
-		p.blendFunc(&src, &dst, &blend, p.mode)
+		var dstColor Color
+		dstColor[0], dstColor[1], dstColor[2] = dR, dG, dB
+		blend := p.blendFunc(src, dstColor, p.mode)
 		if aSrc == 0 && aDest == 0 {
 			c0, c1, c2, aResult = 0, 0, 0, 0
 		} else {
@@ -128,3 +128,61 @@ func pipeRunAARGB8(p *pipe) {
 	p.destOff += 3
 	p.x++
 }
+
+// pipeRunSimpleRGB8NoPat is the allocation-free fast path of pipeRunSimpleRGB8 (when p.pattern == nil).
+func pipeRunSimpleRGB8NoPat(p *pipe) {
+	src := p.cSrc
+	p.destRow[p.destOff+0] = p.s.state.rgbTransferR[src[0]]
+	p.destRow[p.destOff+1] = p.s.state.rgbTransferG[src[1]]
+	p.destRow[p.destOff+2] = p.s.state.rgbTransferB[src[2]]
+	if p.aDestRow != nil {
+		p.aDestRow[p.aDestOff] = 255
+		p.aDestOff++
+	}
+	p.destOff += 3
+	p.x++
+}
+
+// pipeRunAARGB8NoPat is the allocation-free fast path of pipeRunAARGB8 (when p.pattern == nil and p.blendFunc == nil).
+func pipeRunAARGB8NoPat(p *pipe) {
+	src := p.cSrc
+	var aDest byte
+	if p.aDestRow != nil {
+		aDest = p.aDestRow[p.aDestOff]
+	} else {
+		aDest = 0xFF
+	}
+	aSrc := pipeSourceAlpha(p)
+
+	dR := p.destRow[p.destOff+0]
+	dG := p.destRow[p.destOff+1]
+	dB := p.destRow[p.destOff+2]
+
+	var c0, c1, c2, aResult byte
+	if aSrc == 255 && p.alpha0 == nil {
+		c0 = p.s.state.rgbTransferR[src[0]]
+		c1 = p.s.state.rgbTransferG[src[1]]
+		c2 = p.s.state.rgbTransferB[src[2]]
+		aResult = 255
+	} else if aSrc == 0 && aDest == 0 {
+		c0, c1, c2, aResult = 0, 0, 0, 0
+	} else {
+		var alpha2 int
+		aResult, alpha2, _ = pipeResultAlphas(p, aSrc, aDest)
+		alphaSrc := int(aSrc)
+		alphaDestWeight := alpha2 - alphaSrc
+		c0 = p.s.state.rgbTransferR[byte((alphaDestWeight*int(dR)+alphaSrc*int(src[0]))/alpha2)]
+		c1 = p.s.state.rgbTransferG[byte((alphaDestWeight*int(dG)+alphaSrc*int(src[1]))/alpha2)]
+		c2 = p.s.state.rgbTransferB[byte((alphaDestWeight*int(dB)+alphaSrc*int(src[2]))/alpha2)]
+	}
+	p.destRow[p.destOff+0] = c0
+	p.destRow[p.destOff+1] = c1
+	p.destRow[p.destOff+2] = c2
+	if p.aDestRow != nil {
+		p.aDestRow[p.aDestOff] = aResult
+		p.aDestOff++
+	}
+	p.destOff += 3
+	p.x++
+}
+

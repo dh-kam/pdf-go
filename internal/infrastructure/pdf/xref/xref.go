@@ -18,6 +18,18 @@ import (
 )
 
 // Table implements the XRef interface.
+const maxTotalCachedObjectStreamBytes = 32 * 1024 * 1024 // 32 MB
+
+type parsedObjectStream struct {
+	decodedData []byte
+	offsets     []int
+	objNumbers  []int64
+}
+
+func (p *parsedObjectStream) cacheBytes() int {
+	return len(p.decodedData)
+}
+
 type Table struct {
 	entries             []*repository.XRefEntry
 	trailer             *entity.Dict
@@ -31,6 +43,16 @@ type Table struct {
 
 	objStreamLocations  map[uint32]objectStreamLocation
 	objStreamIndexBuilt bool
+	objectStreamCache   map[uint32]*parsedObjectStream
+	objectStreamBytes   int
+}
+
+func (t *Table) cacheParsedObjectStream(key uint32, parsed *parsedObjectStream) {
+	if t.objectStreamCache == nil {
+		t.objectStreamCache = make(map[uint32]*parsedObjectStream)
+	}
+	t.objectStreamCache[key] = parsed
+	t.objectStreamBytes += parsed.cacheBytes()
 }
 
 type objectStreamLocation struct {

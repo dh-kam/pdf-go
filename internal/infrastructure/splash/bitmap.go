@@ -100,3 +100,15 @@ func (b *Bitmap) TakeData() []byte {
 	b.data = nil
 	return d
 }
+
+// fillBitmapBytes fills dst with value using doubling (SplashBitmap.cc:116).
+func fillBitmapBytes(dst []byte, value byte) {
+	if len(dst) == 0 {
+		return
+	}
+	dst[0] = value
+	for n := 1; n < len(dst); n *= 2 {
+		copy(dst[n:], dst[:n])
+	}
+}
+

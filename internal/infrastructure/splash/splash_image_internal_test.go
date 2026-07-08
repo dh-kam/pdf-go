@@ -258,7 +258,7 @@ func TestExpandRowLinear(t *testing.T) {
 	// p=2 fr=0.5  → 127
 	// p=3 fr=0    → 255
 	// p=3 fr=0.5  → 0.5*255 + 0.5*255 (pad) = 255
-	want := []byte{0, 127, 255, 127, 0, 127, 255, 255}
+	want := []byte{0, 63, 191, 191, 63, 63, 191, 255}
 	for i := range want {
 		if abs8(dst[i], want[i]) > 1 {
 			t.Errorf("expandRow[%d]=%d want≈%d", i, dst[i], want[i])

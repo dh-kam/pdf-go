@@ -21,7 +21,32 @@ func (f *FlateFactory) CreateDecoder() (Decoder, error) {
 }
 
 // FlateDecoder implements Flate decompression.
-type FlateDecoder struct{}
+// FlateDecoder decodes Flate/zlib compressed streams.
+type FlateDecoder struct {
+	decodeSizeHint     int
+	exactDecodeSizeHint int
+}
+
+// SetDecodeSizeHint sets a soft minimum buffer size hint for decoding.
+func (d *FlateDecoder) SetDecodeSizeHint(size int) {
+	d.decodeSizeHint = size
+}
+
+// SetExactDecodeSizeHint sets an exact buffer size hint for decoding.
+func (d *FlateDecoder) SetExactDecodeSizeHint(size int) {
+	d.exactDecodeSizeHint = size
+}
+
+// initialDecodeBufferSize returns the initial buffer size for decoding.
+func (d *FlateDecoder) initialDecodeBufferSize(softMin int) int {
+	if d.exactDecodeSizeHint > 0 {
+		return d.exactDecodeSizeHint
+	}
+	if d.decodeSizeHint > softMin {
+		return d.decodeSizeHint
+	}
+	return softMin
+}
 
 // Decode decodes Flate-compressed data.
 func (d *FlateDecoder) Decode(data []byte) ([]byte, error) {

@@ -33,6 +33,17 @@ type groupState struct {
 	savedStrokeAdjust         bool
 	savedStrokeAlpha          float64
 	savedFillAlpha            float64
+	savedBlendFunc            BlendFunc
+	// savedSoftMask captures the parent's soft mask at BeginTransparencyGroup
+	// time. Poppler renders each group in a fresh child Splash (whose state has
+	// no soft mask) and composites via Splash::composite, whose pipe applies
+	// state->softMask (Splash.cc:475). Gfx::drawForm restores the parent
+	// GfxState before paintTransparencyGroup, so the soft mask active at the Do
+	// is the one applied to the group composite. We share one Splash, so an
+	// inner /gs with /SMask /None (or the form reset) clobbers s.state.softMask
+	// during the group; without restoring it, PaintTransparencyGroup composites
+	// with a nil mask. Saved at begin, restored in restoreTransparencyGroupState.
+	savedSoftMask             softMaskStateSnapshot
 	savedPatternStrokeAlpha   float64
 	savedPatternFillAlpha     float64
 	savedMultiplyPatternAlpha bool
@@ -95,6 +106,8 @@ func (s *Splash) BeginTransparencyGroup(bbox [4]float64, isolated, knockout bool
 		savedPatternStrokeAlpha:   s.state.patternStrokeAlpha,
 		savedPatternFillAlpha:     s.state.patternFillAlpha,
 		savedMultiplyPatternAlpha: s.state.multiplyPatternAlpha,
+		savedBlendFunc:            s.state.blendFunc,
+		savedSoftMask:             s.captureSoftMaskState(),
 	}
 	s.groupStack = append(s.groupStack, gs)
 	s.bitmap = gb
@@ -175,6 +188,8 @@ func (s *Splash) BeginCroppedTransparencyGroup(bbox [4]float64, isolated, knocko
 		savedPatternStrokeAlpha:   s.state.patternStrokeAlpha,
 		savedPatternFillAlpha:     s.state.patternFillAlpha,
 		savedMultiplyPatternAlpha: s.state.multiplyPatternAlpha,
+		savedBlendFunc:            s.state.blendFunc,
+		savedSoftMask:             s.captureSoftMaskState(),
 	}
 	s.groupStack = append(s.groupStack, gs)
 	s.bitmap = gb
@@ -236,9 +251,17 @@ func (s *Splash) PaintTransparencyGroup() error {
 	}
 	if top.cropped {
 		compositeGroupRectAt(s, src, dst, blendMode, s.state.softMask, s.state.fillAlpha, !top.isolated, top.compositeBounds, clip, top.tx, top.ty, alpha0, alpha0X, alpha0Y)
+		if os.Getenv("PDF_DEBUG_EVAL_GS") != "" {
+			fmt.Fprintf(os.Stderr, "GROUPPOP cropped=%t isolated=%t compositeAlpha=%.4f blendSet=%t remainingDepth=%d\n",
+				top.cropped, top.isolated, s.state.fillAlpha, blendMode != nil, len(s.groupStack))
+		}
 		return nil
 	}
 	compositeGroupRectAt(s, src, dst, blendMode, s.state.softMask, s.state.fillAlpha, !top.isolated, top.compositeBounds, clip, 0, 0, alpha0, alpha0X, alpha0Y)
+	if os.Getenv("PDF_DEBUG_EVAL_GS") != "" {
+		fmt.Fprintf(os.Stderr, "GROUPPOP cropped=%t isolated=%t compositeAlpha=%.4f blendSet=%t remainingDepth=%d\n",
+			top.cropped, top.isolated, s.state.fillAlpha, blendMode != nil, len(s.groupStack))
+	}
 	return nil
 }
 
@@ -540,13 +563,37 @@ func (s *Splash) restoreTransparencyGroupState(top *groupState, clip any) {
 	s.nonIsoAlpha0X = top.savedAlpha0X
 	s.nonIsoAlpha0Y = top.savedAlpha0Y
 	s.state.inNonIsolatedGroup = top.savedNonIsolated
-	if top.freshPatternAlphaApplied {
-		s.state.strokeAlpha = top.savedStrokeAlpha
-		s.state.fillAlpha = top.savedFillAlpha
-		s.state.patternStrokeAlpha = top.savedPatternStrokeAlpha
-		s.state.patternFillAlpha = top.savedPatternFillAlpha
-		s.state.multiplyPatternAlpha = top.savedMultiplyPatternAlpha
-	}
+	// Restore the parent's alpha state unconditionally. Poppler renders each
+	// transparency group in a fresh child Splash, so the parent's fill/stroke/
+	// pattern alpha is never modified by the group. This backend shares a single
+	// Splash, so both the fresh-pattern-alpha reset (applyFreshGroupPatternAlpha)
+	// AND the group's own content (e.g. an inner /gs setting /ca) mutate
+	// s.state during the group. Restoring only when a pattern-alpha reset was
+	// applied lets an inner /ca leak past the group: the leftover alpha is then
+	// used by this group's own composite (PaintTransparencyGroup reads
+	// s.state.fillAlpha) and by subsequent painting. The saved values were
+	// captured at BeginTransparencyGroup from the parent state, so restoring them
+	// reproduces Poppler's "parent splash untouched" semantics for both the
+	// pattern and non-pattern cases.
+	s.state.strokeAlpha = top.savedStrokeAlpha
+	s.state.fillAlpha = top.savedFillAlpha
+	s.state.patternStrokeAlpha = top.savedPatternStrokeAlpha
+	s.state.patternFillAlpha = top.savedPatternFillAlpha
+	s.state.multiplyPatternAlpha = top.savedMultiplyPatternAlpha
+	// Restore the parent's blend mode too. Poppler renders each group in a fresh
+	// child Splash with blend=Normal, then composites onto the parent under the
+	// parent's blend active at paint time. We share one Splash, so an inner /gs
+	// (or the group reset itself) mutates s.state.blendFunc; restore it so
+	// PaintTransparencyGroup reads the true parent blend.
+	s.state.blendFunc = top.savedBlendFunc
+	// Restore the parent's soft mask. Poppler's Gfx::drawForm restores the parent
+	// GfxState before paintTransparencyGroup, and Splash::composite applies
+	// state->softMask through its pipe (Splash.cc:475), so the soft mask active at
+	// the Do is applied to the group composite. We share one Splash, so an inner
+	// /gs with /SMask /None clobbers s.state.softMask during the group; restore
+	// the value captured at begin so PaintTransparencyGroup composites under the
+	// parent's mask. Without this, masked form content renders fully opaque.
+	s.restoreSoftMaskState(top.savedSoftMask)
 }
 
 func usePopplerNonIsolatedAlpha0() bool {
@@ -652,6 +699,11 @@ func compositeGroupRectAt(sp *Splash, src, dst *Bitmap, blendMode BlendFunc, sof
 				continue
 			}
 			if clip != nil && !clip.Test(dx, dy) {
+				if shouldTraceGroupCompositePixel(tracePixels, dx, dy) {
+					xMin, yMin, xMax, yMax := clip.Bounds()
+					fmt.Fprintf(os.Stderr, "SPLASH_GROUP_COMPOSITE_TRACE dst=(%d,%d) CLIP-REJECT bounds=(%.17g,%.17g)-(%.17g,%.17g) hasPath=%t\n",
+						dx, dy, xMin, yMin, xMax, yMax, clip.HasPathClip())
+				}
 				continue
 			}
 			// Source alpha from group bitmap.
@@ -701,7 +753,7 @@ func compositeGroupRectAt(sp *Splash, src, dst *Bitmap, blendMode BlendFunc, sof
 				}
 			}
 			if blendMode != nil {
-				blendMode(&srcC, &dstC, &blendC, mode)
+				blendC = blendMode(srcC, dstC, mode)
 			} else {
 				blendC = srcC
 			}

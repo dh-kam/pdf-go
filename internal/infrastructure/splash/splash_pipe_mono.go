@@ -80,3 +80,40 @@ func pipeRunAAMono8(p *pipe) {
 	p.destOff++
 	p.x++
 }
+
+// pipeRunSimpleMono8NoPat is the allocation-free fast path of pipeRunSimpleMono8 (when p.pattern == nil).
+func pipeRunSimpleMono8NoPat(p *pipe) {
+	src := p.cSrc
+	p.destRow[p.destOff] = p.s.state.grayTransfer[src[0]]
+	if p.aDestRow != nil {
+		p.aDestRow[p.aDestOff] = 255
+		p.aDestOff++
+	}
+	p.destOff++
+	p.x++
+}
+
+// pipeRunAAMono8NoPat is the allocation-free fast path of pipeRunAAMono8 (when p.pattern == nil and p.blendFunc == nil).
+func pipeRunAAMono8NoPat(p *pipe) {
+	src := p.cSrc
+	dest := p.destRow[p.destOff]
+	var aDest byte
+	if p.aDestRow != nil {
+		aDest = p.aDestRow[p.aDestOff]
+	}
+	aSrc := pipeSourceAlpha(p)
+	aResult, alpha2, _ := pipeResultAlphas(p, aSrc, aDest)
+	var c0 byte
+	if alpha2 == 0 {
+		c0 = 0
+	} else {
+		c0 = p.s.state.grayTransfer[byte(((alpha2-int(aSrc))*int(dest)+int(aSrc)*int(src[0]))/alpha2)]
+	}
+	p.destRow[p.destOff] = c0
+	if p.aDestRow != nil {
+		p.aDestRow[p.aDestOff] = aResult
+		p.aDestOff++
+	}
+	p.destOff++
+	p.x++
+}

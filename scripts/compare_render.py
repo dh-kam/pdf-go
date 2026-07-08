@@ -42,15 +42,56 @@ except ImportError:
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
-BASE_DIR = Path(__file__).resolve().parent.parent / "testdata" / "compare"
+GO_PDF_ROOT = Path(__file__).resolve().parent.parent
+PDFRENDER_BIN = GO_PDF_ROOT / "bin" / "pdfrender"
+PDFTOPPM_BIN = "pdftoppm"
+
+# Output base directory. Defaults to the tracked `compare` corpus
+# (test/testdata/compare). `--out-base 2nd` reroutes every render/comparison
+# artifact to test/testdata/2nd so the external ~1441-page corpus (referenced
+# via --pdf-list, never copied into the tree) stays isolated from the 437-page
+# tracked regression corpus.
+BASE_DIR = GO_PDF_ROOT / "test" / "testdata" / "compare"
 PDFS_DIR = BASE_DIR / "pdfs"
 POPPLER_DIR = BASE_DIR / "poppler_png"
 GOPDF_DIR = BASE_DIR / "gopdf_png"
 DIFF_DIR = BASE_DIR / "diff_png"
 REPORT_DIR = BASE_DIR / "report"
 
-PDFRENDER_BIN = Path(__file__).resolve().parent.parent / "bin" / "pdfrender"
-PDFTOPPM_BIN = "pdftoppm"
+
+def configure_dirs(out_base: str) -> None:
+    """Reassign the module-level output directories to test/testdata/<out_base>.
+
+    Keeps the 437-page `compare` corpus and the external `2nd` corpus in
+    separate subtrees so their poppler_png/gopdf_png never collide.
+    """
+    global BASE_DIR, PDFS_DIR, POPPLER_DIR, GOPDF_DIR, DIFF_DIR, REPORT_DIR
+    BASE_DIR = GO_PDF_ROOT / "test" / "testdata" / out_base
+    PDFS_DIR = BASE_DIR / "pdfs"
+    POPPLER_DIR = BASE_DIR / "poppler_png"
+    GOPDF_DIR = BASE_DIR / "gopdf_png"
+    DIFF_DIR = BASE_DIR / "diff_png"
+    REPORT_DIR = BASE_DIR / "report"
+
+
+def read_pdf_list(path: Path) -> list[Path]:
+    """Read absolute PDF paths from a list file (one per line).
+
+    '#' lines and blank lines are skipped. Paths are taken verbatim — no shell
+    quoting/unescaping — so filenames may contain spaces and CJK characters.
+    Missing files are reported and skipped rather than aborting the run.
+    """
+    pdfs: list[Path] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = Path(line)
+        if not p.exists():
+            print(f"  WARN: list entry not found, skipping: {line}")
+            continue
+        pdfs.append(p)
+    return pdfs
 
 DEFAULT_DPI = 150
 THRESHOLD_PERCENT = 99.0
@@ -129,15 +170,24 @@ def render_poppler(pdf_path: Path, output_dir: Path, dpi: int) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = pdf_path.stem
 
+    # -cropbox: render the page's CropBox (the visible page per PDF spec).
+    # go-pdf renders the CropBox; without this flag pdftoppm renders the
+    # MediaBox, which differs in size/origin for PDFs with a distinct CropBox
+    # (e.g. MediaBox [0 0 549.9 745.5] → 1146x1554 vs CropBox
+    # [8.5 8.5 541.4 737.0] → 1111x1518), causing spurious shape
+    # mismatches. Verified: poppler -cropbox is byte-exact vs go CropBox.
     cmd = [
         PDFTOPPM_BIN,
+        "-cropbox",
         "-png",
         "-r", str(dpi),
         str(pdf_path),
         str(output_dir / prefix),
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    # 600s: image-heavy docs (DallE Prompt Book, 82 DCT pages) need ~5min for a
+    # whole-document pdftoppm run; 120s silently dropped them from the corpus.
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
         raise RuntimeError(f"pdftoppm failed: {result.stderr.strip()}")
 
@@ -681,16 +731,30 @@ def main():
     parser.add_argument("--skip-render", action="store_true", help="Skip rendering, use existing PNGs")
     parser.add_argument("--pdf-filter", default="", help="Only process PDFs starting with this prefix")
     parser.add_argument("--max-files", type=int, default=0, help="Max number of PDFs to process (0=all)")
+    parser.add_argument("--pdf-list", default="", help="Read PDF paths from a list file (one per line) "
+                        "instead of globbing pdfs/*.pdf. Use with --out-base to keep outputs separate.")
+    parser.add_argument("--out-base", default="compare", help="Output subtree under test/testdata/ "
+                        "(default: compare). Use '2nd' for the external list-driven corpus.")
     args = parser.parse_args()
 
-    # Collect PDFs
-    pdfs = sorted(PDFS_DIR.glob("*.pdf"))
+    # Reroute all output dirs when targeting a non-default corpus (e.g. the
+    # external 2nd corpus driven by --pdf-list).
+    if args.out_base != "compare":
+        configure_dirs(args.out_base)
+
+    # Collect PDFs: explicit list file wins, otherwise glob the corpus pdfs/ dir.
+    if args.pdf_list:
+        pdfs = read_pdf_list(Path(args.pdf_list))
+        print(f"Loaded {len(pdfs)} PDFs from list: {args.pdf_list}")
+    else:
+        pdfs = sorted(PDFS_DIR.glob("*.pdf"))
     if args.pdf_filter:
         pdfs = [p for p in pdfs if p.name.startswith(args.pdf_filter)]
     if args.max_files > 0:
         pdfs = pdfs[:args.max_files]
 
     print(f"Found {len(pdfs)} PDFs to process")
+    print(f"Output base: {BASE_DIR}")
     print(f"DPI: {args.dpi}")
     print(f"Skip render: {args.skip_render}")
     print(f"Threshold: {THRESHOLD_PERCENT}%")

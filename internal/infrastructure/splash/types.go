@@ -55,3 +55,12 @@ const (
 	// LineJoinBevel is splashLineJoinBevel (SplashState.h:47).
 	LineJoinBevel LineJoin = 2
 )
+
+type imageDrawOptions struct {
+	disableTopDownDownscale      bool
+	disableRequiredInterpolation bool
+	centerMappedNearestUpscale   bool
+	popplerBilinearOrigin        bool
+	popplerFixedScaleAverage     bool
+	forceScaleThenFlip           bool
+}

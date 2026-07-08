@@ -4,11 +4,12 @@ import "math"
 
 // BlendFunc mirrors SplashBlendFunc (SplashTypes.h:207).
 //
-// Each implementation reads src and dst component-wise (or holistically for the
-// non-separable HSL modes), writes the per-pixel blend result to blend, and is
-// selected at the per-pixel site Splash.cc:535-541 inside pipeRun. The blend
+// Each implementation reads Cs (src) and Cb (dst) component-wise (or holistically for the
+// non-separable HSL modes) and returns the per-pixel blend result Cs/Cb blend.
+// This is selected at the per-pixel site Splash.cc:535-541 inside pipeRun. The blend
 // output is then alpha-composited against the destination by the same pipeRun.
-type BlendFunc func(src, dst, blend *Color, mode ColorMode)
+// Sized to pass by value (Color is [8]byte) to prevent heap escape of parameters.
+type BlendFunc func(src, dst Color, mode ColorMode) Color
 
 // nComps returns the number of color components for a Splash mode (matches the
 // per-mode switch in pipeRun, Splash.cc:535-541 + SplashTypes.h:56-72).
@@ -40,21 +41,23 @@ func rgbIndices(mode ColorMode) (int, int, int) {
 // blendCopyExtra preserves any color components NOT touched by the blend
 // formula (e.g. spot channels in DeviceN). PDF spec 11.3.5: "non-process
 // colorants are unchanged by blend modes".
-func blendCopyExtra(src, blend *Color, n int) {
+func blendCopyExtra(src, blend Color, n int) Color {
 	for k := n; k < splashMaxColorComps; k++ {
 		blend[k] = src[k]
 	}
+	return blend
 }
 
 // BlendNormal — PDF spec 11.3.5.2 / Splash.cc default (state->blendFunc==nil).
 // B(Cs, Cb) = Cs.
-func BlendNormal(src, dst, blend *Color, mode ColorMode) {
-	*blend = *src
+func BlendNormal(src, dst Color, mode ColorMode) Color {
+	return src
 }
 
 // BlendMultiply mirrors Poppler's splashOutBlendMultiply. RGB uses truncating
 // /255, and subtractive modes blend in additive space before converting back.
-func BlendMultiply(src, dst, blend *Color, mode ColorMode) {
+func BlendMultiply(src, dst Color, mode ColorMode) Color {
+	var blend Color
 	n := nComps(mode)
 	if mode == ModeCMYK8 || mode == ModeDeviceN8 {
 		for i := 0; i < n; i++ {
@@ -62,26 +65,27 @@ func BlendMultiply(src, dst, blend *Color, mode ColorMode) {
 			cb := 255 - int(dst[i])
 			blend[i] = byte(255 - (cs*cb)/255)
 		}
-		blendCopyExtra(src, blend, n)
-		return
+		return blendCopyExtra(src, blend, n)
 	}
 	for i := 0; i < n; i++ {
 		blend[i] = byte((int(src[i]) * int(dst[i])) / 255)
 	}
-	blendCopyExtra(src, blend, n)
+	return blendCopyExtra(src, blend, n)
 }
 
 // BlendScreen — PDF spec 11.3.5.2: B = Cb + Cs - Cs*Cb/255.
-func BlendScreen(src, dst, blend *Color, mode ColorMode) {
+func BlendScreen(src, dst Color, mode ColorMode) Color {
+	var blend Color
 	n := nComps(mode)
 	for i := 0; i < n; i++ {
 		blend[i] = byte(int(src[i]) + int(dst[i]) - (int(src[i])*int(dst[i]))/255)
 	}
-	blendCopyExtra(src, blend, n)
+	return blendCopyExtra(src, blend, n)
 }
 
 // BlendOverlay — PDF spec 11.3.5.2: B = HardLight(Cb, Cs) (src/dst swapped).
-func BlendOverlay(src, dst, blend *Color, mode ColorMode) {
+func BlendOverlay(src, dst Color, mode ColorMode) Color {
+	var blend Color
 	n := nComps(mode)
 	for i := 0; i < n; i++ {
 		cs := int(src[i])
@@ -92,11 +96,12 @@ func BlendOverlay(src, dst, blend *Color, mode ColorMode) {
 			blend[i] = byte(255 - (2*((255-cs)*(255-cb)))/255)
 		}
 	}
-	blendCopyExtra(src, blend, n)
+	return blendCopyExtra(src, blend, n)
 }
 
 // BlendDarken — PDF spec 11.3.5.2: B = min(Cs, Cb).
-func BlendDarken(src, dst, blend *Color, mode ColorMode) {
+func BlendDarken(src, dst Color, mode ColorMode) Color {
+	var blend Color
 	n := nComps(mode)
 	for i := 0; i < n; i++ {
 		if src[i] < dst[i] {
@@ -105,11 +110,12 @@ func BlendDarken(src, dst, blend *Color, mode ColorMode) {
 			blend[i] = dst[i]
 		}
 	}
-	blendCopyExtra(src, blend, n)
+	return blendCopyExtra(src, blend, n)
 }
 
 // BlendLighten — PDF spec 11.3.5.2: B = max(Cs, Cb).
-func BlendLighten(src, dst, blend *Color, mode ColorMode) {
+func BlendLighten(src, dst Color, mode ColorMode) Color {
+	var blend Color
 	n := nComps(mode)
 	for i := 0; i < n; i++ {
 		if src[i] > dst[i] {
@@ -118,11 +124,12 @@ func BlendLighten(src, dst, blend *Color, mode ColorMode) {
 			blend[i] = dst[i]
 		}
 	}
-	blendCopyExtra(src, blend, n)
+	return blendCopyExtra(src, blend, n)
 }
 
 // BlendColorDodge — PDF spec 11.3.5.2: brightens Cb by Cs.
-func BlendColorDodge(src, dst, blend *Color, mode ColorMode) {
+func BlendColorDodge(src, dst Color, mode ColorMode) Color {
+	var blend Color
 	n := nComps(mode)
 	for i := 0; i < n; i++ {
 		cs := int(src[i])
@@ -137,11 +144,12 @@ func BlendColorDodge(src, dst, blend *Color, mode ColorMode) {
 			blend[i] = byte(v)
 		}
 	}
-	blendCopyExtra(src, blend, n)
+	return blendCopyExtra(src, blend, n)
 }
 
 // BlendColorBurn — PDF spec 11.3.5.2: darkens Cb by Cs.
-func BlendColorBurn(src, dst, blend *Color, mode ColorMode) {
+func BlendColorBurn(src, dst Color, mode ColorMode) Color {
+	var blend Color
 	n := nComps(mode)
 	for i := 0; i < n; i++ {
 		cs := int(src[i])
@@ -156,11 +164,12 @@ func BlendColorBurn(src, dst, blend *Color, mode ColorMode) {
 			blend[i] = byte(255 - v)
 		}
 	}
-	blendCopyExtra(src, blend, n)
+	return blendCopyExtra(src, blend, n)
 }
 
 // BlendHardLight — PDF spec 11.3.5.2: Multiply or Screen by sign of (Cs-128).
-func BlendHardLight(src, dst, blend *Color, mode ColorMode) {
+func BlendHardLight(src, dst Color, mode ColorMode) Color {
+	var blend Color
 	n := nComps(mode)
 	for i := 0; i < n; i++ {
 		cs := int(src[i])
@@ -171,25 +180,17 @@ func BlendHardLight(src, dst, blend *Color, mode ColorMode) {
 			blend[i] = byte(255 - (2*((255-cb)*(255-cs)))/255)
 		}
 	}
-	blendCopyExtra(src, blend, n)
+	return blendCopyExtra(src, blend, n)
 }
 
 // BlendSoftLight — PDF spec 11.3.5.2 (equation 8.4): piecewise smooth dodge/burn.
-//
-// For Cs <= 0.5:  B = Cb - (1-2*Cs) * Cb * (1-Cb)
-// For Cs >  0.5:  B = Cb + (2*Cs - 1) * (D(Cb) - Cb)
-//
-//	where D(x) = (16*x - 12)*x*x + 4*x  for x <= 0.25
-//	             sqrt(x)                 for x >  0.25
-//
-// Implemented in 0..255 byte space using float intermediates only for the
-// transcendental D(x); arithmetic mirrors the PDF spec exactly.
-func BlendSoftLight(src, dst, blend *Color, mode ColorMode) {
+func BlendSoftLight(src, dst Color, mode ColorMode) Color {
+	var blend Color
 	n := nComps(mode)
 	for i := 0; i < n; i++ {
 		blend[i] = softLight(src[i], dst[i])
 	}
-	blendCopyExtra(src, blend, n)
+	return blendCopyExtra(src, blend, n)
 }
 
 // softLight is the per-channel PDF 11.3.5.2 SoftLight in [0,255] space.
@@ -217,7 +218,8 @@ func softLight(s, b byte) byte {
 }
 
 // BlendDifference — PDF spec 11.3.5.2: B = |Cs - Cb|.
-func BlendDifference(src, dst, blend *Color, mode ColorMode) {
+func BlendDifference(src, dst Color, mode ColorMode) Color {
+	var blend Color
 	n := nComps(mode)
 	for i := 0; i < n; i++ {
 		if src[i] >= dst[i] {
@@ -226,52 +228,49 @@ func BlendDifference(src, dst, blend *Color, mode ColorMode) {
 			blend[i] = dst[i] - src[i]
 		}
 	}
-	blendCopyExtra(src, blend, n)
+	return blendCopyExtra(src, blend, n)
 }
 
 // BlendExclusion — PDF spec 11.3.5.2: B = Cs + Cb - 2*Cs*Cb/255.
-func BlendExclusion(src, dst, blend *Color, mode ColorMode) {
+func BlendExclusion(src, dst Color, mode ColorMode) Color {
+	var blend Color
 	n := nComps(mode)
 	for i := 0; i < n; i++ {
 		cs := int(src[i])
 		cb := int(dst[i])
 		blend[i] = byte(cs + cb - (2*cs*cb)/255)
 	}
-	blendCopyExtra(src, blend, n)
+	return blendCopyExtra(src, blend, n)
 }
 
 // ----- Non-separable blend modes (PDF spec 11.3.5.3, equations 11.3-11.6) -----
-//
-// Operate over RGB triple as a unit. For CMYK/DeviceN we convert via 255-c
-// inversion so the same RGB equations apply (matches Adobe + Splash convention
-// for non-separable modes on subtractive spaces, PDF spec 11.3.5.3).
 
 // BlendHue — PDF spec 11.3.5.3 eq 11.6: SetLum(SetSat(Cs, Sat(Cb)), Lum(Cb)).
-func BlendHue(src, dst, blend *Color, mode ColorMode) {
-	nonSepBlend(src, dst, blend, mode, func(rs, gs, bs, rb, gb, bbv float64) (float64, float64, float64) {
+func BlendHue(src, dst Color, mode ColorMode) Color {
+	return nonSepBlend(src, dst, mode, func(rs, gs, bs, rb, gb, bbv float64) (float64, float64, float64) {
 		r, g, b := setSat(rs, gs, bs, sat(rb, gb, bbv))
 		return setLum(r, g, b, lum(rb, gb, bbv))
 	})
 }
 
 // BlendSaturation — PDF spec 11.3.5.3 eq 11.7: SetLum(SetSat(Cb, Sat(Cs)), Lum(Cb)).
-func BlendSaturation(src, dst, blend *Color, mode ColorMode) {
-	nonSepBlend(src, dst, blend, mode, func(rs, gs, bs, rb, gb, bbv float64) (float64, float64, float64) {
+func BlendSaturation(src, dst Color, mode ColorMode) Color {
+	return nonSepBlend(src, dst, mode, func(rs, gs, bs, rb, gb, bbv float64) (float64, float64, float64) {
 		r, g, b := setSat(rb, gb, bbv, sat(rs, gs, bs))
 		return setLum(r, g, b, lum(rb, gb, bbv))
 	})
 }
 
 // BlendColor — PDF spec 11.3.5.3 eq 11.8: SetLum(Cs, Lum(Cb)).
-func BlendColor(src, dst, blend *Color, mode ColorMode) {
-	nonSepBlend(src, dst, blend, mode, func(rs, gs, bs, rb, gb, bbv float64) (float64, float64, float64) {
+func BlendColor(src, dst Color, mode ColorMode) Color {
+	return nonSepBlend(src, dst, mode, func(rs, gs, bs, rb, gb, bbv float64) (float64, float64, float64) {
 		return setLum(rs, gs, bs, lum(rb, gb, bbv))
 	})
 }
 
 // BlendLuminosity — PDF spec 11.3.5.3 eq 11.9: SetLum(Cb, Lum(Cs)).
-func BlendLuminosity(src, dst, blend *Color, mode ColorMode) {
-	nonSepBlend(src, dst, blend, mode, func(rs, gs, bs, rb, gb, bbv float64) (float64, float64, float64) {
+func BlendLuminosity(src, dst Color, mode ColorMode) Color {
+	return nonSepBlend(src, dst, mode, func(rs, gs, bs, rb, gb, bbv float64) (float64, float64, float64) {
 		return setLum(rb, gb, bbv, lum(rs, gs, bs))
 	})
 }
@@ -280,23 +279,17 @@ func BlendLuminosity(src, dst, blend *Color, mode ColorMode) {
 // modes Splash supports. CMYK is handled by inverting components before/after
 // the RGB equation (PDF spec 11.3.5.3 note 2). Spot/extra channels are copied
 // through unchanged.
-func nonSepBlend(src, dst, blend *Color, mode ColorMode, eq func(rs, gs, bs, rb, gb, bbv float64) (float64, float64, float64)) {
+func nonSepBlend(src, dst Color, mode ColorMode, eq func(rs, gs, bs, rb, gb, bbv float64) (float64, float64, float64)) Color {
+	var blend Color
 	if mode == ModeMono1 || mode == ModeMono8 {
-		// Mono: treat the single component as luminance — Lum-based modes
-		// reduce to copying the chosen luminance source. PDF spec 11.3.5.3.
 		var ls, lb byte = src[0], dst[0]
-		// Reuse eq by treating gray as r=g=b: the non-separable RGB equations
-		// then reduce algebraically to a function of (ls, lb) only.
 		fs := float64(ls) / 255.0
 		fb := float64(lb) / 255.0
 		r, _, _ := eq(fs, fs, fs, fb, fb, fb)
 		blend[0] = byteClampFloat(r)
-		blendCopyExtra(src, blend, 1)
-		return
+		return blendCopyExtra(src, blend, 1)
 	}
 	if mode == ModeCMYK8 {
-		// Convert CMY to RGB via 1 - c, run equation, invert back; K is
-		// derived as min of the result triple per PDF spec 11.3.5.3.
 		rs := 1.0 - float64(src[0])/255.0
 		gs := 1.0 - float64(src[1])/255.0
 		bs := 1.0 - float64(src[2])/255.0
@@ -307,14 +300,10 @@ func nonSepBlend(src, dst, blend *Color, mode ColorMode, eq func(rs, gs, bs, rb,
 		blend[0] = byteClampFloat(1.0 - r)
 		blend[1] = byteClampFloat(1.0 - g)
 		blend[2] = byteClampFloat(1.0 - b)
-		// K passes through from src per Splash convention (no separable K
-		// component in the RGB equations).
 		blend[3] = src[3]
-		blendCopyExtra(src, blend, 4)
-		return
+		return blendCopyExtra(src, blend, 4)
 	}
 	if mode == ModeDeviceN8 {
-		// Process channels (first 4) treated as CMYK; spot channels copied.
 		rs := 1.0 - float64(src[0])/255.0
 		gs := 1.0 - float64(src[1])/255.0
 		bs := 1.0 - float64(src[2])/255.0
@@ -326,10 +315,8 @@ func nonSepBlend(src, dst, blend *Color, mode ColorMode, eq func(rs, gs, bs, rb,
 		blend[1] = byteClampFloat(1.0 - g)
 		blend[2] = byteClampFloat(1.0 - b)
 		blend[3] = src[3]
-		blendCopyExtra(src, blend, 4)
-		return
+		return blendCopyExtra(src, blend, 4)
 	}
-	// RGB / BGR / XBGR.
 	ri, gi, bi := rgbIndices(mode)
 	rs := float64(src[ri]) / 255.0
 	gs := float64(src[gi]) / 255.0
@@ -344,15 +331,13 @@ func nonSepBlend(src, dst, blend *Color, mode ColorMode, eq func(rs, gs, bs, rb,
 	if mode == ModeXBGR8 {
 		blend[3] = src[3]
 	}
-	blendCopyExtra(src, blend, nComps(mode))
+	return blendCopyExtra(src, blend, nComps(mode))
 }
 
 // ----- HSL helpers per PDF spec 11.3.5.3 -----
 
-// lum is PDF spec 11.3.5.3 eq 11.10: Lum(C) = 0.3 R + 0.59 G + 0.11 B.
 func lum(r, g, b float64) float64 { return 0.3*r + 0.59*g + 0.11*b }
 
-// sat is PDF spec 11.3.5.3 eq 11.13: max(R,G,B) - min(R,G,B).
 func sat(r, g, b float64) float64 {
 	mx := r
 	if g > mx {
@@ -371,23 +356,17 @@ func sat(r, g, b float64) float64 {
 	return mx - mn
 }
 
-// setLum is PDF spec 11.3.5.3 eq 11.11: shifts (r,g,b) so its luminance becomes
-// l, then clips back to [0,1] via ClipColor.
 func setLum(r, g, b, l float64) (float64, float64, float64) {
 	d := l - lum(r, g, b)
 	return clipColor(r+d, g+d, b+d)
 }
 
-// setSat is PDF spec 11.3.5.3 eq 11.12: rescale (r,g,b) so the spread between
-// max and min becomes s, preserving the relative ordering.
 func setSat(r, g, b, s float64) (float64, float64, float64) {
-	// Identify min, mid, max channel.
 	type ch struct {
 		v   float64
 		idx int
 	}
 	cs := [3]ch{{r, 0}, {g, 1}, {b, 2}}
-	// Sort ascending — 3 elements, do branchless bubble.
 	if cs[0].v > cs[1].v {
 		cs[0], cs[1] = cs[1], cs[0]
 	}
@@ -409,8 +388,6 @@ func setSat(r, g, b, s float64) (float64, float64, float64) {
 	return out[0], out[1], out[2]
 }
 
-// clipColor is PDF spec 11.3.5.3 eq 11.14: pulls out-of-gamut colors back into
-// [0,1] while preserving luminance.
 func clipColor(r, g, b float64) (float64, float64, float64) {
 	l := lum(r, g, b)
 	mn := r
@@ -450,7 +427,6 @@ func clipColor(r, g, b float64) (float64, float64, float64) {
 	return r, g, b
 }
 
-// byteClampFloat rounds a [0,1] float to 0..255 byte, clamping on overflow.
 func byteClampFloat(x float64) byte {
 	if x <= 0 {
 		return 0

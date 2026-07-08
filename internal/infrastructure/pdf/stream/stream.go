@@ -8,11 +8,39 @@ import (
 	"github.com/dh-kam/pdf-go/internal/domain/entity"
 )
 
+const (
+	streamNameBitsPerComponent entity.Name = "/BitsPerComponent"
+	streamNameBPC              entity.Name = "/BPC"
+	streamNameColorSpace       entity.Name = "/ColorSpace"
+	streamNameCS               entity.Name = "/CS"
+	streamNameDecodeParms      entity.Name = "/DecodeParms"
+	streamNameFilter           entity.Name = "/Filter"
+	streamNameH                entity.Name = "/H"
+	streamNameHeight           entity.Name = "/Height"
+	streamNameColumns          entity.Name = "/Columns"
+	streamNameColors           entity.Name = "/Colors"
+	streamNameRows             entity.Name = "/Rows"
+	streamNameK                entity.Name = "/K"
+	streamNameBlackIs1         entity.Name = "/BlackIs1"
+	streamNameEncodedByteAlign entity.Name = "/EncodedByteAlign"
+	streamNameEarlyChange      entity.Name = "/EarlyChange"
+	streamNameIM               entity.Name = "/IM"
+	streamNameImageMask        entity.Name = "/ImageMask"
+	streamNameLength1          entity.Name = "/Length1"
+	streamNameLength2          entity.Name = "/Length2"
+	streamNameLength3          entity.Name = "/Length3"
+	streamNameN                entity.Name = "/N"
+	streamNamePredictor        entity.Name = "/Predictor"
+	streamNameW                entity.Name = "/W"
+	streamNameWidth            entity.Name = "/Width"
+)
+
 // Stream represents a PDF stream with optional filters.
 type Stream struct {
-	dict    *entity.Dict
-	data    []byte
-	decoded []byte // Cached decoded data
+	dict                   *entity.Dict
+	data                   []byte
+	decoded                []byte // Cached decoded data
+	decodeSizeHintOverride int
 }
 
 func init() {
@@ -27,6 +55,18 @@ func NewStream(dict *entity.Dict, data []byte) *Stream {
 		dict: dict,
 		data: data,
 	}
+}
+
+// SetDecodeSizeHint sets an optional caller-provided decoded byte count hint.
+func (s *Stream) SetDecodeSizeHint(size int) {
+	if s == nil || size <= 0 {
+		return
+	}
+	const maxDecodeSizeHint = 512 << 20
+	if size > maxDecodeSizeHint {
+		return
+	}
+	s.decodeSizeHintOverride = size
 }
 
 // Dict returns the stream dictionary.
@@ -51,11 +91,11 @@ func (s *Stream) Decode() ([]byte, error) {
 	}
 
 	// Get filters from stream dictionary
-	filterVal := s.dict.Get(entity.Name("Filter"))
+	filterVal := s.dict.Get(streamNameFilter)
 	if filterVal == nil {
 		// No filter, but may still have predictor to apply
 		// Check for DecodeParms
-		decodeParmsVal := s.dict.Get(entity.Name("DecodeParms"))
+		decodeParmsVal := s.dict.Get(streamNameDecodeParms)
 		if decodeParmsVal != nil {
 			if decodeParms, ok := decodeParmsVal.(*entity.Dict); ok {
 				// Apply predictor if specified
@@ -114,6 +154,20 @@ func (s *Stream) Decode() ([]byte, error) {
 			}
 			decodeParamsAwareDecoder.SetDecodeParams(params)
 		}
+		if hintAwareDecoder, ok := decoder.(decodeSizeHintAware); ok {
+			var params *entity.Dict
+			if i < len(decodeParamsList) {
+				params = decodeParamsList[i]
+			}
+			hintAwareDecoder.SetDecodeSizeHint(s.decodeSizeHint(params))
+		}
+		if exactHintAwareDecoder, ok := decoder.(exactDecodeSizeHintAware); ok {
+			var params *entity.Dict
+			if i < len(decodeParamsList) {
+				params = decodeParamsList[i]
+			}
+			exactHintAwareDecoder.SetExactDecodeSizeHint(s.exactDecodeSizeHint(params, i == len(filters)-1))
+		}
 
 		data, err = decoder.Decode(data)
 		if err != nil {
@@ -125,7 +179,7 @@ func (s *Stream) Decode() ([]byte, error) {
 		if i < len(decodeParamsList) && decodeParamsList[i] != nil {
 			params := decodeParamsList[i]
 			if hasPredictor(params) {
-				data, err = ApplyPredictor(data, params)
+				data, err = ApplyPredictorInPlace(data, params)
 				if err != nil {
 					return nil, err
 				}
@@ -140,14 +194,13 @@ func (s *Stream) Decode() ([]byte, error) {
 // getDecodeParamsList extracts DecodeParms for each filter.
 // Returns a slice where each element corresponds to the DecodeParms for that filter.
 func (s *Stream) getDecodeParamsList(numFilters int) ([]*entity.Dict, error) {
-	decodeParamsList := make([]*entity.Dict, numFilters)
-
 	// Get DecodeParms from stream dictionary
-	decodeParmsVal := s.dict.Get(entity.Name("DecodeParms"))
+	decodeParmsVal := s.dict.Get(streamNameDecodeParms)
 	if decodeParmsVal == nil {
-		return decodeParamsList, nil
+		return nil, nil
 	}
 
+	decodeParamsList := make([]*entity.Dict, numFilters)
 	switch v := decodeParmsVal.(type) {
 	case *entity.Dict:
 		// Single DecodeParms for a single filter
@@ -172,7 +225,7 @@ func hasPredictor(params *entity.Dict) bool {
 	if params == nil {
 		return false
 	}
-	val := params.Get(entity.Name("Predictor"))
+	val := params.Get(streamNamePredictor)
 	if val == nil {
 		return false
 	}
@@ -201,6 +254,179 @@ func (s *Stream) Reset() {
 	s.decoded = nil
 }
 
+func (s *Stream) decodeSizeHint(params *entity.Dict) int {
+	if s == nil || s.dict == nil {
+		return 0
+	}
+	size := s.decodeParamsSizeHint(params)
+	if imageSize := s.imageDecodeSizeHint(); imageSize > size {
+		size = imageSize
+	}
+	if s.decodeSizeHintOverride > size {
+		size = s.decodeSizeHintOverride
+	}
+	return size
+}
+
+func (s *Stream) exactDecodeSizeHint(params *entity.Dict, isLastFilter bool) int {
+	if s == nil || s.dict == nil {
+		return 0
+	}
+	if !isLastFilter {
+		return 0
+	}
+
+	size := 0
+	for _, name := range []entity.Name{streamNameLength1, streamNameLength2, streamNameLength3} {
+		value := dictInt(s.dict, name)
+		if value <= 0 {
+			continue
+		}
+		size += value
+	}
+	const maxDecodeSizeHint = 512 << 20
+	if size <= 0 || size > maxDecodeSizeHint {
+		size = 0
+	}
+	if size > 0 {
+		return size
+	}
+
+	if params != nil && hasPredictor(params) {
+		if size := s.decodeParamsSizeHint(params); size > 0 {
+			return size
+		}
+	}
+	if size := s.imageDecodeSizeHint(); size > 0 {
+		return size
+	}
+	return 0
+}
+
+func (s *Stream) decodeParamsSizeHint(params *entity.Dict) int {
+	height := dictInt(s.dict, streamNameHeight, streamNameH)
+	if height <= 0 {
+		return 0
+	}
+	decodeParams, err := GetDecodeParams(params)
+	if err != nil || decodeParams.Columns <= 0 || decodeParams.Colors <= 0 || decodeParams.BitsPerComponent <= 0 {
+		return 0
+	}
+	rowBytes := (decodeParams.Columns*decodeParams.Colors*decodeParams.BitsPerComponent + 7) / 8
+	if rowBytes <= 0 {
+		return 0
+	}
+	size := rowBytes * height
+	if decodeParams.Predictor >= 10 {
+		size += height // PNG predictors include one filter byte per row before predictor decoding.
+	}
+	const maxDecodeSizeHint = 512 << 20
+	if size <= 0 || size > maxDecodeSizeHint {
+		return 0
+	}
+	return size
+}
+
+func (s *Stream) imageDecodeSizeHint() int {
+	if s == nil || s.dict == nil {
+		return 0
+	}
+	width := dictInt(s.dict, streamNameWidth, streamNameW)
+	height := dictInt(s.dict, streamNameHeight, streamNameH)
+	if width <= 0 || height <= 0 {
+		return 0
+	}
+	bitsPerComponent := dictInt(s.dict, streamNameBitsPerComponent, streamNameBPC)
+	if bitsPerComponent <= 0 {
+		if isImageMaskDict(s.dict) {
+			bitsPerComponent = 1
+		} else {
+			bitsPerComponent = 8
+		}
+	}
+	components := imageColorComponents(s.dict.Get(streamNameColorSpace))
+	if components <= 0 {
+		components = imageColorComponents(s.dict.Get(streamNameCS))
+	}
+	if components <= 0 {
+		if isImageMaskDict(s.dict) {
+			components = 1
+		} else {
+			return 0
+		}
+	}
+	rowBits := width * components * bitsPerComponent
+	if rowBits <= 0 {
+		return 0
+	}
+	size := ((rowBits + 7) / 8) * height
+	const maxDecodeSizeHint = 512 << 20
+	if size <= 0 || size > maxDecodeSizeHint {
+		return 0
+	}
+	return size
+}
+
+func isImageMaskDict(dict *entity.Dict) bool {
+	if dict == nil {
+		return false
+	}
+	if b, ok := dict.Get(streamNameImageMask).(*entity.Boolean); ok {
+		return b.Value()
+	}
+	if b, ok := dict.Get(streamNameIM).(*entity.Boolean); ok {
+		return b.Value()
+	}
+	return false
+}
+
+func imageColorComponents(obj entity.Object) int {
+	switch v := obj.(type) {
+	case entity.Name:
+		switch v {
+		case entity.Name("DeviceGray"), entity.Name("/DeviceGray"), entity.Name("G"), entity.Name("/G"):
+			return 1
+		case entity.Name("DeviceRGB"), entity.Name("/DeviceRGB"), entity.Name("RGB"), entity.Name("/RGB"):
+			return 3
+		case entity.Name("DeviceCMYK"), entity.Name("/DeviceCMYK"), entity.Name("CMYK"), entity.Name("/CMYK"):
+			return 4
+		}
+	case *entity.Array:
+		if v.Len() == 0 {
+			return 0
+		}
+		name, _ := v.Get(0).(entity.Name)
+		switch name {
+		case entity.Name("Indexed"), entity.Name("/Indexed"), entity.Name("I"), entity.Name("/I"), entity.Name("Separation"), entity.Name("/Separation"):
+			return 1
+		case entity.Name("DeviceN"), entity.Name("/DeviceN"):
+			if names, ok := v.Get(1).(*entity.Array); ok {
+				return names.Len()
+			}
+		case entity.Name("ICCBased"), entity.Name("/ICCBased"):
+			if stream, ok := v.Get(1).(*entity.Stream); ok {
+				return dictInt(stream.Dict(), streamNameN)
+			}
+			if dict, ok := v.Get(1).(*entity.Dict); ok {
+				return dictInt(dict, streamNameN)
+			}
+		}
+	}
+	return 0
+}
+
+func dictInt(dict *entity.Dict, keys ...entity.Name) int {
+	if dict == nil {
+		return 0
+	}
+	for _, key := range keys {
+		if integer, ok := dict.Get(key).(*entity.Integer); ok {
+			return int(integer.Value())
+		}
+	}
+	return 0
+}
+
 // Decoder represents a stream filter decoder.
 type Decoder interface {
 	// Decode decodes the input data.
@@ -211,6 +437,18 @@ type Decoder interface {
 type decodeParamsAware interface {
 	// SetDecodeParams sets per-filter decode parameters from stream dictionary.
 	SetDecodeParams(params *entity.Dict)
+}
+
+// decodeSizeHintAware is implemented by decoders that can preallocate output.
+type decodeSizeHintAware interface {
+	// SetDecodeSizeHint sets an estimated decoded byte count.
+	SetDecodeSizeHint(size int)
+}
+
+// exactDecodeSizeHintAware is implemented by decoders that can consume trusted decoded size hints.
+type exactDecodeSizeHintAware interface {
+	// SetExactDecodeSizeHint sets a trusted decoded byte count.
+	SetExactDecodeSizeHint(size int)
 }
 
 // DecoderFactory creates a decoder for a given filter type.

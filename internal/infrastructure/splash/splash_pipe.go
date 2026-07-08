@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/debug"
+	"sync"
 )
 
 // pipe mirrors SplashPipe (Splash.cc:145-186).
@@ -50,6 +51,10 @@ type pipe struct {
 	run func(p *pipe)
 }
 
+var imagePipePool = sync.Pool{
+	New: func() any { return new(pipe) },
+}
+
 // pipeInit mirrors Splash::pipeInit (Splash.cc:212-293).
 func (s *Splash) pipeInit(p *pipe, x, y int, pat Pattern, cSrc *Color, aInput byte, usesShape, nonIsoGroup bool) {
 	p.s = s
@@ -91,7 +96,7 @@ func (s *Splash) pipeInit(p *pipe, x, y int, pat Pattern, cSrc *Color, aInput by
 	// Splash.cc:239,260 — Simple fast paths require !state->blendFunc and
 	// !state->softMask.
 	noTrans := p.noTransparency && p.blendFunc == nil && p.softMask == nil
-	p.run = pickRun(s.bitmap.mode, noTrans, usesShape, p.pattern == nil)
+	p.run = pickRun(s.bitmap.mode, noTrans, usesShape, p.pattern == nil, p.blendFunc == nil)
 	if len(pipeTracePixels) > 0 || len(lastWriterPixels) > 0 {
 		run := p.run
 		p.run = func(pp *pipe) {
@@ -122,6 +127,10 @@ func pipeSourceAlpha(p *pipe) byte {
 	}
 	if p.usesShape {
 		aSrc = byte(Div255(int(aSrc) * int(p.shape)))
+	}
+	if shouldTracePipePixel(p.x, p.y) {
+		fmt.Fprintf(os.Stderr, "SPLASH_PIPE_TRACE x=%d y=%d aInput=%d patAlpha=%d softMask=%t shape=%d usesShape=%t aSrc=%d cSrc=(%d,%d,%d)\n",
+			p.x, p.y, p.aInput, p.patAlpha, p.softMask != nil, p.shape, p.usesShape, aSrc, p.cSrc[0], p.cSrc[1], p.cSrc[2])
 	}
 	return aSrc
 }
@@ -175,9 +184,20 @@ func pipePatternX(p *pipe) int {
 // The noPat fast path (Splash.cc:259-280) caches one cSrcVal at pipeInit time;
 // for dynamic patterns we keep the same dispatch but the variant body branches
 // on p.pattern internally. Phase 3 — correctness over speed (Approach A).
-func pickRun(m ColorMode, noTransparency, usesShape, noPat bool) func(*pipe) {
-	_ = noPat // dispatch is identical whether the pattern is static or dynamic.
+func pickRun(m ColorMode, noTransparency, usesShape, noPat, noBlend bool) func(*pipe) {
 	if noTransparency {
+		if noPat {
+			switch m {
+			case ModeMono8:
+				return pipeRunSimpleMono8NoPat
+			case ModeRGB8:
+				return pipeRunSimpleRGB8NoPat
+			case ModeCMYK8:
+				return pipeRunSimpleCMYK8NoPat
+			case ModeDeviceN8:
+				return pipeRunSimpleDeviceN8NoPat
+			}
+		}
 		switch m {
 		case ModeMono8:
 			return pipeRunSimpleMono8
@@ -190,6 +210,18 @@ func pickRun(m ColorMode, noTransparency, usesShape, noPat bool) func(*pipe) {
 		}
 	}
 	if !noTransparency && usesShape {
+		if noPat && noBlend {
+			switch m {
+			case ModeMono8:
+				return pipeRunAAMono8NoPat
+			case ModeRGB8:
+				return pipeRunAARGB8NoPat
+			case ModeCMYK8:
+				return pipeRunAACMYK8NoPat
+			case ModeDeviceN8:
+				return pipeRunAADeviceN8NoPat
+			}
+		}
 		switch m {
 		case ModeMono8:
 			return pipeRunAAMono8
@@ -201,8 +233,19 @@ func pickRun(m ColorMode, noTransparency, usesShape, noPat bool) func(*pipe) {
 			return pipeRunAADeviceN8
 		}
 	}
-	// Fallback: AA path with shape — covers the !noTransparency && !usesShape
-	// edge case (no soft-mask / blend-func support in Phase 1).
+	// Fallback: AA path with shape
+	if noPat && noBlend {
+		switch m {
+		case ModeMono8:
+			return pipeRunAAMono8NoPat
+		case ModeRGB8:
+			return pipeRunAARGB8NoPat
+		case ModeCMYK8:
+			return pipeRunAACMYK8NoPat
+		case ModeDeviceN8:
+			return pipeRunAADeviceN8NoPat
+		}
+	}
 	switch m {
 	case ModeMono8:
 		return pipeRunAAMono8

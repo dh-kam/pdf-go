@@ -16,7 +16,19 @@ type textRenderPolicy interface {
 	ShouldSkipTextCode(debugName string, font entity.Font, code uint32) bool
 }
 
-type defaultTextRenderPolicy struct{}
+type defaultTextRenderPolicy struct {
+	snapshot      bool
+	skipTextCodes map[string]map[uint32]struct{}
+}
+
+func newDefaultTextRenderPolicy() defaultTextRenderPolicy {
+	raw := strings.TrimSpace(os.Getenv("PDF_DEBUG_SKIP_TEXT_CODES_FOR_BASE"))
+	policy := defaultTextRenderPolicy{snapshot: true}
+	if raw != "" {
+		policy.skipTextCodes = debugTextCodeMap(raw)
+	}
+	return policy
+}
 
 func (defaultTextRenderPolicy) ShouldSkipAllText() bool {
 	return shouldSkipAllTextForDebug()
@@ -30,11 +42,22 @@ func (defaultTextRenderPolicy) ShouldUseFastPathTextRenderMode() bool {
 	return shouldUseFastPathTextRenderModeForDebug()
 }
 
-func (defaultTextRenderPolicy) HasSkippedTextCodes(debugName string, font entity.Font) bool {
+func (p defaultTextRenderPolicy) HasSkippedTextCodes(debugName string, font entity.Font) bool {
+	if p.snapshot {
+		return len(debugTextCodeSetForBaseFromTargets(debugName, font, p.skipTextCodes)) > 0
+	}
 	return hasSkippedTextCodesForDebug(debugName, font)
 }
 
-func (defaultTextRenderPolicy) ShouldSkipTextCode(debugName string, font entity.Font, code uint32) bool {
+func (p defaultTextRenderPolicy) ShouldSkipTextCode(debugName string, font entity.Font, code uint32) bool {
+	if p.snapshot {
+		skipCodes := debugTextCodeSetForBaseFromTargets(debugName, font, p.skipTextCodes)
+		if len(skipCodes) == 0 {
+			return false
+		}
+		_, ok := skipCodes[code]
+		return ok
+	}
 	return shouldSkipTextCodeForDebug(debugName, font, code)
 }
 
@@ -69,7 +92,10 @@ func debugTextCodeSetForBase(debugName string, font entity.Font) map[uint32]stru
 		return nil
 	}
 
-	targets := debugTextCodeMap(raw)
+	return debugTextCodeSetForBaseFromTargets(debugName, font, debugTextCodeMap(raw))
+}
+
+func debugTextCodeSetForBaseFromTargets(debugName string, font entity.Font, targets map[string]map[uint32]struct{}) map[uint32]struct{} {
 	if len(targets) == 0 {
 		return nil
 	}

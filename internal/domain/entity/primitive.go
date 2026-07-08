@@ -109,8 +109,24 @@ type Integer struct {
 	value int64
 }
 
+const (
+	cachedIntegerMin = -16
+	cachedIntegerMax = 256
+)
+
+var cachedIntegers = func() []*Integer {
+	values := make([]*Integer, cachedIntegerMax-cachedIntegerMin+1)
+	for value := cachedIntegerMin; value <= cachedIntegerMax; value++ {
+		values[value-cachedIntegerMin] = &Integer{value: int64(value)}
+	}
+	return values
+}()
+
 // NewInteger creates a new Integer object.
 func NewInteger(value int64) *Integer {
+	if value >= cachedIntegerMin && value <= cachedIntegerMax {
+		return cachedIntegers[value-cachedIntegerMin]
+	}
 	return &Integer{value: value}
 }
 
@@ -379,10 +395,19 @@ func (a *Array) Items() []Object {
 	return a.items
 }
 
+const inlineDictCapacity = 4
+
+type dictEntry struct {
+	key   Name
+	value Object
+}
+
 // Dict represents a PDF dictionary object.
 type Dict struct {
-	items map[Name]Object
-	xref  XRef // Optional: for resolving indirect references
+	items   map[Name]Object
+	inline  [inlineDictCapacity]dictEntry
+	nInline int
+	xref    XRef // Optional: for resolving indirect references
 }
 
 // XRef is the interface for resolving indirect references.
@@ -393,15 +418,33 @@ type XRef interface {
 
 // NewDict creates a new Dict object.
 func NewDict() *Dict {
+	return &Dict{}
+}
+
+// NewDictWithCapacity creates a new Dict object with an initial item capacity.
+func NewDictWithCapacity(capacity int) *Dict {
+	if capacity <= inlineDictCapacity {
+		return &Dict{}
+	}
 	return &Dict{
-		items: make(map[Name]Object),
+		items: make(map[Name]Object, capacity),
 	}
 }
 
 // NewDictWithXRef creates a new Dict with an XRef for auto-dereferencing.
 func NewDictWithXRef(xref XRef) *Dict {
 	return &Dict{
-		items: make(map[Name]Object),
+		xref: xref,
+	}
+}
+
+// NewDictWithXRefCapacity creates a new Dict with an XRef and initial item capacity.
+func NewDictWithXRefCapacity(xref XRef, capacity int) *Dict {
+	if capacity <= inlineDictCapacity {
+		return &Dict{xref: xref}
+	}
+	return &Dict{
+		items: make(map[Name]Object, capacity),
 		xref:  xref,
 	}
 }
@@ -416,29 +459,27 @@ func (d *Dict) String() string {
 	var sb strings.Builder
 	sb.WriteString("<<")
 	first := true
-	for key, value := range d.items {
-		if !first {
-			sb.WriteString(" ")
+	d.forEachRaw(func(key Name, value Object) {
+		if first {
+			first = false
+		} else {
+			sb.WriteByte(' ')
 		}
-		first = false
 		sb.WriteString(key.String())
-		sb.WriteString(" ")
+		sb.WriteByte(' ')
 		sb.WriteString(value.String())
-	}
+	})
 	sb.WriteString(">>")
 	return sb.String()
 }
 
 // Clone creates a deep copy of this Dict.
 func (d *Dict) Clone() Object {
-	items := make(map[Name]Object, len(d.items))
-	for key, value := range d.items {
-		items[key] = value.Clone()
-	}
-	return &Dict{
-		items: items,
-		xref:  d.xref,
-	}
+	clone := NewDictWithXRefCapacity(d.xref, d.Len())
+	d.forEachRaw(func(key Name, value Object) {
+		clone.Set(key, value.Clone())
+	})
+	return clone
 }
 
 // Get returns the value for the given key.
@@ -475,7 +516,7 @@ func (d *Dict) GetRaw(key Name) Object {
 // PDF names are commonly represented as "/Name", but some call sites
 // pass names without a leading slash.
 func (d *Dict) lookupKey(key Name) (Object, bool) {
-	if value, ok := d.items[key]; ok {
+	if value, ok := d.lookupExact(key); ok {
 		return value, true
 	}
 
@@ -487,12 +528,10 @@ func (d *Dict) lookupKey(key Name) (Object, bool) {
 	// Try the alternative representation:
 	// "/Name" <-> "Name"
 	if keyStr[0] == '/' {
-		value, ok := d.items[Name(keyStr[1:])]
-		return value, ok
+		return d.lookupExact(Name(keyStr[1:]))
 	}
 
-	value, ok := d.items[Name("/"+keyStr)]
-	return value, ok
+	return d.lookupExact(Name("/" + keyStr))
 }
 
 // GetTry tries multiple keys in order, returning the first found value.
@@ -507,6 +546,22 @@ func (d *Dict) GetTry(keys ...Name) Object {
 
 // Set sets the value for the given key.
 func (d *Dict) Set(key Name, value Object) {
+	if d.items != nil {
+		d.items[key] = value
+		return
+	}
+	for i := 0; i < d.nInline; i++ {
+		if d.inline[i].key == key {
+			d.inline[i].value = value
+			return
+		}
+	}
+	if d.nInline < inlineDictCapacity {
+		d.inline[d.nInline] = dictEntry{key: key, value: value}
+		d.nInline++
+		return
+	}
+	d.promoteInline(inlineDictCapacity * 2)
 	d.items[key] = value
 }
 
@@ -518,16 +573,59 @@ func (d *Dict) Has(key Name) bool {
 
 // Keys returns all keys in the dictionary.
 func (d *Dict) Keys() []Name {
-	keys := make([]Name, 0, len(d.items))
-	for key := range d.items {
+	keys := make([]Name, 0, d.Len())
+	d.forEachRaw(func(key Name, _ Object) {
 		keys = append(keys, key)
-	}
+	})
 	return keys
 }
 
 // Len returns the number of entries in the dictionary.
 func (d *Dict) Len() int {
+	if d.items == nil {
+		return d.nInline
+	}
 	return len(d.items)
+}
+
+func (d *Dict) lookupExact(key Name) (Object, bool) {
+	if d.items != nil {
+		value, ok := d.items[key]
+		return value, ok
+	}
+	for i := 0; i < d.nInline; i++ {
+		if d.inline[i].key == key {
+			return d.inline[i].value, true
+		}
+	}
+	return nil, false
+}
+
+func (d *Dict) forEachRaw(fn func(Name, Object)) {
+	if d.items != nil {
+		for key, value := range d.items {
+			fn(key, value)
+		}
+		return
+	}
+	for i := 0; i < d.nInline; i++ {
+		entry := d.inline[i]
+		fn(entry.key, entry.value)
+	}
+}
+
+func (d *Dict) promoteInline(capacity int) {
+	if capacity < d.nInline {
+		capacity = d.nInline
+	}
+	items := make(map[Name]Object, capacity)
+	for i := 0; i < d.nInline; i++ {
+		entry := d.inline[i]
+		items[entry.key] = entry.value
+		d.inline[i] = dictEntry{}
+	}
+	d.nInline = 0
+	d.items = items
 }
 
 // Stream represents a PDF stream object (dictionary + data).

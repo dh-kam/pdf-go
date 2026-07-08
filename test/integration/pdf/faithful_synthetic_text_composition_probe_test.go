@@ -2260,7 +2260,7 @@ func faithfulSyntheticTextArrayGlyphCountForProbe(op domainrenderer.Operator) in
 
 func faithfulSyntheticTextArrayPrefixOperatorForProbe(op domainrenderer.Operator, glyphCount int) domainrenderer.Operator {
 	if glyphCount <= 0 || op.Opcode != "TJ" || len(op.Operands) == 0 {
-		return domainrenderer.Operator{Resources: op.Resources, Opcode: op.Opcode, Operands: []entity.Object{entity.NewArray()}}
+		return domainrenderer.Operator{Opcode: op.Opcode, Operands: []entity.Object{entity.NewArray()}}
 	}
 	array, ok := op.Operands[0].(*entity.Array)
 	if !ok {
@@ -2291,9 +2291,8 @@ func faithfulSyntheticTextArrayPrefixOperatorForProbe(op domainrenderer.Operator
 	}
 
 	return domainrenderer.Operator{
-		Resources: op.Resources,
-		Opcode:    op.Opcode,
-		Operands:  []entity.Object{entity.NewArray(items...)},
+		Opcode:   op.Opcode,
+		Operands: []entity.Object{entity.NewArray(items...)},
 	}
 }
 

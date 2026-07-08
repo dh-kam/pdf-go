@@ -863,7 +863,7 @@ func (s *Splash) emitJoin(out *xpath.Path, vx, vy, dx, dy, dxn, dyn, halfW float
 					vx-wdy, vy+wdx,
 				)
 			} else {
-				dJoin := math.Hypot(-wdy-(-wdyN), wdx-wdxN)
+				dJoin := splashDistLocal(-wdy, wdx, -wdyN, wdxN)
 				if dJoin > 0 {
 					dxJoin := (-wdyN + wdy) / dJoin
 					dyJoin := (wdxN - wdx) / dJoin
@@ -898,7 +898,7 @@ func (s *Splash) emitJoin(out *xpath.Path, vx, vy, dx, dy, dxn, dyn, halfW float
 					vx+wdyN, vy-wdxN,
 				)
 			} else {
-				dJoin := math.Hypot(wdy-wdyN, -wdx-(-wdxN))
+				dJoin := splashDistLocal(wdy, -wdx, wdyN, -wdxN)
 				if dJoin > 0 {
 					dxJoin := (wdyN - wdy) / dJoin
 					dyJoin := (-wdxN + wdx) / dJoin
@@ -946,12 +946,22 @@ func (s *Splash) emitJoin(out *xpath.Path, vx, vy, dx, dy, dxn, dyn, halfW float
 func unitVec(x0, y0, x1, y1 float64) (float64, float64, bool) {
 	dx := x1 - x0
 	dy := y1 - y0
-	d := math.Hypot(dx, dy)
+	d := splashDistLocal(x0, y0, x1, y1)
 	if d == 0 {
 		return 0, 0, false
 	}
 	inv := 1 / d
 	return dx * inv, dy * inv, true
+}
+
+// splashDistLocal mirrors SplashMath.h splashDist: sqrt(dx*dx + dy*dy).
+// math.Hypot is NOT bit-compatible (different algorithm, occasionally 1 ULP
+// off), which shifts stroke cap/join endpoints by 1 ULP vs Poppler and flips
+// AA coverage at cell boundaries.
+func splashDistLocal(x0, y0, x1, y1 float64) float64 {
+	dx := x1 - x0
+	dy := y1 - y0
+	return math.Sqrt(dx*dx + dy*dy)
 }
 
 // drawSpan writes a horizontal run of solid colour pixels from x0..x1 (inclusive)

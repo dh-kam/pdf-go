@@ -65,6 +65,24 @@ func renderGlyphBitmapByIndexFreeTypeGo(fontData []byte, glyphIndex uint32, size
 	}
 	transformFreeTypeGoOutline(outline, rasterMatrix, phaseX, phaseY, floorPhase)
 
+	if os.Getenv("PDF_DEBUG_FTGO_CBOX_TRACE") != "" {
+		minX, maxY := int32(1<<31-1), int32(-(1 << 31))
+		for _, p := range outline.Points {
+			if p.X < minX {
+				minX = p.X
+			}
+			if p.Y > maxY {
+				maxY = p.Y
+			}
+		}
+		phaseX26 := freeTypeGoPhase26Dot6(phaseX, floorPhase)
+		fmt.Fprintf(os.Stderr, "GO_FT_CBOX glyph=%d sizePx=%d rm=[%d,%d,%d,%d] phaseX26=%d cboxXmin=%d cboxYmax=%d\n",
+			glyphIndex, sizePx,
+			freeTypeGoFixed(rasterMatrix[0]), freeTypeGoFixed(rasterMatrix[1]),
+			freeTypeGoFixed(rasterMatrix[2]), freeTypeGoFixed(rasterMatrix[3]),
+			phaseX26, minX, maxY)
+	}
+
 	renderOutline, bitmap, _, ok := ftcore.PrepareBitmapForOutline(outline, -1, ftapi.RenderModeNormal)
 	if !ok || bitmap == nil {
 		return nil, 0, 0, 0, 0, true, nil

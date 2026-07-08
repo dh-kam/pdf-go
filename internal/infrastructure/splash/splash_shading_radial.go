@@ -45,6 +45,7 @@ type RadialShader struct {
 	// Pre-computed quadratic coefficients (constant in pixel coords).
 	dxAxis, dyAxis, dr float64
 	a                  float64
+	inva               float64
 	degenerate         bool
 
 	skipEdgeCorrection bool
@@ -67,6 +68,11 @@ func NewRadialShader(x0, y0, r0, x1, y1, r1, t0, t1 float64, extend0, extend1 bo
 	s.a = s.dxAxis*s.dxAxis + s.dyAxis*s.dyAxis - s.dr*s.dr
 	if math.Abs(s.a) < radialDegenerateEpsilon {
 		s.degenerate = true
+	} else {
+		// Poppler precomputes inva = 1/a and MULTIPLIES the roots
+		// (SplashOutputDev.cc getParameter: s0 *= inva) — dividing by a
+		// instead rounds differently by ±1 ULP and flips colour bands.
+		s.inva = 1 / s.a
 	}
 	return s
 }
@@ -109,7 +115,7 @@ func (s *RadialShader) computeT(fx, fy float64) (t float64, inside bool) {
 		return 0, false
 	}
 	sq := math.Sqrt(disc)
-	return s.selectPopplerRoot((b+sq)/s.a, (b-sq)/s.a)
+	return s.selectPopplerRoot((b+sq)*s.inva, (b-sq)*s.inva)
 }
 
 func (s *RadialShader) selectPopplerRoot(s0, s1 float64) (float64, bool) {
@@ -155,7 +161,7 @@ func (s *RadialShader) GetColor(x, y int, c *Color) bool {
 	funcT := s.T0 + t*(s.T1-s.T0)
 	*c = s.Func(funcT)
 	if shouldTraceRadialPixel(x, y) {
-		fmt.Fprintf(os.Stderr, "SPLASH_RADIAL_PIXEL_TRACE x=%d y=%d fx=%.12f fy=%.12f s=%.12f t=%.12f color=(%d,%d,%d)\n",
+		fmt.Fprintf(os.Stderr, "SPLASH_RADIAL_PIXEL_TRACE x=%d y=%d fx=%.17g fy=%.17g s=%.17g t=%.17g color=(%d,%d,%d)\n",
 			x, y, fx, fy, t, funcT, c[0], c[1], c[2])
 	}
 	return true

@@ -9,6 +9,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,14 +25,18 @@ import (
 
 // ConcurrentRenderer implements concurrent page rendering.
 type ConcurrentRenderer struct {
-	pageCache   domaincache.PageCache
-	formCache   domainrenderer.FormOperatorCache
-	bytePool    domaincache.BytePool
-	maxWorkers  int
-	backend     string
-	renderCount atomic.Int64
-	cacheHits   atomic.Int64
-	cacheMisses atomic.Int64
+	pageCache       domaincache.PageCache
+	pageCacheOnce   sync.Once
+	pageCacheConfig domaincache.CacheConfig
+	formCache       domainrenderer.FormOperatorCache
+	formCacheOnce   sync.Once
+	formCacheSize   int
+	formCacheTTL    time.Duration
+	maxWorkers      int
+	backend         string
+	renderCount     atomic.Int64
+	cacheHits       atomic.Int64
+	cacheMisses     atomic.Int64
 }
 
 type renderOptionsContextKey struct{}
@@ -78,28 +83,24 @@ func NewConcurrentRenderer(options RendererOptions) *ConcurrentRenderer {
 	}
 
 	return &ConcurrentRenderer{
-		pageCache:  cache.NewPageCache(pageCacheConfig),
-		formCache:  newFormOperatorCache(options.FormCacheSize, options.FormCacheTTL),
-		bytePool:   cache.NewBytePool(domaincache.PoolConfig{MinSize: 10, MaxSize: 100}),
-		maxWorkers: options.MaxWorkers,
-		backend:    options.Backend,
+		pageCacheConfig: pageCacheConfig,
+		formCacheSize:   options.FormCacheSize,
+		formCacheTTL:    options.FormCacheTTL,
+		maxWorkers:      options.MaxWorkers,
+		backend:         options.Backend,
 	}
 }
 
 // RenderPage renders a single page to an image.
 func (r *ConcurrentRenderer) RenderPage(ctx context.Context, page *entity.Page, options domainrenderer.RenderOptions) (image.Image, error) {
-	// Apply defaults
-	if options.DPI <= 0 {
-		options.DPI = 72.0
-	}
-	if options.Scale <= 0 {
-		options.Scale = 1.0
-	}
+	options = normalizeRenderOptions(options)
 
 	// Check cache if enabled
+	var pageCache domaincache.PageCache
 	if options.EnableCache {
+		pageCache = r.getPageCache()
 		cacheKey := renderCacheKey(page, options)
-		cached, ok := r.pageCache.Get(ctx, cacheKey)
+		cached, ok := pageCache.Get(ctx, cacheKey)
 		if ok {
 			r.cacheHits.Add(1)
 			r.renderCount.Add(1)
@@ -110,7 +111,51 @@ func (r *ConcurrentRenderer) RenderPage(ctx context.Context, page *entity.Page, 
 		r.cacheMisses.Add(1)
 	}
 
-	// Create canvas from the visible page box, honoring page rotation.
+	c, err := r.renderPageCanvas(ctx, page, options)
+	if err != nil {
+		return nil, err
+	}
+
+	img := c.Image()
+	releaseCanvasIfSupported(c)
+	r.renderCount.Add(1)
+
+	// Cache the result if enabled
+	if options.EnableCache {
+		if pageCache == nil {
+			pageCache = r.getPageCache()
+		}
+		cacheKey := renderCacheKey(page, options)
+		if err := pageCache.Set(ctx, cacheKey, img); err != nil {
+			return nil, fmt.Errorf("cache page %d: %w", page.Index(), err)
+		}
+	}
+
+	return img, nil
+}
+
+// RenderPageCanvas renders a single page and returns the live canvas.
+func (r *ConcurrentRenderer) RenderPageCanvas(ctx context.Context, page *entity.Page, options domainrenderer.RenderOptions) (domaincanvas.Canvas, error) {
+	options = normalizeRenderOptions(options)
+	c, err := r.renderPageCanvas(ctx, page, options)
+	if err != nil {
+		return nil, err
+	}
+	r.renderCount.Add(1)
+	return c, nil
+}
+
+func normalizeRenderOptions(options domainrenderer.RenderOptions) domainrenderer.RenderOptions {
+	if options.DPI <= 0 {
+		options.DPI = 72.0
+	}
+	if options.Scale <= 0 {
+		options.Scale = 1.0
+	}
+	return options
+}
+
+func (r *ConcurrentRenderer) renderPageCanvas(ctx context.Context, page *entity.Page, options domainrenderer.RenderOptions) (domaincanvas.Canvas, error) {
 	pageBox := page.CropBox()
 	xMin := math.Min(pageBox[0], pageBox[2])
 	xMax := math.Max(pageBox[0], pageBox[2])
@@ -144,21 +189,31 @@ func (r *ConcurrentRenderer) RenderPage(ctx context.Context, page *entity.Page, 
 	// Render to canvas.
 	ctxWithRenderOptions := withRenderOptions(ctx, options)
 	if err := r.RenderToCanvas(ctxWithRenderOptions, page, c); err != nil {
+		releaseCanvasIfSupported(c)
 		return nil, fmt.Errorf("render page %d: %w", page.Index(), err)
 	}
+	releaseTransientCanvasCachesIfSupported(c)
 
-	img := c.Image()
-	r.renderCount.Add(1)
+	return c, nil
+}
 
-	// Cache the result if enabled
-	if options.EnableCache {
-		cacheKey := renderCacheKey(page, options)
-		if err := r.pageCache.Set(ctx, cacheKey, img); err != nil {
-			return nil, fmt.Errorf("cache page %d: %w", page.Index(), err)
-		}
+func releaseCanvasIfSupported(c domaincanvas.Canvas) {
+	if releaser, ok := c.(interface{ Release() }); ok {
+		releaser.Release()
 	}
+}
 
-	return img, nil
+func releaseTransientCanvasCachesIfSupported(c domaincanvas.Canvas) {
+	if releaser, ok := c.(interface{ ReleaseTransientCaches() }); ok {
+		releaser.ReleaseTransientCaches()
+	}
+}
+
+func (r *ConcurrentRenderer) getPageCache() domaincache.PageCache {
+	r.pageCacheOnce.Do(func() {
+		r.pageCache = cache.NewPageCache(r.pageCacheConfig)
+	})
+	return r.pageCache
 }
 
 func renderCacheKey(page *entity.Page, options domainrenderer.RenderOptions) domaincache.CacheKey {
@@ -314,6 +369,7 @@ func (r *ConcurrentRenderer) RenderToCanvas(ctx context.Context, page *entity.Pa
 
 	// Create evaluator
 	evaluator := domainrenderer.NewEvaluator(doc.XRef())
+	evaluator.SetOperatorRecording(false)
 	evaluator.SetCanvas(c)
 	renderOpts := renderOptionsFromContext(ctx)
 	if formCache := r.resolveFormCacheForOptions(renderOpts); formCache != nil {
@@ -384,50 +440,81 @@ func (r *ConcurrentRenderer) RenderToCanvas(ctx context.Context, page *entity.Pa
 			}
 		}
 
-		switch rotation {
-		case 90:
-			// x' = (y - yMin), y' = (xMin + pageWidth - x)
-			initial = [6]float64{
-				0,
-				-scaleY,
-				scaleX,
-				0,
-				-yMin * scaleX,
-				(xMin + pageWidth) * scaleY,
+		type yDownBaseSetter interface {
+			SetYDownBase(on bool)
+		}
+		yDownDone := false
+		if useYDownBase() {
+			if setter, ok := c.(yDownBaseSetter); ok {
+				setter.SetYDownBase(true)
+				// Poppler GfxState upsideDown CTM (GfxState.cc:6441): compose
+				// the y-flip INTO the base CTM so device Y comes out of the
+				// same fl(x·b + y·d + f) Poppler evaluates. Flipping per point
+				// at page magnitude loses ~1e-13 and flips AA subcells on
+				// rotated geometry.
+				switch rotation {
+				case 90:
+					initial = [6]float64{0, scaleY, scaleX, 0, -yMin * scaleX, -xMin * scaleY}
+					setPageYOrigin((xMax - xMin) * scaleY)
+				case 180:
+					initial = [6]float64{-scaleX, 0, 0, scaleY, xMax * scaleX, -yMin * scaleY}
+					setPageYOrigin((yMax - yMin) * scaleY)
+				case 270:
+					initial = [6]float64{0, -scaleY, -scaleX, 0, yMax * scaleX, xMax * scaleY}
+					setPageYOrigin((xMax - xMin) * scaleY)
+				default:
+					initial = [6]float64{scaleX, 0, 0, -scaleY, -xMin * scaleX, yMax * scaleY}
+					setPageYOrigin((yMax - yMin) * scaleY)
+				}
+				yDownDone = true
 			}
-			setPageYOrigin((xMax - xMin) * scaleY)
-		case 180:
-			// x' = (xMin + pageWidth - x), y' = (yMin + pageHeight - y)
-			initial = [6]float64{
-				-scaleX,
-				0,
-				0,
-				-scaleY,
-				(xMin + pageWidth) * scaleX,
-				(yMin + pageHeight) * scaleY,
+		}
+		if !yDownDone {
+			switch rotation {
+			case 90:
+				// x' = (y - yMin), y' = (xMin + pageWidth - x)
+				initial = [6]float64{
+					0,
+					-scaleY,
+					scaleX,
+					0,
+					-yMin * scaleX,
+					(xMin + pageWidth) * scaleY,
+				}
+				setPageYOrigin((xMax - xMin) * scaleY)
+			case 180:
+				// x' = (xMin + pageWidth - x), y' = (yMin + pageHeight - y)
+				initial = [6]float64{
+					-scaleX,
+					0,
+					0,
+					-scaleY,
+					(xMin + pageWidth) * scaleX,
+					(yMin + pageHeight) * scaleY,
+				}
+				setPageYOrigin((yMax - yMin) * scaleY)
+			case 270:
+				// x' = (yMin + pageHeight - y), y' = (x - xMin)
+				initial = [6]float64{
+					0,
+					scaleY,
+					-scaleX,
+					0,
+					(yMin + pageHeight) * scaleX,
+					-xMin * scaleY,
+				}
+				setPageYOrigin((xMax - xMin) * scaleY)
+			default:
+				initial = [6]float64{
+					scaleX,
+					0,
+					0,
+					scaleY,
+					-xMin * scaleX,
+					-yMin * scaleY, // Y flip is handled by the Splash canvas; subtract CropBox lower-left here.
+				}
+				setPageYOrigin((yMax - yMin) * scaleY)
 			}
-			setPageYOrigin((yMax - yMin) * scaleY)
-		case 270:
-			// x' = (yMin + pageHeight - y), y' = (x - xMin)
-			initial = [6]float64{
-				0,
-				scaleY,
-				-scaleX,
-				0,
-				(yMin + pageHeight) * scaleX,
-				-xMin * scaleY,
-			}
-			setPageYOrigin((xMax - xMin) * scaleY)
-		default:
-			initial = [6]float64{
-				scaleX,
-				0,
-				0,
-				scaleY,
-				-xMin * scaleX,
-				-yMin * scaleY, // Y flip is handled by the Splash canvas; subtract CropBox lower-left here.
-			}
-			setPageYOrigin((yMax - yMin) * scaleY)
 		}
 
 		evaluator.SetInitialTransform(initial)
@@ -502,6 +589,14 @@ func (s RendererStats) FormCacheHitRate() float64 {
 	return float64(s.FormCacheHits) / float64(total) * 100
 }
 
+// useYDownBase enables composing the page CTM directly in y-down device space
+// (Poppler GfxState upsideDown), eliminating the per-point page-height flip
+// whose float cancellation flips AA subcells on rotated geometry. Gated while
+// the corpus validates the migration; enable with GO_PDF_YDOWN_BASE=1.
+func useYDownBase() bool {
+	return os.Getenv("GO_PDF_YDOWN_BASE") == "1"
+}
+
 func normalizePageRotation(rotation int) int {
 	normalized := rotation % 360
 	if normalized < 0 {
@@ -535,6 +630,9 @@ func (r *ConcurrentRenderer) resolveFormCacheForOptions(opts domainrenderer.Rend
 	if !opts.EnableCache {
 		return nil
 	}
+	r.formCacheOnce.Do(func() {
+		r.formCache = newFormOperatorCache(r.formCacheSize, r.formCacheTTL)
+	})
 	return r.formCache
 }
 

@@ -3,12 +3,15 @@
 package main
 
 import (
+	"compress/zlib"
 	"context"
 	"fmt"
 	"image"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
@@ -21,10 +24,16 @@ import (
 	"github.com/dh-kam/pdf-go/internal/infrastructure/canvas"
 	"github.com/dh-kam/pdf-go/internal/infrastructure/pdf/xref"
 	"github.com/dh-kam/pdf-go/internal/infrastructure/renderer"
+	"github.com/dh-kam/pdf-go/internal/infrastructure/splash"
 	appversion "github.com/dh-kam/pdf-go/internal/version"
 )
 
 const pngFormat = "png"
+const (
+	pngCompressionBest = "best"
+	pngCompressionFast = "fast"
+	pngCompressionNone = "none"
+)
 
 // options represents CLI options.
 type options struct {
@@ -45,6 +54,10 @@ type options struct {
 	imageSamplingMode  string
 	failOnPageError    bool
 	backend            string
+	cpuProfile         string
+	memProfile         string
+	printMemStats      bool
+	pngCompression     string
 }
 
 // renderStats represents rendering statistics.
@@ -118,6 +131,10 @@ func newRootCmd() (*cobra.Command, error) {
 			if err != nil {
 				return fmt.Errorf("invalid --format: %w", err)
 			}
+			pngCompression, err := normalizePNGCompression(cfg.GetString("png-compression"))
+			if err != nil {
+				return fmt.Errorf("invalid --png-compression: %w", err)
+			}
 			imageSamplingMode, err := normalizeImageSamplingMode(cfg.GetString("image-sampling-mode"))
 			if err != nil {
 				return fmt.Errorf("invalid --image-sampling-mode: %w", err)
@@ -145,7 +162,18 @@ func newRootCmd() (*cobra.Command, error) {
 				imageSamplingMode:  imageSamplingMode,
 				failOnPageError:    cfg.GetBool("fail-on-page-error"),
 				backend:            backend,
+				cpuProfile:         cfg.GetString("cpuprofile"),
+				memProfile:         cfg.GetString("memprofile"),
+				printMemStats:      cfg.GetBool("print-mem-stats"),
+				pngCompression:     pngCompression,
 			}
+
+			stopCPUProfile, writeMemProfile, err := startProfiling(opts)
+			if err != nil {
+				return err
+			}
+			defer stopCPUProfile()
+			defer writeMemProfile()
 
 			failed := 0
 			for _, pdfFile := range args {
@@ -173,6 +201,7 @@ func newRootCmd() (*cobra.Command, error) {
 	flags.Float64P("dpi", "d", 72, "Render at specified DPI")
 	flags.Float64P("scale", "s", 1.0, "Scale factor")
 	flags.StringP("format", "f", pngFormat, "Output format (currently only png is supported)")
+	flags.String("png-compression", pngCompressionBest, "PNG compression level: best | fast | none")
 	flags.String("prefix", "", "Prefix for output files (default: input filename)")
 	flags.IntP("workers", "w", 4, "Number of concurrent render workers")
 	flags.Int("cache-size", 0, "Rendered-page cache size when --enable-cache is set (0: auto by workers)")
@@ -189,11 +218,14 @@ func newRootCmd() (*cobra.Command, error) {
 	)
 	flags.String("password", "", "Password for encrypted PDF files")
 	flags.Bool("fail-on-page-error", false, "Exit with an error when any page fails to render")
+	flags.String("cpuprofile", "", "Write CPU profile to this file")
+	flags.String("memprofile", "", "Write memory profile to this file")
 	flags.String(
 		"backend",
 		canvas.BackendSplash,
 		"Rendering backend: splash (default) or image-canvas.",
 	)
+	flags.Bool("print-mem-stats", false, "Print memory statistics (total allocations and current heap alloc) at the end of rendering")
 
 	if err := cfg.BindPFlags(flags); err != nil {
 		return nil, fmt.Errorf("bind flags: %w", err)
@@ -204,10 +236,11 @@ func newRootCmd() (*cobra.Command, error) {
 
 // processPDF processes a single PDF file and renders pages to images.
 func processPDF(filePath string, pages []int, opts options) error {
-	data, err := os.ReadFile(filePath)
+	data, cleanupInput, err := readPDFInput(filePath)
 	if err != nil {
 		return fmt.Errorf("read file: %w", err)
 	}
+	defer cleanupInput()
 
 	xrefTable := xref.NewTable(data)
 	if err := xrefTable.Parse(); err != nil {
@@ -318,13 +351,6 @@ func processPDF(filePath string, pages []int, opts options) error {
 			continue
 		}
 
-		img, err := r.RenderPage(ctx, page, renderOpts)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: Could not render page %d: %v\n", pageIndex+1, err)
-			stats.failed++
-			continue
-		}
-
 		prefix := opts.prefix
 		if prefix == "" {
 			prefix = strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
@@ -333,10 +359,32 @@ func processPDF(filePath string, pages []int, opts options) error {
 		outputFileName := fmt.Sprintf("%s_page_%04d.%s", prefix, pageIndex+1, pngFormat)
 		outputPath := filepath.Join(outputDir, outputFileName)
 
-		if err := saveImage(img, outputPath, opts.format); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: Could not save page %d: %v\n", pageIndex+1, err)
-			stats.failed++
-			continue
+		if canUseDirectCanvasOutput(opts) {
+			c, err := r.RenderPageCanvas(ctx, page, renderOpts)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: Could not render page %d: %v\n", pageIndex+1, err)
+				stats.failed++
+				continue
+			}
+			err = saveCanvasWithCompression(c, outputPath, opts.format, opts.pngCompression)
+			releaseCanvasIfSupported(c)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: Could not save page %d: %v\n", pageIndex+1, err)
+				stats.failed++
+				continue
+			}
+		} else {
+			img, err := r.RenderPage(ctx, page, renderOpts)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: Could not render page %d: %v\n", pageIndex+1, err)
+				stats.failed++
+				continue
+			}
+			if err := saveImageWithCompression(img, outputPath, opts.format, opts.pngCompression); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: Could not save page %d: %v\n", pageIndex+1, err)
+				stats.failed++
+				continue
+			}
 		}
 
 		stats.rendered++
@@ -364,7 +412,22 @@ func processPDF(filePath string, pages []int, opts options) error {
 		return fmt.Errorf("%d page(s) failed to render", stats.failed)
 	}
 
+	if opts.printMemStats {
+		trimRendererMemoryPools()
+		runtime.GC()
+		var memStats runtime.MemStats
+		runtime.ReadMemStats(&memStats)
+		fmt.Printf("MemTotalAlloc: %d\n", memStats.TotalAlloc)
+		fmt.Printf("MemAlloc: %d\n", memStats.Alloc)
+	}
+
 	return nil
+}
+
+func canUseDirectCanvasOutput(opts options) bool {
+	return opts.backend == canvas.BackendSplash &&
+		!opts.enableCache &&
+		strings.EqualFold(opts.format, pngFormat)
 }
 
 func resolvePagesToRender(pages []int, pageCount int) ([]int, error) {
@@ -401,6 +464,19 @@ func normalizeImageFormat(format string) (string, error) {
 		return pngFormat, nil
 	default:
 		return "", fmt.Errorf("unsupported format %q (only %s is supported)", format, pngFormat)
+	}
+}
+
+func normalizePNGCompression(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", pngCompressionBest:
+		return pngCompressionBest, nil
+	case pngCompressionFast:
+		return pngCompressionFast, nil
+	case pngCompressionNone:
+		return pngCompressionNone, nil
+	default:
+		return "", fmt.Errorf("unsupported PNG compression %q", value)
 	}
 }
 
@@ -606,6 +682,10 @@ func resolveCacheTTLSeconds(cacheTTLSec int) time.Duration {
 
 // saveImage saves an image to a file.
 func saveImage(img image.Image, path string, format string) (retErr error) {
+	return saveImageWithCompression(img, path, format, pngCompressionBest)
+}
+
+func saveCanvasWithCompression(c interface{ Image() image.Image }, path string, format string, pngCompression string) (retErr error) {
 	file, err := os.Create(path)
 	if err != nil {
 		return err
@@ -618,12 +698,51 @@ func saveImage(img image.Image, path string, format string) (retErr error) {
 
 	switch strings.ToLower(strings.TrimSpace(format)) {
 	case pngFormat:
-		// pdftoppm/libpng emits IHDR + pHYs + IDAT(BestCompression, 78 DA) + IEND.
-		// Match that layout so the splash backend's parity gate
-		// (test/integration/splash) can compare SHA256 byte-for-byte. Pixel
-		// equality alone is not enough — the test compares raw PNG bytes after
-		// stripping the tIME chunk.
-		retErr = encodePNGCanonical(file, img)
+		level := zlib.BestCompression
+		switch pngCompression {
+		case pngCompressionFast:
+			level = zlib.BestSpeed
+		case pngCompressionNone:
+			level = zlib.NoCompression
+		}
+		if src, ok := c.(rgb8ScanlineSource); ok {
+			return encodePNGCanonicalRGB8WithCompression(file, src, level)
+		}
+		retErr = encodePNGCanonicalWithCompression(file, c.Image(), level)
+	default:
+		retErr = fmt.Errorf("unsupported image format: %s", format)
+	}
+
+	return retErr
+}
+
+func releaseCanvasIfSupported(c any) {
+	if releaser, ok := c.(interface{ Release() }); ok {
+		releaser.Release()
+	}
+}
+
+func saveImageWithCompression(img image.Image, path string, format string, pngCompression string) (retErr error) {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil && retErr == nil {
+			retErr = closeErr
+		}
+	}()
+
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case pngFormat:
+		level := zlib.BestCompression
+		switch pngCompression {
+		case pngCompressionFast:
+			level = zlib.BestSpeed
+		case pngCompressionNone:
+			level = zlib.NoCompression
+		}
+		retErr = encodePNGCanonicalWithCompression(file, img, level)
 	default:
 		retErr = fmt.Errorf("unsupported image format: %s", format)
 	}
@@ -687,4 +806,43 @@ func parsePageSpec(spec string) ([]int, error) {
 	}
 
 	return pages, nil
+}
+
+func startProfiling(opts options) (func(), func(), error) {
+	stopCPUProfile := func() {}
+	writeMemProfile := func() {}
+
+	if opts.cpuProfile != "" {
+		cpuFile, err := os.Create(opts.cpuProfile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("create cpu profile: %w", err)
+		}
+		if err := pprof.StartCPUProfile(cpuFile); err != nil {
+			_ = cpuFile.Close()
+			return nil, nil, fmt.Errorf("start cpu profile: %w", err)
+		}
+		stopCPUProfile = func() {
+			pprof.StopCPUProfile()
+			_ = cpuFile.Close()
+		}
+	}
+
+	if opts.memProfile != "" {
+		memFile, err := os.Create(opts.memProfile)
+		if err != nil {
+			return stopCPUProfile, nil, fmt.Errorf("create memory profile: %w", err)
+		}
+		writeMemProfile = func() {
+			trimRendererMemoryPools()
+			runtime.GC()
+			_ = pprof.WriteHeapProfile(memFile)
+			_ = memFile.Close()
+		}
+	}
+
+	return stopCPUProfile, writeMemProfile, nil
+}
+
+func trimRendererMemoryPools() {
+	splash.TrimMemoryPools()
 }

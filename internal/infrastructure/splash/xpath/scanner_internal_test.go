@@ -21,7 +21,7 @@ func windingCount(s *Scanner, y int) int {
 	}
 	c := 0
 	for _, e := range s.allIntersections[y-s.yMin] {
-		c += e.Count
+		c += int(e.Count)
 	}
 	return c
 }

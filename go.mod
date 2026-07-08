@@ -6,7 +6,7 @@ require (
 	github.com/ajroetker/go-jpeg2000 v0.0.1
 	github.com/andybalholm/brotli v1.2.1
 	github.com/dh-kam/djpeg-go v0.0.0-20260602185927-4cb3753736a3
-	github.com/dh-kam/freetype-go v0.1.1
+	github.com/dh-kam/freetype-go v0.1.2
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
@@ -31,3 +31,5 @@ require (
 	golang.org/x/text v0.36.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/dh-kam/djpeg-go => ../djpeg-go

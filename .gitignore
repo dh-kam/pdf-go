@@ -12,6 +12,30 @@
 # Local/generated working data
 /tmp/
 
+# External test/2nd corpus — list of absolute PDF paths (local-only, points at
+# PDFs outside the repo) and its rendered comparison output. Never committed.
+/test/2nd_pdfs.list
+/test/testdata/2nd/
+
+# Local progress notes referencing external-corpus document names. Never committed.
+/TODO.md
+
+# Generated comparison outputs (rendered PNGs, poppler references, reports)
+/test/testdata/compare/gopdf_png/
+/test/testdata/compare/diff_png/
+/test/testdata/compare/poppler_png/
+/test/testdata/compare/report.csv
+/test/testdata/compare/report/
+/test/testdata/output/
+
+# Local debug artifacts
+/doc_027_rendered/
+/p72_chk/
+/mem.out
+/pdfrender
+/test_render_*.log
+/test_run.log
+
 # Python helper cache
 __pycache__/
 *.pyc

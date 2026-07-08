@@ -296,7 +296,7 @@ func resolveExperimentalIndexedCMYKConversionMode(mode string, candidate string)
 	case "candidate_indexed_cmyk_upscale":
 		switch normalizeImageSamplingMode(mode) {
 		case ImageSamplingModeLegacy:
-			return domainimage.CMYKConversionModeStdlib
+			return domainimage.CMYKConversionModeDefault
 		case ImageSamplingModeExperimentalRGBTransparentEdgeUpscaleV1:
 			return domainimage.CMYKConversionModeStdlib
 		case ImageSamplingModeExperimentalDCTGrayIgnoreICCV1:
@@ -330,6 +330,39 @@ func resolveSelectiveIndexedGrayOriginDownscaleSampler(
 		return sampler, reason
 	}
 	return "experimental_indexed_origin_downscale_bilinear", "legacy_selective_indexed_origin_downscale_phase"
+}
+
+func resolveSelectiveRGBEdgeScaleThenFlipSampler(
+	mode string,
+	candidate string,
+	filter domainimage.ImageFilter,
+	colorSpace string,
+	srcWidth int,
+	srcHeight int,
+	dstWidth float64,
+	dstHeight float64,
+	sampler string,
+	reason string,
+) (string, string) {
+	if normalizeImageSamplingMode(mode) != ImageSamplingModeLegacy {
+		return sampler, reason
+	}
+	if sampler != "explicit_nearest" || reason != "explicit_interpolate=false" {
+		return sampler, reason
+	}
+	if filter != domainimage.FilterFlate || !strings.EqualFold(colorSpace, "DeviceRGB") {
+		return sampler, reason
+	}
+	if candidate != "rejected_non_upscale" {
+		return sampler, reason
+	}
+	if srcWidth <= 0 || srcHeight <= 0 || srcWidth > 32 || srcHeight > 32 {
+		return sampler, reason
+	}
+	if dstWidth >= float64(srcWidth) || dstHeight >= float64(srcHeight) {
+		return sampler, reason
+	}
+	return "explicit_nearest_rgb_small_downscale_scale_then_flip", "legacy_selective_rgb_small_downscale_scale_then_flip"
 }
 
 func resolveExperimentalImageEdgeMode(
@@ -424,20 +457,28 @@ func chooseImageSamplingPolicy(
 		dstHeight,
 	)
 
-	if interpolateExplicit {
-		if interpolate {
-			return imageSamplingDecision{
-				Interpolate:           true,
-				Sampler:               "explicit_approx_bilinear",
-				Reason:                "explicit_interpolate=true",
-				ExperimentalCandidate: experimentalCandidate,
+		if interpolateExplicit {
+			if interpolate {
+				return imageSamplingDecision{
+					Interpolate:           true,
+					Sampler:               "explicit_approx_bilinear",
+					Reason:                "explicit_interpolate=true",
+					ExperimentalCandidate: experimentalCandidate,
+				}
 			}
-		}
-		return imageSamplingDecision{
-			Interpolate:           false,
-			Sampler:               "explicit_nearest",
-			Reason:                "explicit_interpolate=false",
-			ExperimentalCandidate: experimentalCandidate,
+			if filter == domainimage.FilterDCT && isImageDownscale(srcWidth, srcHeight, dstWidth, dstHeight) {
+				return imageSamplingDecision{
+					Interpolate:           false,
+					Sampler:               "explicit_dct_downscale_scale_then_flip",
+					Reason:                "explicit_interpolate=false_dct_downscale",
+					ExperimentalCandidate: experimentalCandidate,
+				}
+			}
+			return imageSamplingDecision{
+				Interpolate:           false,
+				Sampler:               "explicit_nearest",
+				Reason:                "explicit_interpolate=false",
+				ExperimentalCandidate: experimentalCandidate,
 		}
 	}
 
@@ -571,11 +612,29 @@ func chooseImageSamplingPolicy(
 	if !interpolate &&
 		!interpolateExplicit &&
 		isImageDownscale(srcWidth, srcHeight, dstWidth, dstHeight) {
+		if strings.EqualFold(colorSpace, "CalRGB") &&
+			filter == domainimage.FilterFlate {
+			return imageSamplingDecision{
+				Interpolate:           false,
+				Sampler:               "auto_nearest_calrgb_flate_downscale",
+				Reason:                "auto_interpolate=false_calrgb_flate_downscale",
+				ExperimentalCandidate: experimentalCandidate,
+			}
+		}
+
 		if strings.EqualFold(colorSpace, "DeviceGray") &&
 			srcWidth <= 16 &&
 			srcHeight <= 16 &&
 			isStrongImageDownscale(srcWidth, srcHeight, dstWidth, dstHeight) &&
 			sourceICCBased {
+			if !isEncodedImageFilter(filter) {
+				return imageSamplingDecision{
+					Interpolate:           false,
+					Sampler:               "auto_nearest_tiny_iccbased_gray_downscale",
+					Reason:                "auto_interpolate=false_downscale_tiny_iccbased_gray",
+					ExperimentalCandidate: experimentalCandidate,
+				}
+			}
 			return imageSamplingDecision{
 				Interpolate:           true,
 				Sampler:               "auto_box_tiny_iccbased_gray_downscale",
@@ -587,14 +646,14 @@ func chooseImageSamplingPolicy(
 		if (strings.EqualFold(colorSpace, "DeviceGray") || strings.EqualFold(colorSpace, "Indexed")) &&
 			srcWidth <= 32 &&
 			srcHeight <= 32 {
-			if filter == domainimage.FilterCCITTFax &&
-				strings.EqualFold(colorSpace, "DeviceGray") {
-				return imageSamplingDecision{
-					Interpolate:           true,
-					Sampler:               "auto_approx_bilinear_tiny_gray_ccittfax_downscale",
-					Reason:                "auto_interpolate=false_downscale_tiny_gray_ccittfax",
-					ExperimentalCandidate: experimentalCandidate,
-				}
+						if filter == domainimage.FilterCCITTFax &&
+							strings.EqualFold(colorSpace, "DeviceGray") {
+							return imageSamplingDecision{
+								Interpolate:           true,
+								Sampler:               "auto_downscale_bilinear",
+								Reason:                "auto_interpolate=false_downscale_tiny_gray_ccittfax",
+								ExperimentalCandidate: experimentalCandidate,
+							}
 			}
 			return imageSamplingDecision{
 				Interpolate:           true,
@@ -605,11 +664,41 @@ func chooseImageSamplingPolicy(
 		}
 
 		if isStrongImageDownscale(srcWidth, srcHeight, dstWidth, dstHeight) {
+			if filter == domainimage.FilterDCT && strings.EqualFold(colorSpace, "DeviceRGB") {
+				return imageSamplingDecision{
+					Interpolate:           false,
+					Sampler:               "auto_dct_rgb_splash_scale_downscale",
+					Reason:                "auto_interpolate=false_dct_rgb_downscale",
+					ExperimentalCandidate: experimentalCandidate,
+				}
+			}
+			if filter == domainimage.FilterFlate &&
+				strings.EqualFold(colorSpace, "Indexed") &&
+				srcWidth >= 512 &&
+				srcHeight >= 256 {
+				return imageSamplingDecision{
+					Interpolate:           false,
+					Sampler:               "auto_indexed_flate_splash_scale_downscale",
+					Reason:                "auto_interpolate=false_indexed_flate_downscale",
+					ExperimentalCandidate: experimentalCandidate,
+				}
+			}
 			if srcWidth <= 16 && srcHeight <= 16 {
 				return imageSamplingDecision{
 					Interpolate:           true,
 					Sampler:               "auto_downscale_bilinear",
 					Reason:                "auto_interpolate=false_downscale_small_source",
+					ExperimentalCandidate: experimentalCandidate,
+				}
+			}
+			if filter == domainimage.FilterFlate &&
+				strings.EqualFold(colorSpace, "DeviceRGB") &&
+				dstWidth >= 300 &&
+				dstHeight >= 100 {
+				return imageSamplingDecision{
+					Interpolate:           true,
+					Sampler:               "auto_downscale_bilinear_fixed_avg",
+					Reason:                "auto_interpolate=false_downscale_large_flate_rgb",
 					ExperimentalCandidate: experimentalCandidate,
 				}
 			}
@@ -628,6 +717,22 @@ func chooseImageSamplingPolicy(
 				Interpolate:           false,
 				Sampler:               "auto_nearest",
 				Reason:                "auto_interpolate=false_upscale_400pct_poppler",
+				ExperimentalCandidate: experimentalCandidate,
+			}
+		}
+		if filter == domainimage.FilterDCT && strings.EqualFold(colorSpace, "DeviceRGB") {
+			return imageSamplingDecision{
+				Interpolate:           false,
+				Sampler:               "auto_dct_rgb_splash_scale_upscale",
+				Reason:                "auto_interpolate=false_dct_rgb_upscale",
+				ExperimentalCandidate: experimentalCandidate,
+			}
+		}
+		if filter == domainimage.FilterFlate && strings.EqualFold(colorSpace, "Indexed") {
+			return imageSamplingDecision{
+				Interpolate:           false,
+				Sampler:               "auto_indexed_flate_splash_scale_upscale",
+				Reason:                "auto_interpolate=false_indexed_flate_upscale",
 				ExperimentalCandidate: experimentalCandidate,
 			}
 		}
@@ -785,7 +890,8 @@ func isStrongImageDownscale(srcWidth, srcHeight int, dstWidth, dstHeight float64
 }
 
 func normalizeImageSamplingMode(mode string) string {
-	switch strings.TrimSpace(strings.ToLower(mode)) {
+	normalized := strings.TrimSpace(mode)
+	switch normalized {
 	case "", "default", ImageSamplingModeLegacy:
 		return ImageSamplingModeLegacy
 	case ImageSamplingModeAdaptiveDCTICCBasedV1:
@@ -805,6 +911,29 @@ func normalizeImageSamplingMode(mode string) string {
 	case ImageSamplingModeExperimentalDCTGrayIgnoreICCV1:
 		return ImageSamplingModeExperimentalDCTGrayIgnoreICCV1
 	case ImageSamplingModeExperimentalIndexedCMYKLUTV1:
+		return ImageSamplingModeExperimentalIndexedCMYKLUTV1
+	}
+
+	switch {
+	case strings.EqualFold(normalized, "default"), strings.EqualFold(normalized, ImageSamplingModeLegacy):
+		return ImageSamplingModeLegacy
+	case strings.EqualFold(normalized, ImageSamplingModeAdaptiveDCTICCBasedV1):
+		return ImageSamplingModeAdaptiveDCTICCBasedV1
+	case strings.EqualFold(normalized, ImageSamplingModeExperimentalSplashScaleOnlyV1):
+		return ImageSamplingModeExperimentalSplashScaleOnlyV1
+	case strings.EqualFold(normalized, ImageSamplingModeExperimentalIndexedOriginDownscalePhaseV1):
+		return ImageSamplingModeExperimentalIndexedOriginDownscalePhaseV1
+	case strings.EqualFold(normalized, ImageSamplingModeExperimentalIndexedCMYKSimpleV1):
+		return ImageSamplingModeExperimentalIndexedCMYKSimpleV1
+	case strings.EqualFold(normalized, ImageSamplingModeExperimentalIndexedCMYKHybrid75V1):
+		return ImageSamplingModeExperimentalIndexedCMYKHybrid75V1
+	case strings.EqualFold(normalized, ImageSamplingModeExperimentalIndexedCMYKStdlibV1):
+		return ImageSamplingModeExperimentalIndexedCMYKStdlibV1
+	case strings.EqualFold(normalized, ImageSamplingModeExperimentalRGBTransparentEdgeUpscaleV1):
+		return ImageSamplingModeExperimentalRGBTransparentEdgeUpscaleV1
+	case strings.EqualFold(normalized, ImageSamplingModeExperimentalDCTGrayIgnoreICCV1):
+		return ImageSamplingModeExperimentalDCTGrayIgnoreICCV1
+	case strings.EqualFold(normalized, ImageSamplingModeExperimentalIndexedCMYKLUTV1):
 		return ImageSamplingModeExperimentalIndexedCMYKLUTV1
 	default:
 		return ImageSamplingModeLegacy

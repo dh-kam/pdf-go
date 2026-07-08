@@ -1,8 +1,6 @@
 package splash
 
 import (
-	"math"
-
 	"github.com/dh-kam/pdf-go/internal/infrastructure/splash/xpath"
 )
 
@@ -72,7 +70,7 @@ func (s *Splash) makeDashedPath(p *xpath.Path) (*xpath.Path, error) {
 			pb, _ := p.Point(k + 1)
 			x0, y0 := pa.X, pa.Y
 			x1, y1 := pb.X, pb.Y
-			segLen := math.Hypot(x1-x0, y1-y0)
+			segLen := splashDistLocal(x0, y0, x1, y1)
 
 			for segLen > 0 {
 				if lineDashDist >= segLen {

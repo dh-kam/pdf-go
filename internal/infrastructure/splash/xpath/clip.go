@@ -71,8 +71,9 @@ type Clip struct {
 	// Per ownership rules in 02_api_design.md §6, scanners are shared (not
 	// deep-copied) on Clone; the slice header IS deep-copied so independent
 	// clips can grow independently.
-	scanners []*Scanner
-	eo       []bool
+	scanners           []*Scanner
+	sharedScannerCount int
+	eo                 []bool
 
 	// flags mirrors SplashClip's per-path flag byte (SplashClip.h:126). Allocated
 	// lazily — nil until first ClipToPath records a path-clip.
@@ -92,7 +93,13 @@ type Clip struct {
 // with `width-0.001` so the integer xMaxI lands at width-1 (SplashState.cc:69);
 // our integer-bounds API folds that convention in.
 func NewClip(hardXMin, hardYMin, hardXMax, hardYMax int, antialias bool) *Clip {
-	c := &Clip{
+	c := acquireClip()
+	c.resetToHardRect(hardXMin, hardYMin, hardXMax, hardYMax, antialias)
+	return c
+}
+
+func (c *Clip) resetToHardRect(hardXMin, hardYMin, hardXMax, hardYMax int, antialias bool) {
+	*c = Clip{
 		hardXMin:  hardXMin,
 		hardYMin:  hardYMin,
 		hardXMax:  hardXMax,
@@ -107,17 +114,18 @@ func NewClip(hardXMin, hardYMin, hardXMax, hardYMax int, antialias bool) *Clip {
 	c.yMin = splashFloor(c.yMinFP)
 	c.xMax = splashCeilLocal(c.xMaxFP) - 1
 	c.yMax = splashCeilLocal(c.yMaxFP) - 1
-	return c
 }
 
 // Clone returns a copy of c with shared-scanner semantics
 // (SplashClip::SplashClip(const SplashClip*), SplashClip.cc:71-91).
 //
-// scanners are shared (immutable post-construction — see 02_api_design.md §6),
-// so the slice's underlying *Scanner pointers are reused. eo and flags are
-// deep-copied so the two clips can diverge under further ClipToPath calls.
+// scanners are shared (immutable post-construction — see 02_api_design.md §6).
+// The scanner slice uses cap=len so a later ClipToPath append cannot mutate the
+// original slice. eo and flags are deep-copied so the two clips can diverge
+// under further ClipToPath calls.
 func (c *Clip) Clone() *Clip {
-	cp := &Clip{
+	cp := acquireClip()
+	*cp = Clip{
 		hardXMin:      c.hardXMin,
 		hardYMin:      c.hardYMin,
 		hardXMax:      c.hardXMax,
@@ -138,9 +146,10 @@ func (c *Clip) Clone() *Clip {
 		antialias:     c.antialias,
 	}
 	if len(c.scanners) > 0 {
-		// Slice is copied (own header) but elements are shared *Scanner pointers.
-		cp.scanners = make([]*Scanner, len(c.scanners))
-		copy(cp.scanners, c.scanners)
+		c.sharedScannerCount = max(c.sharedScannerCount, len(c.scanners))
+		// Share immutable scanner pointers without sharing append capacity.
+		cp.scanners = c.scanners[:len(c.scanners):len(c.scanners)]
+		cp.sharedScannerCount = len(cp.scanners)
 	}
 	if len(c.eo) > 0 {
 		cp.eo = make([]bool, len(c.eo))
@@ -160,7 +169,7 @@ func (c *Clip) Clone() *Clip {
 // argument-order normalisation, which we replicate).
 func (c *Clip) ResetToRect(x0, y0, x1, y1 float64) {
 	// Drop any existing path-clip state.
-	c.scanners = nil
+	c.releaseOwnedScanners()
 	c.eo = nil
 	c.flags = nil
 	c.hasPathBounds = false
@@ -193,6 +202,10 @@ func (c *Clip) ResetToRect(x0, y0, x1, y1 float64) {
 // downstream callers can short-circuit. The sentinel is NOT propagated up the
 // stack — TestRect/TestSpan must still work correctly on an empty clip.
 func (c *Clip) ClipToRect(x0, y0, x1, y1 float64) error {
+	if os.Getenv("PDF_DEBUG_SPLASH_CLIPRECT_TRACE") != "" {
+		fmt.Fprintf(os.Stderr, "SPLASH_CLIPRECT (%.17g,%.17g)-(%.17g,%.17g) prev=(%.17g,%.17g)-(%.17g,%.17g)\n",
+			x0, y0, x1, y1, c.xMinFP, c.yMinFP, c.xMaxFP, c.yMaxFP)
+	}
 	if x0 < x1 {
 		if x0 > c.xMinFP {
 			c.xMinFP = x0
@@ -241,7 +254,9 @@ func (c *Clip) ClipToRect(x0, y0, x1, y1 float64) error {
 // rectangle fast path. It returns false for general paths so callers can defer
 // path-scanner clipping until their coordinate convention is known to match.
 func (c *Clip) ClipToPathRectOnly(path *Path, matrix [6]float64, flatness float64) (bool, error) {
-	xPath := NewXPath(path, matrix, flatness, true)
+	xPath := acquireXPath()
+	defer releaseXPath(xPath)
+	xPath.Reset(path, matrix, flatness, true)
 	if xPath.Length() == 4 && isAxisAlignedRect(xPath) {
 		return true, c.ClipToRect(xPath.Segs[0].X0, xPath.Segs[0].Y0, xPath.Segs[2].X0, xPath.Segs[2].Y0)
 	}
@@ -355,7 +370,9 @@ func (c *Clip) ClipToPath(path *Path, matrix [6]float64, flatness float64, eo bo
 // clip-scanner y-boundary snap epsilon. Passing 0 mirrors Poppler's raw floor()
 // path for fill/clip AA consistency when the same geometry was already painted.
 func (c *Clip) ClipToPathWithYFloorSnapEps(path *Path, matrix [6]float64, flatness float64, eo bool, yFloorSnapEps float64) error {
-	xPath := NewXPath(path, matrix, flatness, true)
+	xPath := acquireXPath()
+	defer releaseXPath(xPath)
+	xPath.Reset(path, matrix, flatness, true)
 
 	// Empty path collapses the clip (SplashClip.cc:188-192).
 	if xPath.Length() == 0 {
@@ -389,7 +406,7 @@ func (c *Clip) ClipToPathWithYFloorSnapEps(path *Path, matrix [6]float64, flatne
 
 	// Clip scanners receive a tiny y-floor snap so matrix roundoff at exact
 	// horizontal clip boundaries does not leak a subpixel row outside the path.
-	scanner := newScanner(xPath, eo, c.xMin, yMinAA, c.xMax, yMaxAA, yFloorSnapEps)
+	scanner := acquireScanner(xPath, eo, c.xMin, yMinAA, c.xMax, yMaxAA, yFloorSnapEps)
 
 	// Append parallel entries; flags grows in lockstep per SplashClip.cc:210.
 	c.scanners = append(c.scanners, scanner)

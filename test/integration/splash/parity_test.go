@@ -90,6 +90,14 @@ var phase2RequiredTargets = map[string]bool{
 	"13_radial_grad":     true, // radial shading     — Q1-TODO PDF
 	"14_tiling_pattern":  true, // tiling fanout      — Q1-TODO PDF
 
+	// Image promotions (P4-QA1/Dev4 2026-06-11): scaling kernel and colorspace
+	// fixes (exact integer division, 0.5 offset bilinear phase, CMYK LUT)
+	// brought these to 100% exact parity.
+	"20_image_bilinear_up":   true,
+	"21_image_bilinear_down": true,
+	"22_image_indexed":       true,
+	"23_image_cmyk":          true,
+
 	// Phase 4 promotion (P4-QA1 2026-04-27): under Phase 4 wiring this
 	// fixture renders pixel-equal to pdftoppm — the prior "ACCIDENTALLY
 	// pixel-equal" XFAIL log line in p3 confirmed the parity. Promoting so
@@ -116,10 +124,6 @@ var phase3IntegrationGap = map[string]bool{
 	"15_glyph_mono":          true, // glyph blit through canvas DrawText path lossy at sub-px
 	"16_glyph_aa_subpx":      true, // glyph blit through canvas DrawText path lossy at sub-px
 	"17_glyph_blend_lsb":     true, // glyph blit through canvas DrawText path lossy at sub-px
-	"20_image_bilinear_up":   true, // canvas.DrawImage path doesn't route through Splash.DrawImage
-	"21_image_bilinear_down": true, // canvas.DrawImage path doesn't route through Splash.DrawImage
-	"22_image_indexed":       true, // canvas.DrawImage path doesn't route through Splash.DrawImage
-	"23_image_cmyk":          true, // canvas.DrawImage path doesn't route through Splash.DrawImage
 	"24_clip_intersect":      true, // splashCanvas.Clip stub returns errNotImplemented
 	"25_link_border":         true, // annotation border not threaded into splashCanvas
 }

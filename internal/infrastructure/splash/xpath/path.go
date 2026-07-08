@@ -50,6 +50,14 @@ func NewPath() *Path {
 	return &Path{}
 }
 
+// Reset clears the path for reuse.
+func (p *Path) Reset() {
+	p.pts = p.pts[:0]
+	p.flags = p.flags[:0]
+	p.hints = p.hints[:0]
+	p.curSubpath = 0
+}
+
 // Clone returns a deep copy of p (SplashPath move-ctor analogue, SplashPath.cc:56-72).
 func (p *Path) Clone() *Path {
 	c := &Path{curSubpath: p.curSubpath}

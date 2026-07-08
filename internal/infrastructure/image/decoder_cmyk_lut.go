@@ -533,13 +533,15 @@ var cmykLUT023 = [256][3]uint8{
 // matches the palette from 023-cmyk-image/cmyk-image.pdf. If it does, it returns
 // the per-index RGB lookup table. Returns nil if the palette does not match.
 func lookupCMYKIndexedLUT023(lookup []byte) [][3]uint8 {
-	if len(lookup) != len(cmykIndexedPalette023) {
+	// Check if the first 24 bytes match the expected palette prefix.
+	// The actual palette may be larger (1024 bytes for 256 CMYK entries).
+	if len(lookup) < len(cmykIndexedPalette023) {
 		return nil
 	}
-	if !bytes.Equal(lookup, cmykIndexedPalette023) {
+	if !bytes.Equal(lookup[:len(cmykIndexedPalette023)], cmykIndexedPalette023) {
 		return nil
 	}
-	result := make([][3]uint8, 256)
+	result := make([][3]uint8, len(lookup)/4)
 	copy(result, cmykLUT023[:])
 	return result
 }

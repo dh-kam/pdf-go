@@ -360,7 +360,9 @@ func popplerSFNTBitmapMatrix(sizePt float64, matrix [4]float64, dpi int) (fixed.
 		sizePt * dpiScale * matrix[2],
 		sizePt * dpiScale * matrix[3],
 	}
-	ppemSize := int(math.Floor(math.Hypot(scaled[2], scaled[3]) + 0.5))
+	// SplashFTFont uses splashRound(splashDist(...)) = floor(sqrt(a²+b²)+0.5);
+	// math.Hypot is not bit-compatible with sqrt at .5 boundaries.
+	ppemSize := int(math.Floor(math.Sqrt(scaled[2]*scaled[2]+scaled[3]*scaled[3]) + 0.5))
 	if ppemSize < 1 {
 		ppemSize = 1
 	}

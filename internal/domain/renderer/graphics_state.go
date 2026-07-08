@@ -79,6 +79,9 @@ type GraphicsState struct {
 	clipMode             ClipMode
 	pendingClip          bool
 	pendingClipMode      ClipMode
+	strokeAdjust         bool
+	pathClipBounds       [4]float64
+	pathClipBoundsValid  bool
 }
 
 // ClipMode represents the clipping rule.
@@ -88,3 +91,10 @@ const (
 	ClipNonZeroWinding ClipMode = iota
 	ClipEvenOdd
 )
+
+// ResetForReuse resets the graphics state for reuse in a pool.
+func (gs *GraphicsState) ResetForReuse() {
+	gs.pathClipBoundsValid = false
+}
+
+var defaultBlackColorSpace = &ColorSpace{Color: &Color{Hex: "000000"}}

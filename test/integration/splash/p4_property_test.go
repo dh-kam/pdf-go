@@ -448,18 +448,25 @@ func TestSoftMaskAttenuates(t *testing.T) {
 		mask.Data()[i] = 0x80
 	}
 
+	// Install the soft mask BEFORE the group begins: the composite uses the
+	// Do-time parent state (alpha/blend/softmask capture-order trilogy —
+	// Poppler paints after restoreState, so the parent's mask is what
+	// applies). Begin captures it into the saved group state.
+	s.SetSoftMask(mask)
 	// Render through a transparency group so the soft mask is consulted at
 	// composite time (the per-pixel softmask read lives in compositeGroup,
 	// not in the AA pipe — see splash_group.go:126-128).
 	if err := s.BeginTransparencyGroup([4]float64{0, 0, W, H}, true, false, nil); err != nil {
 		t.Skipf("BeginTransparencyGroup returned %v — Phase 4 group deferred", err)
 	}
+	// The evaluator clears the state mask for the group's inner content
+	// (otherwise it would be applied twice: once by the fill pipe and once
+	// by the composite). Mirror that contract here.
+	s.SetSoftMask(nil)
 	s.SetFillPattern(splash.NewSolidColor(splash.Color{0, 0, 0}))
 	if err := s.Fill(p4FillRectPath(t, 5, 5, 25, 15), false); err != nil {
 		t.Skipf("Fill returned %v — Phase 4 deferred", err)
 	}
-	// Install soft mask BEFORE Paint — Paint reads s.state.softMask.
-	s.SetSoftMask(mask)
 	if err := s.PaintTransparencyGroup(); err != nil {
 		t.Fatalf("PaintTransparencyGroup: %v", err)
 	}

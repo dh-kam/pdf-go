@@ -119,7 +119,7 @@ func (s *AxialShader) GetColor(x, y int, c *Color) bool {
 	funcT := s.T0 + t*(s.T1-s.T0)
 	*c = s.Func(funcT)
 	if shouldTraceAxialPixel(x, y) {
-		fmt.Fprintf(os.Stderr, "SPLASH_AXIAL_PIXEL_TRACE name=%s x=%d y=%d fx=%.12f fy=%.12f s=%.12f t=%.12f color=(%d,%d,%d)\n",
+		fmt.Fprintf(os.Stderr, "SPLASH_AXIAL_PIXEL_TRACE name=%s x=%d y=%d fx=%.17g fy=%.17g s=%.17g t=%.17g color=(%d,%d,%d)\n",
 			s.DebugName, x, y, fx, fy, t, funcT, c[0], c[1], c[2])
 	}
 	return true

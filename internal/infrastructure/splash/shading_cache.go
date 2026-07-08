@@ -62,9 +62,20 @@ func newSplashUnivariateShadingColorCache(shading *entity.Shading, ctm [6]float6
 		maxSize = 2
 	}
 	if float64(maxSize) > area {
+		if os.Getenv("PDF_DEBUG_SPLASH_SHADING_CACHE_TRACE") != "" {
+			fmt.Fprintf(os.Stderr, "SPLASH_SHADING_CACHE BAIL maxSize=%d area=%.6g\n", maxSize, area)
+		}
 		return nil
 	}
 
+	if os.Getenv("PDF_DEBUG_SPLASH_SHADING_CACHE_TRACE") != "" {
+		fmt.Fprintf(os.Stderr, "SPLASH_SHADING_CACHE maxSize=%d tMin=%.17g tMax=%.17g sMin=%.17g sMax=%.17g dist=%.17g area=%.17g\n",
+			maxSize, tMin, tMax, sMin, sMax, distance, area)
+	}
+	if os.Getenv("PDF_DEBUG_SPLASH_SHADING_CACHE_TRACE") != "" {
+		fmt.Fprintf(os.Stderr, "SPLASH_SHADING_CACHE maxSize=%d tMin=%.17g tMax=%.17g sMin=%.17g sMax=%.17g dist=%.17g area=%.17g\n",
+			maxSize, tMin, tMax, sMin, sMax, distance, area)
+	}
 	cache := &splashUnivariateShadingColorCache{
 		bounds: make([]float64, maxSize),
 		coeff:  float64(maxSize-1) / (tMax - tMin),

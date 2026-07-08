@@ -45,7 +45,9 @@ func (s *Splash) fillWithPattern(p *xpath.Path, eo bool, pat Pattern, alpha floa
 	s.maybeInjectFillRectHints(p)
 
 	// 2. Build XPath. closeSubpaths=true matches Splash.cc:2372.
-	xPath := xpath.NewXPath(p, s.state.matrix, s.state.flatness, true)
+	xPath := xpath.AcquireXPath()
+	defer xpath.ReleaseXPath(xPath)
+	xPath.Reset(p, s.state.matrix, s.state.flatness, true)
 	if s.vectorAA {
 		xPath.AAScale() // Splash.cc:2374
 	}
@@ -74,7 +76,8 @@ func (s *Splash) fillWithPattern(p *xpath.Path, eo bool, pat Pattern, alpha floa
 	}
 
 	// 4. Build Scanner (Splash.cc:2383).
-	scanner := xpath.NewScanner(xPath, eo, clipXMinI, yMinScan, clipXMaxI, yMaxScan)
+	scanner := xpath.AcquireScanner(xPath, eo, clipXMinI, yMinScan, clipXMaxI, yMaxScan)
+	defer xpath.ReleaseScanner(scanner)
 
 	// 5. Pull device-pixel bbox of the path under the active scale (Splash.cc:2386-2390).
 	var xMinI, yMinI, xMaxI, yMaxI int
@@ -82,6 +85,14 @@ func (s *Splash) fillWithPattern(p *xpath.Path, eo bool, pat Pattern, alpha floa
 		xMinI, yMinI, xMaxI, yMaxI = scanner.BBoxAA()
 	} else {
 		xMinI, yMinI, xMaxI, yMaxI = scanner.BBox()
+	}
+	if os.Getenv("PDF_DEBUG_TYPE3_TEMPBITMAP_DUMP") != "" && s.bitmap != nil && s.bitmap.width < 64 {
+		nSeg := 0
+		if xPath != nil {
+			nSeg = len(xPath.Segs)
+		}
+		fmt.Fprintf(os.Stderr, "T3FILLIMPL bbox=(%d,%d,%d,%d) clip=(%d,%d,%d,%d) bitmap=%dx%d nSeg=%d aaBuf=%d\n",
+			xMinI, yMinI, xMaxI, yMaxI, clipXMinI, clipYMinI, clipXMaxI, clipYMaxI, s.bitmap.width, s.bitmap.height, nSeg, len(s.aaBuf))
 	}
 	// Empty bbox (scanner saw no segs) → nothing to paint, but C++ still returns Ok.
 	if yMinI > yMaxI || xMinI > xMaxI {
@@ -126,15 +137,19 @@ func (s *Splash) fillWithPattern(p *xpath.Path, eo bool, pat Pattern, alpha floa
 	}
 
 	// 8. Initialise the pipe (Splash.cc:2408).
-	var pipe pipe
 	aInput := byte(Round(alpha * 255))
-	s.pipeInit(&pipe, 0, yMinI, pat, nil, aInput, s.vectorAA, false)
+	pipeState := imagePipePool.Get().(*pipe)
+	s.pipeInit(pipeState, 0, yMinI, pat, nil, aInput, s.vectorAA, false)
+	defer func() {
+		*pipeState = pipe{}
+		imagePipePool.Put(pipeState)
+	}()
 
 	// 9. AA loop (Splash.cc:2411-2428) — render+clip+popcount+gamma+pipe per row.
 	if s.vectorAA {
-		s.fillAARows(&pipe, scanner, clip, xMinI, yMinI, xMaxI, yMaxI)
+		s.fillAARows(pipeState, scanner, clip, xMinI, yMinI, xMaxI, yMaxI)
 	} else {
-		s.fillNoAARows(&pipe, scanner, clip, xMinI, yMinI, xMaxI, yMaxI)
+		s.fillNoAARows(pipeState, scanner, clip, xMinI, yMinI, xMaxI, yMaxI)
 	}
 
 	return nil
@@ -146,7 +161,7 @@ func (s *Splash) applyTextGlyphPathIntegerSlopeBias(xPath *xpath.XPath) {
 	if s == nil || !s.textGlyphPathIntegerSlopeBias || xPath == nil {
 		return
 	}
-	if os.Getenv("PDF_DEBUG_SPLASH_DISABLE_TEXT_GLYPH_INTEGER_SLOPE_BIAS") == "1" {
+	if debugSplashDisableTextGlyphIntegerSlopeBias {
 		return
 	}
 	for i := range xPath.Segs {
@@ -168,16 +183,16 @@ func (s *Splash) applyTextGlyphPathIntegerSlopeBias(xPath *xpath.XPath) {
 }
 
 func (s *Splash) debugTraceSplashXPath(x *xpath.XPath) {
-	if os.Getenv("PDF_DEBUG_SPLASH_XPATH_TRACE") == "" || x == nil {
+	if debugSplashXpathTrace == "" || x == nil {
 		return
 	}
-	if raw := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_XPATH_TRACE_STROKE")); raw != "" {
+	if raw := strings.TrimSpace(debugSplashXpathTraceStroke); raw != "" {
 		want, err := strconv.Atoi(raw)
 		if err != nil || s == nil || s.debugStrokeIndex != want {
 			return
 		}
 	}
-	if raw := strings.TrimSpace(os.Getenv("PDF_DEBUG_SPLASH_XPATH_TRACE_FILL")); raw != "" {
+	if raw := strings.TrimSpace(debugSplashXpathTraceFill); raw != "" {
 		want, err := strconv.Atoi(raw)
 		if err != nil || s == nil || s.debugFillIndex != want {
 			return
@@ -196,7 +211,7 @@ func (s *Splash) debugTraceSplashXPath(x *xpath.XPath) {
 }
 
 func (s *Splash) applyTinyGroupedFillYMinBoundaryTie(xPath *xpath.XPath) {
-	if xPath == nil || os.Getenv("PDF_DEBUG_SPLASH_DISABLE_TINY_GROUP_YMIN_TIE") == "1" {
+	if xPath == nil || debugSplashDisableTinyGroupYMinTie {
 		return
 	}
 	if s == nil || len(s.groupStack) == 0 {
@@ -261,7 +276,7 @@ func (s *Splash) fillAARows(pipe *pipe, scanner *xpath.Scanner, clip *xpath.Clip
 	if s.aaBuf == nil {
 		return
 	}
-	if os.Getenv("PDF_DEBUG_SPLASH_DISABLE_FULL_WIDTH_AABUF") != "1" {
+	if !debugSplashDisableFullWidthAabuf {
 		s.fillAARowsFullWidth(pipe, scanner, clip, yMinI, yMaxI)
 		return
 	}
@@ -299,6 +314,13 @@ func (s *Splash) fillAARowsFullWidth(pipe *pipe, scanner *xpath.Scanner, clip *x
 	}
 	for y := yMinI; y <= yMaxI; y++ {
 		x0, x1 := scanner.RenderAALineFullWidth(y, s.aaBuf, s.bitmap.width)
+		if os.Getenv("PDF_DEBUG_TYPE3_TEMPBITMAP_DUMP") != "" && s.bitmap.width < 64 && y == yMinI {
+			asum := 0
+			for _, b := range s.aaBuf {
+				asum += int(b)
+			}
+			fmt.Fprintf(os.Stderr, "T3AA y=%d renderSpan=[%d,%d] aaBufSum=%d\n", y, x0, x1, asum)
+		}
 		if clip != nil {
 			x0, x1 = clip.ClipAALineFullWidth(y, s.aaBuf, x0, x1, s.bitmap.width)
 		}
@@ -358,9 +380,13 @@ func (s *Splash) runAALine(p *pipe, xMinI, xMaxI, y, rowSize int) {
 
 func (s *Splash) runAALineFullWidth(p *pipe, xMinI, xMaxI, y, rowSize int) {
 	s.pipeSetXY(p, xMinI, y)
+	dbg := os.Getenv("PDF_DEBUG_TYPE3_TEMPBITMAP_DUMP") != "" && s.bitmap != nil && s.bitmap.width < 64
 	for x := xMinI; x <= xMaxI; x++ {
 		p.sampleXOff = 0
 		t := s.aaLineCoverage(x, rowSize)
+		if dbg {
+			fmt.Fprintf(os.Stderr, "T3RUN x=%d t=%d pattern=%T shapeInit=%v\n", x, t, p.pattern, p.shape)
+		}
 		if t != 0 {
 			p.shape = s.aaGamma[t]
 			if debugSplashAxialRightEdgeSamplePrev() && isDebugAxialRightEdgeSamplePrevCoverage(t) && pipeCanUseAxialRightEdgeSamplePrev(p) {
@@ -386,19 +412,39 @@ func (s *Splash) aaLineCoverage(x, rowSize int) int {
 	if x < 0 || rowSize <= 0 {
 		return 0
 	}
+	return s.aaBufCoverageAt(x, rowSize)
+}
+
+func (s *Splash) aaBufCoverageAt(x, rowSize int) int {
 	cell := x * splashAASize
+	byteIdx := cell >> 3
+	lastIdx := byteIdx + (splashAASize-1)*rowSize
+	if lastIdx >= 0 && lastIdx < len(s.aaBuf) {
+		if cell&7 == 0 {
+			return bitCount4[(s.aaBuf[byteIdx]>>4)&0x0f] +
+				bitCount4[(s.aaBuf[byteIdx+rowSize]>>4)&0x0f] +
+				bitCount4[(s.aaBuf[byteIdx+rowSize*2]>>4)&0x0f] +
+				bitCount4[(s.aaBuf[byteIdx+rowSize*3]>>4)&0x0f]
+		}
+		return bitCount4[s.aaBuf[byteIdx]&0x0f] +
+			bitCount4[s.aaBuf[byteIdx+rowSize]&0x0f] +
+			bitCount4[s.aaBuf[byteIdx+rowSize*2]&0x0f] +
+			bitCount4[s.aaBuf[byteIdx+rowSize*3]&0x0f]
+	}
+	return s.aaBufCoverageAtSlow(cell, rowSize)
+}
+
+func (s *Splash) aaBufCoverageAtSlow(cell, rowSize int) int {
 	t := 0
 	for yy := 0; yy < splashAASize; yy++ {
-		rowOff := yy * rowSize
-		byteIdx := rowOff + (cell >> 3)
-		if byteIdx >= len(s.aaBuf) {
-			continue
-		}
-		b := s.aaBuf[byteIdx]
-		if cell&7 == 0 {
-			t += bitCount4[(b>>4)&0x0f]
-		} else {
-			t += bitCount4[b&0x0f]
+		byteIdx := yy*rowSize + (cell >> 3)
+		if byteIdx >= 0 && byteIdx < len(s.aaBuf) {
+			b := s.aaBuf[byteIdx]
+			if cell&7 == 0 {
+				t += bitCount4[(b>>4)&0x0f]
+			} else {
+				t += bitCount4[b&0x0f]
+			}
 		}
 	}
 	return t
@@ -507,7 +553,7 @@ func traceAALinePixelBefore(p *pipe, x, y, subcellCount int) {
 }
 
 func debugSplashAxialRightEdgeSamplePrev() bool {
-	return os.Getenv("PDF_DEBUG_SPLASH_AXIAL_RIGHT_EDGE_SAMPLE_PREV") == "1"
+	return debugSplashAxialRightEdgeSamplePrevVal
 }
 
 func isDebugAxialRightEdgeSamplePrevCoverage(t int) bool {
