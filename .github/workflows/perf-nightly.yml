@@ -1,4 +1,4 @@
-name: Nightly Performance Snapshot
+name: "[04] Nightly Performance Snapshot"
 
 on:
   schedule:
