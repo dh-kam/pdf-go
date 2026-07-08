@@ -1,0 +1,58 @@
+name: "[05] Build pages and deploy"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'cmd/pdfwasm/**'
+      - 'examples/browser/**'
+      - '.github/workflows/pages.yml'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build WASM demo
+        run: make build-wasm
+
+      - name: Stamp site metadata
+        run: |
+          SITE=build/js-wasm/default
+          touch "$SITE/.nojekyll"
+          git rev-parse HEAD > "$SITE/COMMIT.txt"
+          git describe --tags --always > "$SITE/VERSION.txt"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/js-wasm/default
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
