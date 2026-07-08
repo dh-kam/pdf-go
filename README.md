@@ -1,18 +1,27 @@
 # Go PDF Rendering Library
 
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://golang.org)
+[![Pure Go](https://img.shields.io/badge/Pure%20Go-CGO__ENABLED%3D0-00ADD8?style=flat)](https://golang.org)
+[![WebAssembly](https://img.shields.io/badge/WebAssembly-Live%20Demo-654FF0?style=flat&logo=webassembly&logoColor=white)](https://dh-kam.github.io/pdf-go/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Go PDF is a PDF parsing, rendering, and text extraction library written in Go. The project ports core PDF.js behavior into a server-side Go implementation and uses Poppler-compatible rendering work as the primary raster accuracy target.
+Go PDF is a PDF parsing, rendering, and text extraction library written in **pure Go**. The project ports core PDF.js behavior into a server-side Go implementation and uses Poppler-compatible rendering as the primary raster accuracy target: the tracked regression corpus renders **pixel-identical** to Poppler 24.02 (`pdftoppm`) at 150 dpi.
 
 Documentation: [English](README.md) | [한국어](README.ko.md)
+
+## Why pdf-go
+
+- **Pure Go, zero system dependencies.** The default build is `CGO_ENABLED=0` end to end — parser, rasterizer (a Splash port), and font engines (Type1/CFF/TrueType interpreters and a FreeType-compatible glyph rasterizer) are all Go. No Poppler, MuPDF, Cairo, or FreeType installation required, and cross-compiling is a plain `GOOS`/`GOARCH` switch.
+- **Runs in the browser via WebAssembly.** The same rendering engine compiles with `GOOS=js GOARCH=wasm` and renders PDFs fully client-side — no server round-trip, no native plugin. Try the [live demo](https://dh-kam.github.io/pdf-go/).
+- **Poppler-grade output.** Rendering is validated pixel-by-pixel against Poppler's `pdftoppm` on a multi-document regression corpus, page-for-page byte-exact.
 
 ## Features
 
 - Pure-Go default build path with optional CGo integrations behind build tags.
+- WebAssembly build target with a browser demo (document open, per-page render, text APIs).
 - Clean Architecture layout with domain, use case, interface, and infrastructure layers.
 - PDF parsing for classic XRef tables, XRef streams, and incremental update chains.
-- Rendering for pages, paths, text, images, clipping, patterns, and XObjects.
+- Rendering for pages, paths, text, images, clipping, patterns, shadings, transparency groups, and XObjects.
 - Font support for Standard 14, Type1, TrueType/OpenType, CFF/Type1C, and CID-keyed fonts.
 - Image support for JPEG, PNG, masks, color conversion, and optional advanced decoders.
 - Text extraction APIs with layout-aware helpers.
@@ -111,6 +120,29 @@ if err != nil {
 }
 fmt.Println(text)
 ```
+
+## WebAssembly (Browser)
+
+Because the whole engine is pure Go, it compiles unchanged to WebAssembly and renders PDFs entirely in the browser — documents never leave the client.
+
+**Live demo:** https://dh-kam.github.io/pdf-go/ (deployed by the `[05] Build pages and deploy` workflow)
+
+Build the WASM bundle locally:
+
+```bash
+make build-wasm
+# emits build/js-wasm/default/{pdfwasm.wasm, wasm_exec.js, index.html, main.js, pdf_worker.js}
+```
+
+The module registers a `pdfgo` global with a small JavaScript API:
+
+```js
+const doc = pdfgo.openDocument(new Uint8Array(buffer), {});   // -> { id, pageCount, backend, ok }
+const page = pdfgo.renderPage(doc.id, 0, { dpi: 150 });       // -> { width, height, data (RGBA), ok }
+pdfgo.closeDocument(doc.id);
+```
+
+The bundled demo (`examples/browser/`) runs rendering inside a Web Worker (`pdf_worker.js`) so the UI stays responsive on large documents.
 
 ## CLI Build
 

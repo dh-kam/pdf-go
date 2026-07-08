@@ -1,13 +1,22 @@
 # Go PDF Rendering Library
 
-[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://golang.org)
+[![Pure Go](https://img.shields.io/badge/Pure%20Go-CGO__ENABLED%3D0-00ADD8?style=flat)](https://golang.org)
+[![WebAssembly](https://img.shields.io/badge/WebAssembly-Live%20Demo-654FF0?style=flat&logo=webassembly&logoColor=white)](https://dh-kam.github.io/pdf-go/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-순수 Go로 작성된 PDF 렌더링 라이브러리입니다. PDF.js를 포팅하여 브라우저 의존성 없이 PDF 문서를 파싱, 렌더링, 텍스트 추출 기능을 제공합니다.
+**순수 Go**로 작성된 PDF 파싱·렌더링·텍스트 추출 라이브러리입니다. PDF.js의 핵심 동작을 Go로 포팅했으며, Poppler 호환 렌더링을 정확도 기준으로 삼아 추적 회귀 코퍼스가 Poppler 24.02(`pdftoppm`, 150dpi)와 **픽셀 단위로 동일**하게 렌더링됩니다.
+
+## 왜 pdf-go인가
+
+- **순수 Go, 시스템 의존성 제로.** 기본 빌드가 처음부터 끝까지 `CGO_ENABLED=0` — 파서, 래스터라이저(Splash 포트), 폰트 엔진(Type1/CFF/TrueType 인터프리터와 FreeType 호환 글리프 래스터라이저)까지 전부 Go입니다. Poppler·MuPDF·Cairo·FreeType 설치가 필요 없고, 크로스 컴파일은 `GOOS`/`GOARCH` 지정만으로 끝납니다.
+- **WebAssembly로 브라우저에서 동작.** 동일한 렌더링 엔진이 `GOOS=js GOARCH=wasm`으로 그대로 컴파일되어 서버 왕복 없이 완전히 클라이언트 사이드에서 PDF를 렌더링합니다. [라이브 데모](https://dh-kam.github.io/pdf-go/)에서 바로 확인할 수 있습니다.
+- **Poppler급 출력 품질.** 다중 문서 회귀 코퍼스에서 Poppler `pdftoppm` 대비 페이지 단위 byte-exact 픽셀 검증을 거칩니다.
 
 ## 특징
 
-- **순수 Go 구현**: CGo 의존성 없음
+- **순수 Go 구현**: CGo 의존성 없음 (선택적 CGo 통합은 빌드 태그 뒤에 격리)
+- **WebAssembly 빌드**: 브라우저 데모 포함 (문서 열기, 페이지 렌더, 텍스트 API)
 - **Clean Architecture**: 유지보수 가능한 모듈형 구조
 - **병렬 처리**: 다중 페이지 동시 렌더링
 - **캐싱**: LRU 캐시로 성능 최적화
@@ -133,6 +142,29 @@ func extractText(doc *pdf.Document) {
     }
 }
 ```
+
+## WebAssembly (브라우저)
+
+엔진 전체가 순수 Go이므로 WebAssembly로 그대로 컴파일되어 브라우저에서 완전히 클라이언트 사이드로 PDF를 렌더링합니다 — 문서가 클라이언트를 벗어나지 않습니다.
+
+**라이브 데모:** https://dh-kam.github.io/pdf-go/ (`[05] Build pages and deploy` 워크플로우로 배포)
+
+로컬 WASM 번들 빌드:
+
+```bash
+make build-wasm
+# build/js-wasm/default/{pdfwasm.wasm, wasm_exec.js, index.html, main.js, pdf_worker.js} 생성
+```
+
+모듈은 전역 `pdfgo` 객체로 간단한 JavaScript API를 제공합니다:
+
+```js
+const doc = pdfgo.openDocument(new Uint8Array(buffer), {});   // -> { id, pageCount, backend, ok }
+const page = pdfgo.renderPage(doc.id, 0, { dpi: 150 });       // -> { width, height, data (RGBA), ok }
+pdfgo.closeDocument(doc.id);
+```
+
+동봉된 데모(`examples/browser/`)는 렌더링을 Web Worker(`pdf_worker.js`)에서 수행하여 큰 문서에서도 UI가 멈추지 않습니다.
 
 ## 프로젝트 구조
 
